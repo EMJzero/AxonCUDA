@@ -1,0 +1,7 @@
+*.o
+*.exe
+
+.vscode/
+trashcan/
+hgraphs/
+multi-level_v0/
