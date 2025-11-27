@@ -1,7 +1,8 @@
 *.o
 *.exe
+*.sqlite
+*.nsys-rep
 
 .vscode/
 trashcan/
 hgraphs/
-multi-level_v0/

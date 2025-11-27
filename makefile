@@ -49,7 +49,7 @@ run: $(TARGET)
 	@if [ -z "$(RUN_ARG)" ]; then \
 		./$(TARGET); \
 	else \
-		./$(TARGET) $(RUN_ARG); \
+		./$(TARGET) -r $(RUN_ARG); \
 	fi
 
 run8k: $(TARGET)
@@ -64,10 +64,10 @@ profile: $(TARGET)
 	fi
 	nsys profile --stats=true --force-overwrite=true \
 		--output=$(TARGET)_profile \
-		./$(TARGET) $(PROFILE_ARG)
+		./$(TARGET) -r $(PROFILE_ARG)
 
 # ==========================================
 clean:
-	rm -f $(TARGET) *.o *.qdrep *.nsys-rep
+	rm -f $(TARGET) *.o *.qdrep *.nsys-rep *.sqlite
 
 .PHONY: all run profile clean
