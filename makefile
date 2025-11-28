@@ -8,8 +8,8 @@ NVCC        := nvcc
 CXXFLAGS    := -O3 --std=c++20 -Wall -Wextra -I.
 NVCCFLAGS   := -O3 --std=c++20 -arch=native -allow-unsupported-compiler -Xcompiler "-Wall -Wextra" -I.
 
-SRC_CPPS    := main.cpp
-SRC_CUS     := kernel.cu
+SRC_CPPS    := #main.cpp
+SRC_CUS     := main.cu kernel.cu
 
 OBJ_CPPS    := $(SRC_CPPS:.cpp=.o)
 OBJ_CUS     := $(SRC_CUS:.cu=.o)
@@ -27,7 +27,7 @@ $(TARGET): $(OBJS)
 %.o: %.cpp hgraph.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-%.o: %.cu hgraph.hpp
+%.o: %.cu hgraph.hpp utils.cuh
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 # ==========================================

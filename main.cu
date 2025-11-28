@@ -1,4 +1,5 @@
 #include <iostream>
+#include <iomanip>
 #include <string>
 
 #include </home/mronzani/cuda/include/cuda_runtime.h>
@@ -8,10 +9,9 @@
 #include </home/mronzani/cuda/include/thrust/sort.h>
 
 #include "hgraph.hpp"
+#include "utils.cuh"
 
-#define WARP_SIZE 32u
-
-#define MAX_GROUP_SIZE 4 // => MAX_GROUP_SIZE - 1 slots per node
+#define DEVICE_ID 0
 
 extern __global__ void candidates_kernel(
     const uint32_t* hedges,
@@ -25,15 +25,14 @@ extern __global__ void candidates_kernel(
     const uint32_t num_nodes,
     const uint32_t bits_key_neg,
     uint32_t* pairs,
-    uint32_t* groups,
+    float* scores
 );
 
 extern __global__ void grouping_kernel(
     const uint32_t* pairs,
+    const float* scores,
     const uint32_t num_nodes,
-    const uint32_t bits_key_neg,
-    uint32_t* groups,
-    uint32_t* distances
+    slot* group_slots
 );
 
 extern __global__ void apply_coarsening_hedges(
@@ -128,7 +127,21 @@ int main(int argc, char** argv) {
     // ============================
     // === CUDA STUFF GOES HERE ===
 
-    std::cout << "\nSetting up GPU memory...";
+    std::cout << "CUDA device:\n";
+    
+    // get device properties
+    int device_cnt;
+    cudaGetDeviceCount(&device_cnt);
+    std::cout << "  Found " << device_cnt << " devices: using device " << DEVICE_ID << "\n";
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, DEVICE_ID);
+    std::cout << "  Dev. name " << props.name << "\n";
+    std::cout << "  Available VRAM: " << std::setprecision(1) << (float)(props.totalGlobalMem) / (1 << 30) << " GB\n";
+    std::cout << "  Shared mem. per block: " << std::setprecision(1) << (float)(props.sharedMemPerBlock) / (1 << 10) << " KB\n";
+    std::cout << "  Max. grid size: " << props.maxGridSize[0] << " x " << props.maxGridSize[1] << " x " << props.maxGridSize[2] << "\n";
+    std::cout << "  Max. block size: " << props.maxThreadsDim[0] << " x " << props.maxThreadsDim[1] << " x " << props.maxThreadsDim[2] << "\n";
+    
+    std::cout << "Setting up GPU memory...\n";
 
     uint32_t num_hedges = static_cast<uint32_t>(hg.hedges().size());
     std::vector<uint32_t> hedge_offsets; // hedge idx -> hedge start index in the contiguous hedges array
@@ -173,6 +186,7 @@ int main(int argc, char** argv) {
     uint32_t *d_touching = nullptr, *d_touching_offsets = nullptr;
     float *d_hedge_weights = nullptr;
     uint32_t *d_pairs = nullptr;
+    slot *d_slots = nullptr;
     float *d_scores = nullptr;
     //uint32_t* d_pranks = nullptr;
     // coincide with the innermost group each node was part of + refinement moves
@@ -189,6 +203,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_hedge_weights, num_hedges * sizeof(float))); // hedge -> weight
     CUDA_CHECK(cudaMalloc(&d_pairs, num_nodes * sizeof(uint32_t))); // node -> best neighbor
     CUDA_CHECK(cudaMalloc(&d_scores, num_nodes * sizeof(float))); // connection streght for each pair
+    CUDA_CHECK(cudaMalloc(&d_slots, num_nodes * sizeof(slot))); // slot to finalize node pairs during grouping (true dtype: "slot")
     //CUDA_CHECK(cudaMalloc(&d_pranks, num_nodes * sizeof(uint32_t))); // ranked nodes by pair connection strenght (from strongest node to weakest)
     CUDA_CHECK(cudaMalloc(&d_partitions, num_nodes * sizeof(uint32_t))); // node -> partition id
     
@@ -202,12 +217,10 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_touching_offsets, touching_hedge_offsets.data(), touching_hedge_offsets.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_hedge_weights, hedge_weight_host.data(), num_hedges * sizeof(float), cudaMemcpyHostToDevice));
 
-    // zero-out outputs
-    CUDA_CHECK(cudaMemset(d_pairs, 0xFFFFFFFF, num_nodes * sizeof(uint32_t))); // 0xFF... -> UINT32_MAX
-    // NOTE: no need to set "d_scores" if we use "d_pairs" to see which locations are valid
-    CUDA_CHECK(cudaMemset(d_partitions, 0xFFFFFFFF, num_nodes * sizeof(uint32_t))); // 0xFF... -> UINT32_MAX
+    // zero-out final outputs
+    CUDA_CHECK(cudaMemset(d_partitions, 0xFF, num_nodes * sizeof(uint32_t))); // 0xFF... -> UINT32_MAX
     
-    void coarsen_refine_uncoarsen(uint32_t level_idx, uint32_t curr_num_nodes) {
+    std::function<void(uint32_t,uint32_t)> coarsen_refine_uncoarsen = [&](uint32_t level_idx, uint32_t curr_num_nodes) { // this is a lambda
         std::cout << "Coarsening level " << level_idx << ", remaining nodes=" << curr_num_nodes << "\n";
 
         /*
@@ -224,11 +237,19 @@ int main(int argc, char** argv) {
         // prepare this level's groups
         uint32_t *d_groups = nullptr;
         CUDA_CHECK(cudaMalloc(&d_groups, curr_num_nodes * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemset(d_groups, 0, curr_num_nodes * sizeof(uint32_t)));
+        // TODO: thrust sequence?
+        CUDA_CHECK(cudaMemset(d_groups, 0x00, curr_num_nodes * sizeof(uint32_t)));
+
+        // zero-out this level's outputs
+        CUDA_CHECK(cudaMemset(d_pairs, 0xFF, num_nodes * sizeof(uint32_t))); // 0xFF -> UINT32_MAX
+        // NOTE: no need to init. "d_scores" if we use "d_pairs" to see which locations are valid
+        slot init_slot; init_slot.id = 0xFFFFFFFFu; init_slot.score = 0u;
+        thrust::device_ptr<slot> d_slots_ptr(d_slots);
+        thrust::fill(d_slots_ptr, d_slots_ptr + num_nodes, init_slot); // upper 32 bits to 0x00, lower 32 to 0xFF
 
         // the upper "MAX_GROUP_SIZE" bits are the key for the inverse (multi)function assigning nodes to group in the previous level
-        uint32_t bits_key = MAX_GROUP_SIZE*level_idx == 0 ? 0 : (~uint32_t(0) << (32 - MAX_GROUP_SIZE*level_idx)); // highest bits to 1
-        uint32_t bits_key_negated = bits_key ^ UINT32_MAX; // highest bits to 0, everything else 1
+        uint32_t bits_key = level_idx == 0 ? 0 : (~uint32_t(0) << (32 - MAX_GROUP_SIZE*level_idx)); // highest bits to 1
+        uint32_t bits_key_negated = ~bits_key; // highest bits to 0, everything else 1
 
         // launch configuration - candidates kernel
         // choose threads_per_block multiple of WARP_SIZE
@@ -253,7 +274,7 @@ int main(int argc, char** argv) {
             curr_num_nodes,
             bits_key_negated,
             d_pairs,
-            d_groups // TODO: this is a cheeky hack to initialize "d_groups" in parallel (each node to itself)
+            d_scores
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -271,20 +292,52 @@ int main(int argc, char** argv) {
         thrust::sort_by_key(scores, scores + curr_num_nodes, ranks.begin(), thrust::greater<float>());
         */
 
+        // =============================
+        // print some temporary results
+        // TODO: remove me!
+        std::vector<uint32_t> pairs_tmp(curr_num_nodes);
+        uint32_t min = 0xFFFFFFFF, max = 0;
+        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        std::cout << "Pairing results:\n";
+        for (uint32_t i = 0; i < std::min<uint32_t>(curr_num_nodes, 20); ++i) {
+            uint32_t target = pairs_tmp[i];
+            min = std::min(min, target);
+            max = std::max(max, target);
+            if (target == UINT32_MAX) std::cout << "node " << i << " -> target=none\n";
+            else std::cout << "  node " << i << " ->" << " target=" << target << "\n";
+        }
+        std::cout << "  min = " << min << " max = " << max << "\n";
+        // =============================
+
         // launch configuration - grouping kernel
-        threads_per_block = 128;
+        threads_per_block = 256;
         int num_threads_needed = curr_num_nodes; // 1 thread per node
         blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
         size_t bytes_per_thread = 0; //TODO
         shared_bytes = threads_per_block * bytes_per_thread;
+        // additional checks for the cooperative kernel mode
+        int blocks_per_SM = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_SM, grouping_kernel, threads_per_block, DEVICE_ID);
+        int max_blocks = blocks_per_SM * props.multiProcessorCount;
+        if (blocks > max_blocks) {
+            std::cout << "ABORTING: grouping kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << " !\n";
+            abort();
+        }
         // launch - grouping kernel
         std::cout << "Running grouping kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        grouping_minfirst_kernel<<<blocks, threads_per_block, shared_bytes>>>(
+        /*grouping_kernel<<<blocks, threads_per_block, shared_bytes>>>(
             d_pairs,
+            d_scores,
             curr_num_nodes,
-            bits_key_negated,
-            d_groups,
-        );
+            d_slots
+        );*/
+        void *kernel_args[] = {
+            (void*)&d_pairs,
+            (void*)&d_scores,
+            (void*)&curr_num_nodes,
+            (void*)&d_slots
+        };
+        cudaLaunchCooperativeKernel((void*)grouping_kernel, blocks, threads_per_block, kernel_args, shared_bytes);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -292,30 +345,31 @@ int main(int argc, char** argv) {
         // launch - order groups kernel
         // TODO: overwrite "groups" with a map node -> new node id (MUST INITIALIZE HERE (multi)function bits, one-hot encoding for each seen node in the group)
 
+        // =============================
         // print some temporary results
         // TODO: remove me!
         std::vector<uint32_t> pairs(curr_num_nodes);
-        std::vector<uint32_t> groups(curr_num_nodes);
+        std::vector<slot> slots(curr_num_nodes);
         //std::vector<uint32_t> pranks(curr_num_nodes);
         CUDA_CHECK(cudaMemcpy(pairs.data(), d_pairs, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(groups.data(), d_groups, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(slots.data(), d_slots, curr_num_nodes * sizeof(slot), cudaMemcpyDeviceToHost));
         //CUDA_CHECK(cudaMemcpy(pranks.data(), d_pranks, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         std::set<uint32_t> groups_count;
         std::cout << "Grouping results:\n";
         for (uint32_t i = 0; i < std::min<uint32_t>(curr_num_nodes, 20); ++i) {
             uint32_t target = pairs[i];
-            uint32_t group = groups[i];
+            uint32_t group = slots[i].id;
             groups_count.insert(group);
             uint32_t rank = 0; //pranks[i];
             if (target == UINT32_MAX) std::cout << "node " << i << " -> target=none group=none rank=none\n";
-            else std::cout << "  node " << i << " ->" << " target=" << target << " group=0x" << std::setfill('0') << std::setw(sizeof(uint32_t)*2) << std::hex << group << " rank=" << rank << "\n";
+            else std::cout << "  node " << i << " ->" << " target=" << target << " group=" << group << " rank=" << rank << "\n";
         }
         std::cout << "Groups count: " << groups_count.size() << "\n";
-
+        // =============================
 
         // launch configuration - coarsening kernel (hedges)
         threads_per_block = 128;
-        int num_threads_needed = num_hedges; // 1 thread per hedge
+        num_threads_needed = num_hedges; // 1 thread per hedge
         blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
         // launch - coarsening kernel (hedges)
         std::cout << "Running coarsening kernel (hedges) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
@@ -332,7 +386,7 @@ int main(int argc, char** argv) {
 
         // launch configuration - coarsening kernel (neighbors)
         threads_per_block = 128;
-        int num_threads_needed = curr_num_nodes; // 1 thread per node
+        num_threads_needed = curr_num_nodes; // 1 thread per node
         blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
         // launch - coarsening kernel (neighbors)
         std::cout << "Running coarsening kernel (neighbors) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
@@ -348,13 +402,13 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // recursive call, go down one more level
-        if ()
-        coarsen_refine_uncoarsen(level_idx + 1, TODO_GROUPS_COUNT_ALLOCATE_ONE_VARIABLE_IN_GLOBAL_MEMORY_FROM_THE_HOST);
+        if (false) // TODO: TO GET GROUPS COUNT, ALLOCATE ONE_VARIABLE IN GLOBAL MEMORY FROM THE HOST
+            coarsen_refine_uncoarsen(level_idx + 1, 123456);
 
         std::cout << "Refining level " << level_idx << ", remaining nodes=" << curr_num_nodes << "\n";
 
-        // launch configuration - XXX kernel
-        // launch - XXX kernel
+        // launch configuration - fm-ref kernel
+        // launch - fm-ref kernel
 
         std::cout << "Uncoarsening level " << level_idx << ", remaining nodes=" << curr_num_nodes << "\n";
 
@@ -364,7 +418,7 @@ int main(int argc, char** argv) {
 
         // cleanup groups
         CUDA_CHECK(cudaFree(d_groups));
-    }
+    };
 
     // START: first level, down we go!
     coarsen_refine_uncoarsen(0, num_nodes);
@@ -372,26 +426,19 @@ int main(int argc, char** argv) {
     // TO FINISH UP!
 
     // copy back results
-    std::vector<uint32_t> pairs(num_nodes);
-    std::vector<uint32_t> groups(num_nodes);
-    std::vector<uint32_t> distances(num_nodes);
-    CUDA_CHECK(cudaMemcpy(pairs.data(), d_pairs, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(groups.data(), d_groups, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    std::vector<uint32_t> partitions(num_nodes);
+    CUDA_CHECK(cudaMemcpy(partitions.data(), d_partitions, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
     // print some example outputs
-    std::set<uint32_t> groups_count;
+    std::set<uint32_t> part_count;
     std::cout << "Results:\n";
     for (uint32_t i = 0; i < std::min<uint32_t>(num_nodes, 20); ++i) {
-        //uint32_t group = (uint32_t)(groups[i] >> 32);
-        //uint32_t rank = (uint32_t)(groups[i]);
-        uint32_t target = pairs[i];
-        uint32_t group = groups[i];
-        groups_count.insert(group);
-        uint32_t rank = 0; //distances[i];
-        if (target == UINT32_MAX) std::cout << "node " << i << " -> target=none group=none rank=none\n";
-        else std::cout << "node " << i << " ->" << " target=" << target << " group=" << group << " rank=" << rank << "\n";
+        uint32_t part = partitions[i];
+        part_count.insert(part);
+        if (part == UINT32_MAX) std::cout << "node " << i << " -> part=none\n";
+        else std::cout << "node " << i << " ->" << " part=" << part << "\n";
     }
-    std::cout << "Groups count: " << groups_count.size() << "\n";
+    std::cout << "Partitions count: " << part_count.size() << "\n";
 
     // cleanup device memory
     CUDA_CHECK(cudaFree(d_hedges));
