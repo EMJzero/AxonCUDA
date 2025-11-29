@@ -270,7 +270,7 @@ int main(int argc, char** argv) {
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-
+    
     std::function<void(uint32_t,uint32_t)> coarsen_refine_uncoarsen = [&](uint32_t level_idx, uint32_t curr_num_nodes) { // this is a lambda
         std::cout << "Coarsening level " << level_idx << ", remaining nodes=" << curr_num_nodes << "\n";
 
@@ -347,50 +347,17 @@ int main(int argc, char** argv) {
         // print some temporary results
         // TODO: remove me!
         std::vector<uint32_t> pairs_tmp(curr_num_nodes);
-        std::vector<float> scores_tmp(curr_num_nodes);
         uint32_t min = 0xFFFFFFFF, max = 0;
-        std::set<uint32_t> candidates_count;
         CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_scores, curr_num_nodes * sizeof(float), cudaMemcpyDeviceToHost));
         std::cout << "Pairing results:\n";
-        for (uint32_t i = 0; i < curr_num_nodes; ++i) {
+        for (uint32_t i = 0; i < std::min<uint32_t>(curr_num_nodes, 20); ++i) {
             uint32_t target = pairs_tmp[i];
-            float score = scores_tmp[i];
             min = std::min(min, target);
             max = std::max(max, target);
-            // CYCLES DEBUG:
-            /*std::set<uint32_t> path;
-            while (target != UINT32_MAX && !path.contains(target)) {
-                path.insert(target);
-                target = pairs_tmp[target];
-            }
-            if (target != UINT32_MAX && target != pairs_tmp[pairs_tmp[target]]) {
-                std::cout << "  CYCLE: ";
-                target = pairs_tmp[i];
-                score = scores_tmp[i];
-                path.clear();
-                while (target != UINT32_MAX && !path.contains(target)) {
-                    std::cout << target << "(" << score << ") ";
-                    path.insert(target);
-                    score = scores_tmp[target];
-                    target = pairs_tmp[target];
-                }
-                std::cout << target << "(" << score << ") ";
-                std::cout << "\n";
-            }
-            target = pairs_tmp[i];
-            score = scores_tmp[i];*/
-            // =============
-            if (target == i)
-                std::cout << "  node " << i << " -> SELF TARGETED, WARNING!!\n";
-            candidates_count.insert(target);
-            if (i < std::min<uint32_t>(curr_num_nodes, 20)) {
-                if (target == UINT32_MAX) std::cout << "node " << i << " -> target=none score=none\n";
-                else std::cout << "  node " << i << " ->" << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << "\n";
-            }
+            if (target == UINT32_MAX) std::cout << "node " << i << " -> target=none\n";
+            else std::cout << "  node " << i << " ->" << " target=" << target << "\n";
         }
         std::cout << "  min = " << min << " max = " << max << "\n";
-        std::cout << "Candidates count: " << candidates_count.size() << "\n";
         // =============================
 
         // launch configuration - grouping kernel
@@ -440,15 +407,13 @@ int main(int argc, char** argv) {
         //CUDA_CHECK(cudaMemcpy(pranks.data(), d_pranks, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         std::set<uint32_t> groups_count;
         std::cout << "Grouping results:\n";
-        for (uint32_t i = 0; i < curr_num_nodes; ++i) {
+        for (uint32_t i = 0; i < std::min<uint32_t>(curr_num_nodes, 20); ++i) {
             uint32_t target = pairs[i];
             uint32_t group = slots[i].id;
             groups_count.insert(group);
             uint32_t rank = 0; //pranks[i];
-            if (i < std::min<uint32_t>(curr_num_nodes, 20)) {
-                if (target == UINT32_MAX) std::cout << "node " << i << " -> target=none group=none rank=none\n";
-                else std::cout << "  node " << i << " ->" << " target=" << target << " group=" << group << " rank=" << rank << "\n";
-            }
+            if (target == UINT32_MAX) std::cout << "node " << i << " -> target=none group=none rank=none\n";
+            else std::cout << "  node " << i << " ->" << " target=" << target << " group=" << group << " rank=" << rank << "\n";
         }
         std::cout << "Groups count: " << groups_count.size() << "\n";
         // =============================
@@ -518,13 +483,11 @@ int main(int argc, char** argv) {
     // print some example outputs
     std::set<uint32_t> part_count;
     std::cout << "Results:\n";
-    for (uint32_t i = 0; i < num_nodes; ++i) {
+    for (uint32_t i = 0; i < std::min<uint32_t>(num_nodes, 20); ++i) {
         uint32_t part = partitions[i];
         part_count.insert(part);
-        if (i < std::min<uint32_t>(num_nodes, 20)) {
-            if (part == UINT32_MAX) std::cout << "node " << i << " -> part=none\n";
-            else std::cout << "node " << i << " ->" << " part=" << part << "\n";
-        }
+        if (part == UINT32_MAX) std::cout << "node " << i << " -> part=none\n";
+        else std::cout << "node " << i << " ->" << " part=" << part << "\n";
     }
     std::cout << "Partitions count: " << part_count.size() << "\n";
 

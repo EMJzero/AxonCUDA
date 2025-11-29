@@ -55,7 +55,7 @@ void neighborhoods_count_kernel(
             for (uint32_t node_idx = lane_id; node_idx < my_hedge_size; node_idx += WARP_SIZE) { // the warp loops over hedge pins
                 if (node_idx < my_hedge_size) {
                     uint32_t neighbor = my_hedge[node_idx];
-                    if (neighbor != node_id && sm_hashset_insert(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, neighbor))
+                    if (sm_hashset_insert(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, neighbor))
                         seen_distinct++;
                 }
             }
@@ -123,7 +123,7 @@ void neighborhoods_scatter_kernel(
             for (uint32_t node_idx = lane_id; node_idx < my_hedge_size; node_idx += WARP_SIZE) { // the warp loops over hedge pins
                 if (node_idx < my_hedge_size) {
                     uint32_t neighbor = my_hedge[node_idx];
-                    if (neighbor != node_id && sm_hashset_insert(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, neighbor)) {
+                    if (sm_hashset_insert(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, neighbor)) {
                         uint32_t offset = atomicAdd(&seen_distinct_total, 1); // returns the value as it was before the increment (reserving that idx)
                         my_neighbors[offset] = neighbor;
                     }
@@ -167,10 +167,6 @@ void candidates_kernel(
     * - same part of the histogram in each thread's registers
     * - scan hyperedges (with caching in shared memory - either passive or automatic) once per histogram part
     * - warp primitives to both reduce each bin and find the maximum bin
-    *
-    * It is 100% possible for two neighbors of a node to partake, with that node, in the same hedges! And this makes them peer pairing candidates.
-    * => Use fixed point, not floats, because we need associativity to find those peer candidates!
-    * => In case of a tie, deterministically update the best by lower ID! This is the invariant that was lost in the parallel construction of neighborhoods: the order of neighbors!
     */
 
     const uint32_t* my_neighbors = neighbors + neighbors_offsets[warp_id];
@@ -182,7 +178,7 @@ void candidates_kernel(
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
 
     // all threads in the warp should agree on those...
-    uint32_t best_score = 0;
+    float best_score = 0.0f;
     uint32_t best_neighbor = UINT32_MAX;
 
     // handle HIST_SIZE neighbors at a time
@@ -197,7 +193,7 @@ void candidates_kernel(
                     neighbors_count = 0;
             } else
                 histogram[nb].node = UINT32_MAX;
-            histogram[nb].score = 0;
+            histogram[nb].score = 0.0f;
         }
 
         // TODO: shared memory caching of hyperedges!!
@@ -209,9 +205,9 @@ void candidates_kernel(
             const uint32_t* my_hedge = hedges + hedge_offsets[actual_hedge_idx];
             my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
             const uint32_t* not_my_hedge = hedges + hedge_offsets[actual_hedge_idx + 1];
-            const uint32_t my_hedge_weight = (uint32_t)(hedge_weights[actual_hedge_idx]*FIXED_POINT_SCALE);
+            float my_hedge_weight = hedge_weights[actual_hedge_idx];
             for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
-                uint32_t pin = UINT32_MAX - 1;
+                uint32_t pin = UINT32_MAX - 1; 
                 if (my_hedge < not_my_hedge)
                     pin = *my_hedge & bits_key_neg;
                 // update local histogram
@@ -222,17 +218,14 @@ void candidates_kernel(
             }
         }
 
-        // tie-breaker: lower id node wins; invariant: partial neighbors order
-
         // reduce local histograms between threads (each thread will see the full histogram)
         for (uint32_t nb = 0; nb < HIST_SIZE; nb++)
-            histogram[nb].score = warpReduceSumInt(histogram[nb].score);
+            histogram[nb].score = warpReduceSumFloat(histogram[nb].score);
 
         // reduce max in histogram between threads (each thread grabs a different bin)
         for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
             bin max = warpReduceMax(histogram[nb].score, histogram[nb].node);
-            //if (((unsigned long long)max.score << 32) | ((unsigned long long)max.node & 0xffffffffull) > ((unsigned long long)best_score << 32) | ((unsigned long long)best_neighbor & 0xffffffffull)) {
-            if (max.score > best_score || max.score == best_score && max.node < best_neighbor) {
+            if (max.score > best_score) {
                 best_score = max.score;
                 best_neighbor = max.node;
             }
@@ -243,7 +236,7 @@ void candidates_kernel(
 
     if (lane_id == 0) {
         pairs[warp_id] = best_neighbor; // (multi)function bits already removed while building the histogram
-        scores[warp_id] = ((float)best_score)/FIXED_POINT_SCALE;
+        scores[warp_id] = best_score;
     }
 }
 
@@ -329,32 +322,18 @@ void grouping_kernel(
     * For multiple slots, this can be iterated after deleting the pairs that were already used! Leaving some nodes pointing to "nothing".
     */
 
-    // invariant: symmetric connectivity and each node always pick the first, strongest connection (ignore hedge direction when selecting pairs) => you get a tree with single roots or 2-cycles as roots
-
     // go up the tree
-    if (target != UINT32_MAX) {
-        while (current != target_target) {
-            // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
-            bool outcome = atomic_max_on_slot(group_slots, target, current, score);
-            // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
-            if (!outcome) break;
-            // DEBUG: prevent cycles longer than 2!
-            /*bool die = false;
-            for (uint32_t i = 0; i < path_length; i++) {
-                if (path[i] == target) {
-                    die = true;
-                    break;
-                }
-            }
-            if (die) break;
-            assert(path_length < PATH_SIZE);*/
-            path[path_length++] = target;
-            current = target;
-            target = target_target;
-            if (target == UINT32_MAX) break; // alternative root: a node with no target
-            target_target = pairs[target_target]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
-            score = (uint32_t)(scores[current]*FIXED_POINT_SCALE);
-        }
+    while (target != UINT32_MAX && current != target_target) {
+        // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
+        bool outcome = atomic_max_on_slot(group_slots, target, current, score);
+        // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
+        if (!outcome) break;
+        path[path_length++] = target;
+        assert(path_length <= PATH_SIZE);
+        current = target;
+        target = target_target;
+        target_target = pairs[target_target]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
+        score = (uint32_t)(scores[current]*FIXED_POINT_SCALE);
     }
     // handle "root(s)" as a pair of nodes pointing to each other
     // NOTE: concurrent writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
@@ -371,10 +350,8 @@ void grouping_kernel(
 
     // go down the tree
     // it the root had no target, path[path_length - 1] is the root, if the root was a mutual-poiting pair, path[path_length - 1] is the first encountered node of the pair
-    if (path_length > 1) {
-        current = path[path_length - 2]; // NOTE: possible opt. since now "current" is already "== path[path_length - 1]"...
-        target = path[path_length - 1]; // this is "who current would have liked to be with", the node one step back up the ladder towards root
-    }
+    current = path[path_length - 2]; // NOTE: possible opt. since now "current" is already "== path[path_length - 1]"...
+    target = path[path_length - 1]; // this is "who current would have liked to be with", the node one step back up the ladder towards root
     for (path_length = path_length - 3; path_length >= 0; path_length--) {
         if (group_slots[target].id == current) {
             // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine
@@ -382,7 +359,7 @@ void grouping_kernel(
             // NOTE: do we even care about the score now?
             //group_slots[current].score = group_slots[target].id;
             // NOTE: after a successful link the next node down the path has already lost its target, so we might as well skip it
-            current = path[path_length--];
+            current == path[path_length--];
             if (path_length < 0) break;
         }
         target = current;

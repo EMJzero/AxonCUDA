@@ -145,7 +145,8 @@ namespace hgraph {
 
                 outbound_[src].insert(idx);
 
-                for (uint32_t dst : he.destinations()) {
+                for (uint32_t i = 1; i < he.length(); i++) {
+                    uint32_t dst = hedges_flat_[he.offset() + i];
                     if (dst >= nodes)
                         throw std::runtime_error("Invalid destination node");
 
@@ -287,7 +288,6 @@ namespace hgraph {
                     }
                 }
 
-                neigh.erase(n);
                 neighborhoods_.insert(neighborhoods_.end(), neigh.begin(), neigh.end());
                 write_pos += neigh.size();
             }

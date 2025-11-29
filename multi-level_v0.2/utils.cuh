@@ -4,8 +4,6 @@
 // USED BY: everyone
 
 #define WARP_SIZE 32u
-// TODO: determine this at runtime w.r.t. the mean and variance of the spike frequency!
-#define FIXED_POINT_SCALE 262144u // used to convert scores to fixed point
 
 // initialize shared memory: one consecutive chunk per warp
 __device__ __forceinline__ void sm_init(uint32_t* sm, const uint32_t size, const uint32_t val) {
@@ -19,12 +17,12 @@ __device__ __forceinline__ void sm_init(uint32_t* sm, const uint32_t size, const
 
 // USED BY: neighborhoods kernel
 
-#define SM_MAX_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
+#define SM_MAX_DEDUPE_BUFFER_SIZE 8192 // 16384 is too big for an A100...
 
 __forceinline__ __device__ uint32_t warpReduceSumInt(uint32_t val) {
     #pragma unroll
-    for (int i = 1; i < WARP_SIZE; i *= 2)
-        val += __shfl_xor_sync(0xffffffff, val, i);
+    for (int offset = WARP_SIZE/2; offset > 0; offset /= 2)
+    val += __shfl_down_sync(0xffffffff, val, offset);
     return val;
 }
 
@@ -35,23 +33,22 @@ __forceinline__ __device__ uint32_t warpReduceSumInt(uint32_t val) {
 
 typedef struct {
     uint32_t node;
-    uint32_t score;
+    float score;
 } bin;
 
 __forceinline__ __device__ float warpReduceSumFloat(float val) {
     #pragma unroll
-    for (int i = 1; i < WARP_SIZE; i *= 2)
-        val += __shfl_xor_sync(0xffffffff, val, i);
+    for (int offset = WARP_SIZE/2; offset > 0; offset /= 2)
+    val += __shfl_down_sync(0xffffffff, val, offset);
     return val;
 }
 
-__forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
+__forceinline__ __device__ bin warpReduceMax(float val, uint32_t payload) {
     #pragma unroll
     for (int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
-        uint32_t other_val = __shfl_down_sync(0xffffffff, val, offset);
+        float other_val = __shfl_down_sync(0xffffffff, val, offset);
         uint32_t other_payload = __shfl_down_sync(0xffffffff, payload, offset);
-        //if (((unsigned long long)other_val << 32) | ((unsigned long long)other_payload & 0xffffffffull) > ((unsigned long long)val << 32) | ((unsigned long long)payload & 0xffffffffull)) {
-        if (other_val > val || other_val == val && other_payload < payload) {
+        if (other_val > val) {
             val = other_val;
             payload = other_payload;
         }
@@ -62,8 +59,10 @@ __forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
 
 // USED BY: grouping kernel
 
-#define MAX_GROUP_SIZE 4u // => MAX_GROUP_SIZE - 1 slots per node
-#define PATH_SIZE 128u // initial slots for nodes to see while traversing the pairs three, TODO: automatically extend if needed (costly...)
+#define MAX_GROUP_SIZE 4 // => MAX_GROUP_SIZE - 1 slots per node
+// TODO: determine this at runtime w.r.t. the mean and variance of the spike frequency!
+#define FIXED_POINT_SCALE 1024 // used to convert scores to fixed point
+#define PATH_SIZE 16384 // 128 // initial slots for nodes to see while traversing the pairs three, TODO: automatically extend if needed (costly...)
 
 typedef struct __align__(8) {
     uint32_t id; // lower 32 bits (Nvidia GPUs are little-endian)
@@ -72,7 +71,7 @@ typedef struct __align__(8) {
 
 __device__ __forceinline__ unsigned long long pack_slot(uint32_t score, uint32_t node) {
     // high 32 bits = score, low 32 bits = node
-    return ( (unsigned long long)score << 32 ) | ( (unsigned long long)node & 0xffffffffull );
+    return ( (unsigned long long)score << 32 ) | ( (unsigned long long)node  & 0xffffffffull );
 }
 
 __device__ __forceinline__ void unpack_slot(unsigned long long v, uint32_t &score, uint32_t &node) {
@@ -98,7 +97,7 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* s, uint32_t idx, ui
 
 // USED BY: coarsening routines
 
-#define MAX_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
+#define MAX_DEDUPE_BUFFER_SIZE 8192 // 16384 is too big for an A100...
 
 
 // SHARED MEMORY HASH-SET

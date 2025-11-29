@@ -5,8 +5,9 @@ TARGET      := hgraph_gpu.exe
 CXX         := g++
 NVCC        := nvcc
 
-CXXFLAGS    := -O3 --std=c++20 -Wall -Wextra -I.
-NVCCFLAGS   := -O3 --std=c++20 -arch=native -allow-unsupported-compiler -Xcompiler "-Wall -Wextra" -I.
+# TODO: change to -O3 for the final version, keep -O1 for fast compilation during development
+CXXFLAGS    := -O1 --std=c++20 -Wall -Wextra -I.
+NVCCFLAGS   := -O1 --std=c++20 -arch=native -allow-unsupported-compiler -Xcompiler "-Wall -Wextra" -I.
 
 SRC_CPPS    := #main.cpp
 SRC_CUS     := main.cu kernel.cu

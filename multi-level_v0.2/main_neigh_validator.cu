@@ -270,6 +270,53 @@ int main(int argc, char** argv) {
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+    // ||
+    hg.buildNeighborhoods();
+    //CUDA_CHECK(cudaMalloc(&d_neighbors, hg.getNeighborhoods().size() * sizeof(uint32_t))); // contigous neighborhood sets array
+    //CUDA_CHECK(cudaMalloc(&d_neighbors_offsets, hg.getNeighborhoodOffsets().size() * sizeof(uint32_t))); // node -> neighbors set start idx in d_neighbors
+    //CUDA_CHECK(cudaMemcpy(d_neighbors, hg.getNeighborhoods().data(), hg.getNeighborhoods().size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    //CUDA_CHECK(cudaMemcpy(d_neighbors_offsets, hg.getNeighborhoodOffsets().data(), hg.getNeighborhoodOffsets().size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    std::vector<uint32_t> ngb(total_neighbors);
+    std::vector<uint32_t> ngb_off(num_nodes + 1);
+    CUDA_CHECK(cudaMemcpy(ngb.data(), d_neighbors, total_neighbors * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ngb_off.data(), d_neighbors_offsets, (num_nodes + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    for (uint32_t i = 0; i < std::min<uint32_t>(1000, total_neighbors); i++) {
+        if (ngb[i] != hg.getNeighborhoods()[i])
+            std::cout << i << ":" << ngb[i]  << "!=" << hg.getNeighborhoods()[i] << "; ";
+    }
+    std::cout << "\n\n";
+    for (uint32_t i = 0; i < num_nodes + 1; i++) {
+        if (ngb_off[i] != hg.getNeighborhoodOffsets()[i])
+            std::cout << i << "::" << ngb_off[i] << "!=" << hg.getNeighborhoodOffsets()[i] << "; ";
+    }
+    std::cout << "\n\n";
+    for (uint32_t i = 0; i < num_nodes + 1; i++) {
+        std::set<uint32_t> neee;
+        std::set<uint32_t> niii;
+        for (uint32_t j = ngb_off[i]; j < ngb_off[i + 1]; j++) {
+            neee.insert(hg.getNeighborhoods()[j]);
+            niii.insert(ngb[j]);
+        }
+        if (neee != niii)
+            std::cout << i << "; ";
+    }
+    for (uint32_t i = 0; i < num_nodes; i++) {
+        for (uint32_t n = 0; n < ngb_off[i + 1] - ngb_off[i]; n++) {
+            uint32_t neighbor = ngb[ngb_off[i] + n];
+            bool ok = false;
+            for (uint32_t m = 0; m < ngb_off[neighbor + 1] - ngb_off[neighbor]; m++) {
+                if (i == ngb[ngb_off[neighbor] + m]) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                std::cout << "ERROR: node " << i << " has neighbor " << neighbor << " but the neighbor does not see the node!\n";
+                break;
+            }
+        }
+    }
+    std::cout << "Neighborhoods are symmetric!\n";
 
     std::function<void(uint32_t,uint32_t)> coarsen_refine_uncoarsen = [&](uint32_t level_idx, uint32_t curr_num_nodes) { // this is a lambda
         std::cout << "Coarsening level " << level_idx << ", remaining nodes=" << curr_num_nodes << "\n";
@@ -349,48 +396,20 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> pairs_tmp(curr_num_nodes);
         std::vector<float> scores_tmp(curr_num_nodes);
         uint32_t min = 0xFFFFFFFF, max = 0;
-        std::set<uint32_t> candidates_count;
         CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_scores, curr_num_nodes * sizeof(float), cudaMemcpyDeviceToHost));
         std::cout << "Pairing results:\n";
         for (uint32_t i = 0; i < curr_num_nodes; ++i) {
             uint32_t target = pairs_tmp[i];
-            float score = scores_tmp[i];
+            uint32_t score = scores_tmp[i];
             min = std::min(min, target);
             max = std::max(max, target);
-            // CYCLES DEBUG:
-            /*std::set<uint32_t> path;
-            while (target != UINT32_MAX && !path.contains(target)) {
-                path.insert(target);
-                target = pairs_tmp[target];
-            }
-            if (target != UINT32_MAX && target != pairs_tmp[pairs_tmp[target]]) {
-                std::cout << "  CYCLE: ";
-                target = pairs_tmp[i];
-                score = scores_tmp[i];
-                path.clear();
-                while (target != UINT32_MAX && !path.contains(target)) {
-                    std::cout << target << "(" << score << ") ";
-                    path.insert(target);
-                    score = scores_tmp[target];
-                    target = pairs_tmp[target];
-                }
-                std::cout << target << "(" << score << ") ";
-                std::cout << "\n";
-            }
-            target = pairs_tmp[i];
-            score = scores_tmp[i];*/
-            // =============
-            if (target == i)
-                std::cout << "  node " << i << " -> SELF TARGETED, WARNING!!\n";
-            candidates_count.insert(target);
             if (i < std::min<uint32_t>(curr_num_nodes, 20)) {
                 if (target == UINT32_MAX) std::cout << "node " << i << " -> target=none score=none\n";
                 else std::cout << "  node " << i << " ->" << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << "\n";
             }
         }
         std::cout << "  min = " << min << " max = " << max << "\n";
-        std::cout << "Candidates count: " << candidates_count.size() << "\n";
         // =============================
 
         // launch configuration - grouping kernel
