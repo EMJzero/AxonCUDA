@@ -73,6 +73,26 @@ extern __global__ void apply_coarsening_neighbors(
     uint32_t* neighbors
 );
 
+extern __global__ void apply_coarsening_touching_count(
+    const uint32_t* hedges,
+    const uint32_t* hedge_offsets,
+    const uint32_t num_hedges,
+    const uint32_t* groups,
+    const uint32_t bits_key_neg,
+    uint32_t* touching_offsets
+);
+
+extern __global__ void apply_coarsening_touching_scatter(
+    const uint32_t* hedges,
+    const uint32_t* hedge_offsets,
+    const uint32_t num_hedges,
+    const uint32_t* groups,
+    const uint32_t bits_key_neg,
+    const uint32_t* touching_offsets,
+    uint32_t* touching,
+    uint32_t* touching_counter
+);
+
 using namespace hgraph;
 
 #define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
@@ -204,7 +224,6 @@ int main(int argc, char** argv) {
     uint32_t *d_pairs = nullptr;
     slot *d_slots = nullptr;
     float *d_scores = nullptr;
-    //uint32_t* d_pranks = nullptr;
     // coincide with the innermost group each node was part of + refinement moves
     // => the innermost nodes (groups) count is also the number of partitions
     uint32_t *d_partitions = nullptr;
@@ -224,7 +243,6 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_pairs, num_nodes * sizeof(uint32_t))); // node -> best neighbor
     CUDA_CHECK(cudaMalloc(&d_scores, num_nodes * sizeof(float))); // connection streght for each pair
     CUDA_CHECK(cudaMalloc(&d_slots, num_nodes * sizeof(slot))); // slot to finalize node pairs during grouping (true dtype: "slot")
-    //CUDA_CHECK(cudaMalloc(&d_pranks, num_nodes * sizeof(uint32_t))); // ranked nodes by pair connection strenght (from strongest node to weakest)
     CUDA_CHECK(cudaMalloc(&d_partitions, num_nodes * sizeof(uint32_t))); // node -> partition id
     
     // copy to device
@@ -246,6 +264,7 @@ int main(int argc, char** argv) {
     blocks = num_nodes;
     threads_per_block = 256; // 256/32 -> 8 warps per block
     std::cout << "Running neighborhoods kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    // count each node's neighbors
     neighborhoods_count_kernel<<<blocks, threads_per_block>>>(
         d_hedges,
         d_offsets,
@@ -254,11 +273,13 @@ int main(int argc, char** argv) {
         num_nodes,
         d_neighbors_offsets
     );
-    thrust::device_ptr<uint32_t> t_offsets(d_neighbors_offsets);
-    thrust::exclusive_scan(t_offsets, t_offsets + (num_nodes + 1), t_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
+    // compute final offsets
+    thrust::device_ptr<uint32_t> t_neigh_offsets(d_neighbors_offsets);
+    thrust::exclusive_scan(t_neigh_offsets, t_neigh_offsets + (num_nodes + 1), t_neigh_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
     uint32_t total_neighbors;
     CUDA_CHECK(cudaMemcpy(&total_neighbors, d_neighbors_offsets + num_nodes, sizeof(uint32_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMalloc(&d_neighbors, total_neighbors * sizeof(uint32_t))); // contigous neighborhood sets array
+    // write neighbors in at their correct offset
     neighborhoods_scatter_kernel<<<blocks, threads_per_block>>>(
         d_hedges,
         d_offsets,
@@ -329,19 +350,6 @@ int main(int argc, char** argv) {
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
-        
-        // NO NEED: if a thread is started for every pair, this isn't needed!
-        /*
-        // launch configuration - rank pairs kernel (based on thrust)
-        // wrap raw pointers with thrust's "device_ptr"
-        thrust::device_ptr<float> scores(d_scores);
-        thrust::device_ptr<uint32_t> ranks(d_pranks);
-        // initialize the ranking of nodes in the same order as scores, that is following nodes ids from 0..curr_num_nodes-1
-        thrust::sequence(ranks, ranks + curr_num_nodes);
-        // launch - rank pairs kernel
-        // sort ranks with scores as key (descending order)
-        thrust::sort_by_key(scores, scores + curr_num_nodes, ranks.begin(), thrust::greater<float>());
-        */
 
         // =============================
         // print some temporary results
@@ -358,29 +366,6 @@ int main(int argc, char** argv) {
             float score = scores_tmp[i];
             min = std::min(min, target);
             max = std::max(max, target);
-            // CYCLES DEBUG:
-            /*std::set<uint32_t> path;
-            while (target != UINT32_MAX && !path.contains(target)) {
-                path.insert(target);
-                target = pairs_tmp[target];
-            }
-            if (target != UINT32_MAX && target != pairs_tmp[pairs_tmp[target]]) {
-                std::cout << "  CYCLE: ";
-                target = pairs_tmp[i];
-                score = scores_tmp[i];
-                path.clear();
-                while (target != UINT32_MAX && !path.contains(target)) {
-                    std::cout << target << "(" << score << ") ";
-                    path.insert(target);
-                    score = scores_tmp[target];
-                    target = pairs_tmp[target];
-                }
-                std::cout << target << "(" << score << ") ";
-                std::cout << "\n";
-            }
-            target = pairs_tmp[i];
-            score = scores_tmp[i];*/
-            // =============
             if (target == i)
                 std::cout << "  node " << i << " -> SELF TARGETED, WARNING!!\n";
             candidates_count.insert(target);
@@ -409,12 +394,6 @@ int main(int argc, char** argv) {
         }
         // launch - grouping kernel
         std::cout << "Running grouping kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        /*grouping_kernel<<<blocks, threads_per_block, shared_bytes>>>(
-            d_pairs,
-            d_scores,
-            curr_num_nodes,
-            d_slots
-        );*/
         void *kernel_args[] = {
             (void*)&d_pairs,
             (void*)&d_scores,
@@ -434,20 +413,17 @@ int main(int argc, char** argv) {
         // TODO: remove me!
         std::vector<uint32_t> pairs(curr_num_nodes);
         std::vector<slot> slots(curr_num_nodes);
-        //std::vector<uint32_t> pranks(curr_num_nodes);
         CUDA_CHECK(cudaMemcpy(pairs.data(), d_pairs, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(slots.data(), d_slots, curr_num_nodes * sizeof(slot), cudaMemcpyDeviceToHost));
-        //CUDA_CHECK(cudaMemcpy(pranks.data(), d_pranks, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         std::set<uint32_t> groups_count;
         std::cout << "Grouping results:\n";
         for (uint32_t i = 0; i < curr_num_nodes; ++i) {
             uint32_t target = pairs[i];
             uint32_t group = slots[i].id;
             groups_count.insert(group);
-            uint32_t rank = 0; //pranks[i];
             if (i < std::min<uint32_t>(curr_num_nodes, 20)) {
                 if (target == UINT32_MAX) std::cout << "node " << i << " -> target=none group=none rank=none\n";
-                else std::cout << "  node " << i << " ->" << " target=" << target << " group=" << group << " rank=" << rank << "\n";
+                else std::cout << "  node " << i << " ->" << " target=" << target << " group=" << group << "\n";
             }
         }
         std::cout << "Groups count: " << groups_count.size() << "\n";
@@ -487,9 +463,42 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
+        // launch configuration - coarsening kernel (touching)
+        threads_per_block = 128;
+        num_threads_needed = num_hedges; // 1 thread per hedge
+        blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+        // launch - coarsening kernel (neighbors)
+        std::cout << "Running coarsening kernel (touching) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        apply_coarsening_touching_count<<<blocks, threads_per_block>>>(
+            d_hedges,
+            d_offsets,
+            num_hedges,
+            d_groups,
+            bits_key_negated,
+            d_touching_offsets
+        );
+        thrust::device_ptr<uint32_t> t_touching_offsets(d_touching_offsets);
+        thrust::exclusive_scan(t_touching_offsets, t_touching_offsets + (num_nodes + 1), t_touching_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
+        uint32_t *d_touching_counter = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_touching_counter, num_nodes * sizeof(uint32_t))); // node -> number of touching hedges seen as of now
+        CUDA_CHECK(cudaMemset(d_touching_counter, 0x00, num_nodes * sizeof(uint32_t)));
+        apply_coarsening_touching_scatter<<<blocks, threads_per_block>>>(
+            d_hedges,
+            d_offsets,
+            num_hedges,
+            d_groups,
+            bits_key_negated,
+            d_touching_offsets,
+            d_touching,
+            d_touching_counter
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(d_touching_counter));
+
         // recursive call, go down one more level
         if (false) // TODO: TO GET GROUPS COUNT, ALLOCATE ONE_VARIABLE IN GLOBAL MEMORY FROM THE HOST
-            coarsen_refine_uncoarsen(level_idx + 1, 123456);
+            coarsen_refine_uncoarsen(level_idx + 1, new_num_nodes);
 
         std::cout << "Refining level " << level_idx << ", remaining nodes=" << curr_num_nodes << "\n";
 
@@ -501,6 +510,19 @@ int main(int argc, char** argv) {
         // launch configuration - uncoarsen kernel
         // launch - uncoarsen kernel
         // TODO: apply the inverse (multi)function!
+        /*
+        * How to uncoarsen:
+        * - create a "d_ungroup" map that inverts the "d_groups" map
+        *   - first, you need an array with, for each coarser node, the number of nodes that got mapped to it
+        *     - this can be built with a dedicated reduce, or as a subproduct of constructing "d_groups"
+        *   - then, do a prefix sum of this counts array to get the offsets "d_ungroup_offsets" where each
+        *     coarser node will have the start of its uncoarsed nodes counterparts
+        *   - write (BIN pattern) from each uncoarse node, your own id in the first available slot after the
+        *     "d_groups" offset of your coarse counterpart
+        * - using this map just means accessing "d_ungroup_offsets" with a coarse node's id, then going to
+        *   "d_groups" at that offset and iterate until the next offset is hit, this shows you all uncoarse
+        *   nodes you need to replace the coarse one with
+        */
 
         // cleanup groups
         CUDA_CHECK(cudaFree(d_groups));
@@ -538,7 +560,6 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_hedge_weights));
     CUDA_CHECK(cudaFree(d_pairs));
     CUDA_CHECK(cudaFree(d_scores));
-    //CUDA_CHECK(cudaFree(d_pranks));
     CUDA_CHECK(cudaFree(d_partitions));
 
     // === CUDA STUFF ENDS HERE ===

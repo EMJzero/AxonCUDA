@@ -16,8 +16,12 @@ void neighborhoods_count_kernel(
     const uint32_t* touching,
     const uint32_t* touching_offsets,
     const uint32_t num_nodes,
-    uint32_t* neighbors_offsets
+    uint32_t* neighbors_offsets // here filled as counters of "how many neighbors per node" -> then do a prefix sum for the offsets
 ) {
+    /*
+    * Idea: BIN pattern of count->scan->scatter
+    */
+
     // STYLE: one node per block, one touching hedge per warp, distinct neighbors in shared memory!
     const uint32_t node_id = blockIdx.x;
     if (node_id >= num_nodes) return;
@@ -63,7 +67,7 @@ void neighborhoods_count_kernel(
     }
 
     // reduce distinct counts per-warp
-    seen_distinct = warpReduceSumInt(seen_distinct);
+    seen_distinct = warpReduceSum<uint32_t>(seen_distinct);
 
     // accumulate counts per-block
     if (lane_id == 0)
@@ -171,6 +175,8 @@ void candidates_kernel(
     * It is 100% possible for two neighbors of a node to partake, with that node, in the same hedges! And this makes them peer pairing candidates.
     * => Use fixed point, not floats, because we need associativity to find those peer candidates!
     * => In case of a tie, deterministically update the best by lower ID! This is the invariant that was lost in the parallel construction of neighborhoods: the order of neighbors!
+    *
+    * This kernel must give a symmetry invariant, if one node sees a candidate with score "s", then that candidate must also see this node as an option with score "s"!
     */
 
     const uint32_t* my_neighbors = neighbors + neighbors_offsets[warp_id];
@@ -190,7 +196,7 @@ void candidates_kernel(
         // load the first HIST_SIZE neighbors and setup per-thread local histograms
         for (uint32_t nb = 0; nb < HIST_SIZE; nb++) {
             if (nb < neighbors_count) {
-                uint32_t my_neighbor = my_neighbors[nb];
+                const uint32_t my_neighbor = my_neighbors[nb];
                 // NOTE: neighbors and hedges use different (multi)function bits, so we must remove them before comparing!!
                 histogram[nb].node = my_neighbor & bits_key_neg;
                 if (my_neighbor == UINT32_MAX) // reached blank neighbors area left by coarsening
@@ -205,7 +211,7 @@ void candidates_kernel(
         // scan touching hyperedges
         // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
         for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-            uint32_t actual_hedge_idx = *hedge_idx; // NOTE: no (multi)function bits used in "touching"
+            const uint32_t actual_hedge_idx = *hedge_idx; // NOTE: no (multi)function bits used in "touching"
             const uint32_t* my_hedge = hedges + hedge_offsets[actual_hedge_idx];
             my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
             const uint32_t* not_my_hedge = hedges + hedge_offsets[actual_hedge_idx + 1];
@@ -226,7 +232,7 @@ void candidates_kernel(
 
         // reduce local histograms between threads (each thread will see the full histogram)
         for (uint32_t nb = 0; nb < HIST_SIZE; nb++)
-            histogram[nb].score = warpReduceSumInt(histogram[nb].score);
+            histogram[nb].score = warpReduceSum<uint32_t>(histogram[nb].score);
 
         // reduce max in histogram between threads (each thread grabs a different bin)
         for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
@@ -273,35 +279,7 @@ void grouping_kernel(
     uint32_t score = (uint32_t)(scores[tid]*FIXED_POINT_SCALE); // score with which "current" points to "target"
 
     /*
-    * logic:
-    * - MAYBE: this could be done with a (target-id,score)-key-based sort with thrust, but would be n*logn...
-    * - each node has M free slots
-    * - one thread per pair (node)
-    * - [NAH one round per slot]
-    * - slots made of float+uint32 tuples being score+pair
-    * - big HP: by construction, a node will always propose a pair with score equal or higher than that of pairs
-    *   formulated by others towards him. That is because each node already went over its entire neighborhood and found
-    *   the best candidate, others will all be second choices. So either the node succeeds with its target, or it accepts
-    *   the best of the second choices -> don't protect writes to yourself (no deadlocks - just lock the slot of the target
-    *   node where you write), simply overwrite them if you succeed. After every thread has written, go see if what you
-    *   wrote is still there, if so, write to yourself the same pairing. Issue: cascade effect where if this check happens
-    *   in parallel, since each thread can only decide (check the "still there") after his target decided what to do.
-    *   - upgrade: the M slots of each node are sorted by score, when writing there, lock the node, and insert yourself,
-    *     pushing out the lowest score entry (even if that is yourself). If, after the global synch, a node sees that its
-    *     write was pushed out of the target's slots, then do nothing, otherwise, if it is still there, insert a the top
-    *     of your slots your target, pushing out one of the others...cascade effect...
-    *   - cascade effect solution: (1) global synch, (2) everyone checks and updates if needed, (3) if an updated happens,
-    *     write a 1 (unprotected - initialized at 0) to a global variable, (4) repeat so long as the variable gets to 1
-    * - practically, every thread:
-    *   - if its score is higher than what is in its target's slot, atomically updates it with its own
-    *   - otherwise do nothing (just accept incoming writes)
-    *   - repeat after a global synch:
-    *     - if you wrote something, go check if it's still there, if so, write to yourself the pair's counterpart
-    * Note: the "big HP" leaves no room for cycles (longer than two - pairs pointing one to the other)! The "pairs" build a tree!
-    */
-
-    /*
-    * NEW LOGIC: a walk up (and down) the tree for grouping!
+    * Logic: a walk up (and down) the tree for grouping!
     *
     * => big HP: by construction, a node will always propose a pair with score equal or higher than that of pairs formulated
     *            by others towards him. This HP leaves no room for cycles (longer than two - pairs pointing one to the other)!
@@ -327,15 +305,22 @@ void grouping_kernel(
     * => this is a choke for atomic operations of a shit ton of threads that followed the same tree! Trivialize the solution of the root!
     *
     * For multiple slots, this can be iterated after deleting the pairs that were already used! Leaving some nodes pointing to "nothing".
+    *
+    * Required invariant: symmetric connectivity and each node always pick the first, strongest connection (ignore hedge direction when selecting pairs)
+    *   => you get a tree with single roots or 2-cycles as roots
+    *
+    * Could the upward walk be done in a single shot, no path required? Yes! But then you'd loose the ability to deterministially walk back and group by score!
     */
 
-    // invariant: symmetric connectivity and each node always pick the first, strongest connection (ignore hedge direction when selecting pairs) => you get a tree with single roots or 2-cycles as roots
+    // initialize yourself to a one-node group, unless someone already claimed you
+    atomicCAS(&group_slots[tid].id, UINT32_MAX, tid);
 
     // go up the tree
+    bool outcome = false;
     if (target != UINT32_MAX) {
         while (current != target_target) {
             // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
-            bool outcome = atomic_max_on_slot(group_slots, target, current, score);
+            outcome = atomic_max_on_slot(group_slots, target, current, score);
             // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
             if (!outcome) break;
             // DEBUG: prevent cycles longer than 2!
@@ -346,8 +331,8 @@ void grouping_kernel(
                     break;
                 }
             }
-            if (die) break;
-            assert(path_length < PATH_SIZE);*/
+            if (die) break;*/
+            assert(path_length < PATH_SIZE);
             path[path_length++] = target;
             current = target;
             target = target_target;
@@ -358,8 +343,8 @@ void grouping_kernel(
     }
     // handle "root(s)" as a pair of nodes pointing to each other
     // NOTE: concurrent writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
-    if (target != UINT32_MAX) {
-        uint32_t lowest_id = min(current, target);
+    if (outcome) { // "&& target != UINT32_MAX" is implied by "outcome" not being false
+        const uint32_t lowest_id = min(current, target);
         group_slots[current].id = lowest_id;
         group_slots[current].score = score;
         group_slots[target].id = lowest_id;
@@ -371,29 +356,27 @@ void grouping_kernel(
 
     // go down the tree
     // it the root had no target, path[path_length - 1] is the root, if the root was a mutual-poiting pair, path[path_length - 1] is the first encountered node of the pair
-    if (path_length > 1) {
-        current = path[path_length - 2]; // NOTE: possible opt. since now "current" is already "== path[path_length - 1]"...
-        target = path[path_length - 1]; // this is "who current would have liked to be with", the node one step back up the ladder towards root
-    }
-    for (path_length = path_length - 3; path_length >= 0; path_length--) {
+    for (path_length = path_length - 2; path_length >= 0; path_length--) {
+        // NOTE: on the first iteration, coming from the upward walk, "current" is the last node that got its slot updated
+        target = current; // this is "who current would have liked to be with", the node one step back up the ladder towards root
+        current = path[path_length];
         if (group_slots[target].id == current) {
             // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine
             group_slots[current].id = current;
             // NOTE: do we even care about the score now?
             //group_slots[current].score = group_slots[target].id;
             // NOTE: after a successful link the next node down the path has already lost its target, so we might as well skip it
-            current = path[path_length--];
-            if (path_length < 0) break;
+            path_length--;
         }
-        target = current;
-        current = path[path_length];
     }
-    // as of now, current is the last element of the path (that did not include the "tid" node)
-    target = current;
-    current = tid;
-    if (group_slots[target].id == current) {
-        group_slots[current].id = current;
-        //group_slots[current].score = group_slots[target].id;
+    // the path did not include the "tid" node, handle it here iff you did not happen to group path[0] with path[1] during the last iteration above (leading to path_length == -2)
+    if (path_length == -1) {
+        target = current;
+        current = tid;
+        if (group_slots[target].id == current) {
+            group_slots[current].id = current;
+            //group_slots[current].score = group_slots[target].id;
+        }
     }
 }
 
@@ -427,11 +410,11 @@ void apply_coarsening_hedges(
     uint32_t hedge[MAX_DEDUPE_BUFFER_SIZE];
 
     for (uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
-        uint32_t pin = groups[*curr]; // read and map pin to its new id
+        const uint32_t pin = groups[*curr & bits_key_neg]; // read and map pin to its new id
         bool not_seen = true;
         // NOTE: slightly slow sequential scan, fine for cardinalities ~200
         for (uint32_t i = 0; i < distinct; i++) {
-            uint32_t entry = hedge[i];
+            const uint32_t entry = hedge[i];
             if (entry & bits_key_neg == pin & bits_key_neg) {
                 not_seen = false;
                 hedge[i] = (entry & bits_key_neg) | (entry & bits_key | pin & bits_key); // OR of the (multi)function bits
@@ -483,11 +466,11 @@ void apply_coarsening_neighbors(
     uint32_t neighbor[MAX_DEDUPE_BUFFER_SIZE];
 
     for (uint32_t* curr = neighbor_start; curr < neighbor_end; curr++) {
-        uint32_t pin = groups[*curr]; // read and map pin to its new id
+        const uint32_t pin = groups[*curr & bits_key_neg]; // read and map pin to its new id
         bool not_seen = true;
         // NOTE: slightly slow sequential scan, fine for cardinalities ~200
         for (uint32_t i = 0; i < distinct; i++) {
-            uint32_t entry = neighbor[i];
+            const uint32_t entry = neighbor[i];
             if (entry & bits_key_neg == pin & bits_key_neg) {
                 not_seen = false;
                 neighbor[i] = (entry & bits_key_neg) | (entry & bits_key | pin & bits_key); // OR of the (multi)function bits
@@ -510,15 +493,17 @@ void apply_coarsening_neighbors(
 }
 
 __global__
-void apply_coarsening_touching(
-    const uint32_t num_nodes,
-    const uint32_t* groups,
-    uint32_t* touching,
-    uint32_t* touching_offsets
+void apply_coarsening_touching_count(
+    const uint32_t* hedges,
+    const uint32_t* hedge_offsets,
+    const uint32_t num_hedges,
+    const uint32_t* groups, // node -> new node id (with (multi)function bits already inserted)
+    const uint32_t bits_key_neg, // do the bitwise-and only when using node ids as indices!
+    uint32_t* touching_offsets // here filled as counters of "how many hedges per node" -> then do a prefix sum for the offsets
 ) {
-    // STYLE: one node per thread!
+    // STYLE: one hedge per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
+    if (tid >= num_hedges) return;
 
     /*
     * Idea:
@@ -530,5 +515,49 @@ void apply_coarsening_touching(
     * ISSUE: how can this be inverted once you uncoarsen? We don't have (multi)function bits here, nor we have
     *        a map on hyperedges where to build them...
     * => we must resort to duplicating the "touching" data at every level...
+    *
+    * TODO: for now we use the same BIN pattern of count->scan->scatter as for initial the neighborhoods kernel...
+    * TODO: for now we just do atomics towards global memory, because nodes are too many for shared memory, eventually:
+    *   - use the shared memory hash-map to keep a "first-come-first-served" set of counters in shared memory,
+    *     and reditect additional entries to global counters, then atomically increment global memory
     */
+
+    const uint32_t hedge_start_idx = hedge_offsets[tid], hedge_end_idx = hedge_offsets[tid + 1];
+    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
+
+    // TODO: initialize shared memory
+    //__shared__ hashmap_entry hashmap[SM_MAX_HASHMAP_SIZE];
+    //sm_init(hashmap, SM_MAX_HASHMAP_SIZE*2, SM_HASH_EMPTY);
+
+    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
+        const uint32_t pin = groups[*curr & bits_key_neg]; // read and map pin to its new id
+        atomicAdd(&touching_offsets[pin], 1);
+    }
+}
+
+__global__
+void apply_coarsening_touching_scatter(
+    const uint32_t* hedges,
+    const uint32_t* hedge_offsets,
+    const uint32_t num_hedges,
+    const uint32_t* groups, // node -> new node id (with (multi)function bits already inserted)
+    const uint32_t bits_key_neg, // do the bitwise-and only when using node ids as indices!
+    const uint32_t* touching_offsets,
+    uint32_t* touching,
+    uint32_t* touching_counter // node -> number of touching hedges inserted as of now
+) {
+    // STYLE: one node per thread!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_hedges) return;
+
+    // TODO: any upgrade done to "apply_coarsening_touching_count" apples here too!
+
+    const uint32_t hedge_start_idx = hedge_offsets[tid], hedge_end_idx = hedge_offsets[tid + 1];
+    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
+
+    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
+        const uint32_t pin = groups[*curr & bits_key_neg]; // read and map pin to its new id
+        const uint32_t idx = atomicAdd(&touching_counter[pin], 1); // claim the current index
+        touching[touching_offsets[pin] + idx] = tid;
+    }
 }

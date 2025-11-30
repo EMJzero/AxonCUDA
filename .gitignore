@@ -2,6 +2,7 @@
 *.exe
 *.sqlite
 *.nsys-rep
+*.tmp
 
 .vscode/
 trashcan/

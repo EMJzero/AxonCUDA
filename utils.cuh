@@ -16,17 +16,19 @@ __device__ __forceinline__ void sm_init(uint32_t* sm, const uint32_t size, const
         sm[i] = val;
 }
 
+template <typename T>
+__forceinline__ __device__ T warpReduceSum(T val) {
+    #pragma unroll
+    for (int offset = 1; offset < warpSize; offset <<= 1) {
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
 
 // USED BY: neighborhoods kernel
 
 #define SM_MAX_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
-
-__forceinline__ __device__ uint32_t warpReduceSumInt(uint32_t val) {
-    #pragma unroll
-    for (int i = 1; i < WARP_SIZE; i *= 2)
-        val += __shfl_xor_sync(0xffffffff, val, i);
-    return val;
-}
 
 
 // USED BY: candidates kernel
@@ -37,13 +39,6 @@ typedef struct {
     uint32_t node;
     uint32_t score;
 } bin;
-
-__forceinline__ __device__ float warpReduceSumFloat(float val) {
-    #pragma unroll
-    for (int i = 1; i < WARP_SIZE; i *= 2)
-        val += __shfl_xor_sync(0xffffffff, val, i);
-    return val;
-}
 
 __forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
     #pragma unroll
@@ -62,7 +57,7 @@ __forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
 
 // USED BY: grouping kernel
 
-#define MAX_GROUP_SIZE 4u // => MAX_GROUP_SIZE - 1 slots per node
+#define MAX_GROUP_SIZE 2u // => MAX_GROUP_SIZE - 1 slots per node; 2 means pairs
 #define PATH_SIZE 128u // initial slots for nodes to see while traversing the pairs three, TODO: automatically extend if needed (costly...)
 
 typedef struct __align__(8) {
@@ -99,6 +94,7 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* s, uint32_t idx, ui
 // USED BY: coarsening routines
 
 #define MAX_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
+#define SM_MAX_HASHMAP_SIZE 4096u
 
 
 // SHARED MEMORY HASH-SET
