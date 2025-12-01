@@ -16,22 +16,11 @@ __device__ __forceinline__ void sm_init(uint32_t* sm, const uint32_t size, const
         sm[i] = val;
 }
 
-// every warp lane sees the max
 template <typename T>
 __forceinline__ __device__ T warpReduceSum(T val) {
     #pragma unroll
-    for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+    for (int offset = 1; offset < warpSize; offset <<= 1) {
         val += __shfl_xor_sync(0xffffffff, val, offset);
-    }
-    return val;
-}
-
-// only lane == 0 sees the max
-template <typename T>
-__forceinline__ __device__ T warpReduceSumLN0(T val) {
-    #pragma unroll
-    for (int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
     }
     return val;
 }
@@ -45,7 +34,6 @@ __forceinline__ __device__ T warpReduceSumLN0(T val) {
 // USED BY: candidates kernel
 
 #define HIST_SIZE 64u // must be a multiple of WARP_SIZE (for the histogram max reduction)
-#define MAX_CANDIDATES 2u // => how many candidates are proposed for a node (ranked by score)
 
 typedef struct {
     uint32_t node;
@@ -54,9 +42,10 @@ typedef struct {
 
 __forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
     #pragma unroll
-    for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-        uint32_t other_val = __shfl_xor_sync(0xffffffff, val, offset);
-        uint32_t other_payload = __shfl_xor_sync(0xffffffff, payload, offset);
+    for (int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
+        uint32_t other_val = __shfl_down_sync(0xffffffff, val, offset);
+        uint32_t other_payload = __shfl_down_sync(0xffffffff, payload, offset);
+        //if (((unsigned long long)other_val << 32) | ((unsigned long long)other_payload & 0xffffffffull) > ((unsigned long long)val << 32) | ((unsigned long long)payload & 0xffffffffull)) {
         if (other_val > val || other_val == val && other_payload < payload) {
             val = other_val;
             payload = other_payload;
@@ -68,7 +57,7 @@ __forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
 
 // USED BY: grouping kernel
 
-#define MAX_GROUP_SIZE 1u // => MAX_GROUP_SIZE - 1 slots per node; 2 means pairs
+#define MAX_GROUP_SIZE 2u // => MAX_GROUP_SIZE - 1 slots per node; 2 means pairs
 #define PATH_SIZE 128u // initial slots for nodes to see while traversing the pairs three, TODO: automatically extend if needed (costly...)
 
 typedef struct __align__(8) {

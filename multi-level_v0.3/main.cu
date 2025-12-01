@@ -242,9 +242,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_touching, touching_hedges.size() * sizeof(uint32_t))); // contigous inbound+outbout sets array
     CUDA_CHECK(cudaMalloc(&d_touching_offsets, touching_hedge_offsets.size() * sizeof(uint32_t))); // node -> touching set start idx in d_touching
     CUDA_CHECK(cudaMalloc(&d_hedge_weights, num_hedges * sizeof(float))); // hedge -> weight
-    CUDA_CHECK(cudaMalloc(&d_pairs, num_nodes * sizeof(uint32_t) * MAX_CANDIDATES)); // node -> best neighbor
-    CUDA_CHECK(cudaMalloc(&d_scores, num_nodes * sizeof(float) * MAX_CANDIDATES)); // connection streght for each pair
-    CUDA_CHECK(cudaMalloc(&d_slots, num_nodes * sizeof(slot) * MAX_GROUP_SIZE)); // slot to finalize node pairs during grouping (true dtype: "slot")
+    CUDA_CHECK(cudaMalloc(&d_pairs, num_nodes * sizeof(uint32_t))); // node -> best neighbor
+    CUDA_CHECK(cudaMalloc(&d_scores, num_nodes * sizeof(float))); // connection streght for each pair
+    CUDA_CHECK(cudaMalloc(&d_slots, num_nodes * sizeof(slot))); // slot to finalize node pairs during grouping (true dtype: "slot")
     CUDA_CHECK(cudaMalloc(&d_partitions, num_nodes * sizeof(uint32_t))); // node -> partition id
     
     // copy to device
@@ -315,11 +315,11 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemset(d_groups, 0x00, curr_num_nodes * sizeof(uint32_t)));
 
         // zero-out this level's outputs
-        CUDA_CHECK(cudaMemset(d_pairs, 0xFF, num_nodes * sizeof(uint32_t) * MAX_CANDIDATES)); // 0xFF -> UINT32_MAX
+        CUDA_CHECK(cudaMemset(d_pairs, 0xFF, num_nodes * sizeof(uint32_t))); // 0xFF -> UINT32_MAX
         // NOTE: no need to init. "d_scores" if we use "d_pairs" to see which locations are valid
         slot init_slot; init_slot.id = 0xFFFFFFFFu; init_slot.score = 0u;
         thrust::device_ptr<slot> d_slots_ptr(d_slots);
-        thrust::fill(d_slots_ptr, d_slots_ptr + num_nodes * MAX_GROUP_SIZE, init_slot); // upper 32 bits to 0x00, lower 32 to 0xFF
+        thrust::fill(d_slots_ptr, d_slots_ptr + num_nodes, init_slot); // upper 32 bits to 0x00, lower 32 to 0xFF
 
         // the upper "MAX_GROUP_SIZE" bits are the key for the inverse (multi)function assigning nodes to group in the previous level
         uint32_t bits_key = level_idx == 0 ? 0 : (~uint32_t(0) << (32 - MAX_GROUP_SIZE*level_idx)); // highest bits to 1
@@ -356,29 +356,28 @@ int main(int argc, char** argv) {
         // =============================
         // print some temporary results
         // TODO: remove me!
-        std::vector<uint32_t> pairs_tmp(curr_num_nodes * MAX_CANDIDATES);
-        std::vector<float> scores_tmp(curr_num_nodes * MAX_CANDIDATES);
-        std::vector<std::set<uint32_t>> candidates_count(MAX_CANDIDATES);
-        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * MAX_CANDIDATES, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_scores, curr_num_nodes * sizeof(float) * MAX_CANDIDATES, cudaMemcpyDeviceToHost));
-        std::cout << "Pairing results:";
+        std::vector<uint32_t> pairs_tmp(curr_num_nodes);
+        std::vector<float> scores_tmp(curr_num_nodes);
+        uint32_t min = 0xFFFFFFFF, max = 0;
+        std::set<uint32_t> candidates_count;
+        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_scores, curr_num_nodes * sizeof(float), cudaMemcpyDeviceToHost));
+        std::cout << "Pairing results:\n";
         for (uint32_t i = 0; i < curr_num_nodes; ++i) {
-            if (i < std::min<uint32_t>(curr_num_nodes, 20))
-            std::cout << "\n  node " << i << " ->";
-            for (uint32_t j = 0; j < MAX_CANDIDATES; ++j) {
-                float score = scores_tmp[i * MAX_CANDIDATES + j];
-                uint32_t target = pairs_tmp[i * MAX_CANDIDATES + j];
-                candidates_count[j].insert(target);
-                if (i < std::min<uint32_t>(curr_num_nodes, 20)) {
-                    if (target == UINT32_MAX) std::cout << " (target=none score=none) ";
-                    else if (target == i) std::cout << " !!SELF TARGETED!! ";
-                    else std::cout << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ") ";
-                }
+            uint32_t target = pairs_tmp[i];
+            float score = scores_tmp[i];
+            min = std::min(min, target);
+            max = std::max(max, target);
+            if (target == i)
+                std::cout << "  node " << i << " -> SELF TARGETED, WARNING!!\n";
+            candidates_count.insert(target);
+            if (i < std::min<uint32_t>(curr_num_nodes, 20)) {
+                if (target == UINT32_MAX) std::cout << "node " << i << " -> target=none score=none\n";
+                else std::cout << "  node " << i << " ->" << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << "\n";
             }
         }
-        std::cout << "\n";
-        for (uint32_t j = 0; j < MAX_CANDIDATES; ++j)
-            std::cout << "Candidates count (" << j << "): " << candidates_count[j].size() << "\n";
+        std::cout << "  min = " << min << " max = " << max << "\n";
+        std::cout << "Candidates count: " << candidates_count.size() << "\n";
         // =============================
 
         // launch configuration - grouping kernel
@@ -426,10 +425,30 @@ int main(int argc, char** argv) {
         uint32_t new_num_nodes = t_headflags.back() + 1;
         uint32_t new_bits_key = (~uint32_t(0) << (32 - MAX_GROUP_SIZE*(level_idx + 1))); // highest bits to 1
         uint32_t new_bits_key_negated = ~new_bits_key; // highest bits to 0, everything else 1
+        //CUDA_CHECK(cudaMemcpy(&new_num_nodes, thrust::raw_pointer_cast(t_headflags.data()) + (curr_num_nodes - 1), sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        // ===================================================
+        // === additional code to add (multi)function bits ===
+        // compute the rank inside each group; t_same[i] = 1 if "i" is in the same group as the previous element, 0 otherwise
+        thrust::device_vector<uint32_t> t_same(curr_num_nodes);
+        t_same[0] = 0;
+        thrust::transform(t_headflags.begin() + 1, t_headflags.end(), t_headflags.begin(), t_same.begin() + 1, [] __device__ (uint32_t curr, uint32_t prev) { return (curr == prev) ? 1u : 0u; });
+        // inclusive_scan by key (multiple scan, each limited to its key = group), gives the running ranks per group inside t_same
+        thrust::inclusive_scan_by_key(t_headflags.begin(), t_headflags.end(), t_same.begin(), t_same.begin());
+        // combine group ids with the high-bits one-hot encoding the inside-group rank
+        thrust::device_vector<uint32_t> t_encoded(curr_num_nodes);
+        thrust::transform(thrust::make_zip_iterator(make_tuple(t_headflags.begin(), t_same.begin())), thrust::make_zip_iterator(make_tuple(t_headflags.end(), t_same.end())), t_encoded.begin(),
+        [new_bits_key_negated] __device__ (auto t) {
+                uint32_t cid  = thrust::get<0>(t);
+                uint32_t rank = thrust::get<1>(t);
+                uint32_t high = (1u << (31u - rank));
+                uint32_t low  = cid & new_bits_key_negated;
+                return high | low;
+            }
+        );
+        // ===================================================
         // scatter the new ids back to original positions using the sequence; for sorted position i, original index is d_indices[i]; we want: d_groups[d_indices[i]] = t_headflags[i]
-        thrust::scatter(t_headflags.begin(), t_headflags.end(), d_indices.begin(), t_groups);
-
-        // TODO: apply (multi)function one-hot encoding bits kernel here!
+        //thrust::scatter(t_headflags.begin(), t_headflags.end(), d_indices.begin(), t_groups);
+        thrust::scatter(t_encoded.begin(), t_encoded.end(), d_indices.begin(), t_groups);
 
         // if the number of groups has reached the required threshold, they become the partitions
         // TODO: set the threshold
@@ -443,22 +462,19 @@ int main(int argc, char** argv) {
         // =============================
         // print some temporary results
         // TODO: remove me!
-        std::vector<slot> slots_tmp(curr_num_nodes);
-        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * MAX_CANDIDATES, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(slots_tmp.data(), d_slots, curr_num_nodes * sizeof(slot) * MAX_GROUP_SIZE, cudaMemcpyDeviceToHost));
+        std::vector<uint32_t> pairs(curr_num_nodes);
+        std::vector<slot> slots(curr_num_nodes);
+        CUDA_CHECK(cudaMemcpy(pairs.data(), d_pairs, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(slots.data(), d_slots, curr_num_nodes * sizeof(slot), cudaMemcpyDeviceToHost));
         std::set<uint32_t> groups_count;
         std::cout << "Grouping results:\n";
         for (uint32_t i = 0; i < curr_num_nodes; ++i) {
-            uint32_t target = pairs_tmp[i];
-            uint32_t group = slots_tmp[i].id;
+            uint32_t target = pairs[i];
+            uint32_t group = slots[i].id;
             groups_count.insert(group);
             if (i < std::min<uint32_t>(curr_num_nodes, 20)) {
-                std::cout << "  node " << i << " ->";
-                for (uint32_t j = 0; j < MAX_CANDIDATES; ++j) {
-                    if (target == UINT32_MAX) std::cout << "target=none\n";
-                    else std::cout << " (" << j << " target=" << target << ")";
-                }
-                std::cout << " group=" << group << "\n";
+                if (target == UINT32_MAX) std::cout << "node " << i << " -> target=none group=none rank=none\n";
+                else std::cout << "  node " << i << " ->" << " target=" << target << " group=" << group << "\n";
             }
         }
         std::cout << "Groups count: " << groups_count.size() << "\n";

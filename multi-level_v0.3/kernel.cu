@@ -188,8 +188,8 @@ void candidates_kernel(
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
 
     // all threads in the warp should agree on those...
-    uint32_t best_score[MAX_CANDIDATES] = {0};
-    uint32_t best_neighbor[MAX_CANDIDATES] = {UINT32_MAX};
+    uint32_t best_score = 0;
+    uint32_t best_neighbor = UINT32_MAX;
 
     // handle HIST_SIZE neighbors at a time
     for (; my_neighbors < not_my_neighbors; my_neighbors += HIST_SIZE) {
@@ -231,33 +231,16 @@ void candidates_kernel(
         // tie-breaker: lower id node wins; invariant: partial neighbors order
 
         // reduce local histograms between threads (each thread will see the full histogram)
-        // TODO: could stop at min(HIST_SIZE, neighbors_count) if we don't set neighbors_count to 0 as a stopping condition earliers...
         for (uint32_t nb = 0; nb < HIST_SIZE; nb++)
             histogram[nb].score = warpReduceSum<uint32_t>(histogram[nb].score);
 
         // reduce max in histogram between threads (each thread grabs a different bin)
         for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
-            // get the best MAX_CANDIDATES candidates out of the histogram
-            uint32_t curr_neighbor = histogram[nb].node;
-            uint32_t curr_score = histogram[nb].score;
-            for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
-                bin max = warpReduceMax(curr_score, curr_neighbor);
-                // TODO: only "lane_id = 0" actually needs to do all of this...
-                for (uint32_t j = 0; j < MAX_CANDIDATES; j++) {
-                    if (max.score > best_score[j] || max.score == best_score[j] && max.node < best_neighbor[j]) {
-                        for (uint32_t t = MAX_CANDIDATES - 1; t > j; t--) {
-                            best_score[t] = best_score[t - 1];
-                            best_neighbor[t] = best_neighbor[t - 1];
-                        }
-                        best_score[j] = max.score;
-                        best_neighbor[j] = max.node;
-                        break;
-                    }
-                }
-                if (curr_neighbor == max.node) {
-                    curr_neighbor = UINT32_MAX;
-                    curr_score = 0;
-                }
+            bin max = warpReduceMax(histogram[nb].score, histogram[nb].node);
+            //if (((unsigned long long)max.score << 32) | ((unsigned long long)max.node & 0xffffffffull) > ((unsigned long long)best_score << 32) | ((unsigned long long)best_neighbor & 0xffffffffull)) {
+            if (max.score > best_score || max.score == best_score && max.node < best_neighbor) {
+                best_score = max.score;
+                best_neighbor = max.node;
             }
         }
 
@@ -265,10 +248,8 @@ void candidates_kernel(
     }
 
     if (lane_id == 0) {
-        for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
-            pairs[warp_id * MAX_CANDIDATES + i] = best_neighbor[i]; // (multi)function bits already removed while building the histogram
-            scores[warp_id * MAX_CANDIDATES + i] = ((float)best_score[i])/FIXED_POINT_SCALE;
-        }
+        pairs[warp_id] = best_neighbor; // (multi)function bits already removed while building the histogram
+        scores[warp_id] = ((float)best_score)/FIXED_POINT_SCALE;
     }
 }
 
@@ -287,14 +268,15 @@ void grouping_kernel(
 
     // STYLE: one node per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) {
-        for (uint32_t i = 0; i < 2*MAX_CANDIDATES; i++)
-            grid.sync();
-        return;
-    }
+    if (tid >= num_nodes) return;
 
     int32_t path_length = 0;
     uint32_t path[PATH_SIZE];
+
+    uint32_t current = tid; // current node in the tree of pairs
+    uint32_t target = pairs[tid]; // target node of "current"
+    uint32_t target_target = pairs[target]; // target node of "target"
+    uint32_t score = (uint32_t)(scores[tid]*FIXED_POINT_SCALE); // score with which "current" points to "target"
 
     /*
     * Logic: a walk up (and down) the tree for grouping!
@@ -330,142 +312,71 @@ void grouping_kernel(
     * Could the upward walk be done in a single shot, no path required? Yes! But then you'd loose the ability to deterministially walk back and group by score!
     */
 
-    /*
-    * Beyond just pairs, multi-group upgrade:
-    * - use the "id" from the first slot as the final group reference
-    * - going upward, each node has MAX_GROUP_SIZE slots, you claim the first free one or the first one you beat:
-    *   - if you find a free slot, atomically settle there
-    *   - if you atomically beat someone, now repeat the process on the next slot, with your candidate becoming the guy you beat (essentially, go down the ladder,
-    *     atomically), if you exceed the MAX_GROUP_SIZE slots, ditch the candidate and break
-    *   - mutual pairs take each other's first slot, then proceed to agree on the best MAX_GROUP_SIZE-1 best slots all of theirs (slots are always sorted, use
-    *     a routine similar to merge-sort's merge)
-    * - going downward:
-    *   - option 1: if your entry is still there in your target, lock yourself up and stay with your target -> write you target's first "id" in your first slot
-    *     ISSUE: for one node that joins its target's group, MAX_GROUP_SIZE others are left behind, and some might have had a stronger connection with the node...
-    *   - option 2: while going downward, only lock one of your slots with your target, if possible, then keep a trail of MAX_GROUP_SIZE nodes before you, not of
-    *     just one, using the trail's length as a count of group size, and continously atomically checking, before locking another node, if the trail is still
-    *     valid, as in all targets of targets are still in a slot...
-    *     ISSUE: exponential complexity of the downard walk...
-    *  - option 3: if your entry is still there in your target, start copying all its slot over yours, but only if they are better, this way you may find that
-    *    you have a child that is much stronger, in this case you go and updated it atomically in the target...
-    *    ISSUE: two branches may do the updated at the same time you need to do another upward walk to re-validate groups afterwards...
-    *   => let's go with option 1, since the optimization "beyond just the first choice" will already refine groups further!
-    * ||
-    * Beyond just pairs, multi-group upgrade, version 2:
-    * - use the "id" from the first slot as the final group reference
-    * - going upward, each node has MAX_GROUP_SIZE slots, you claim the first free one or the first one you beat:
-    *   - if you find a free slot, atomically settle there
-    *   - if your "id" is already there, break (someone else "handled you" already)
-    *   - if you atomically beat someone, now repeat the process on the next slot, with your candidate becoming the guy you beat (essentially, go down the ladder,
-    *     atomically), if you exceed the MAX_GROUP_SIZE slots, ditch the candidate and break
-    *   - in both above cases, after you wrote your "id" in your target, you attempt to write there also the "id" of the previous node in your path (that is
-    *     the previous node you visited while going upward, that currently points to you) with the method, and repeat for up to MAX_GROUP_SIZE-1 nodes going back
-    *     - optimization to not be exponential in MAX_GROUP_SIZE: nodes before you will always have a score lower than yours, so you can start searching a slot
-    *       for them starting from where you wrote your own "id", and stop (not even continue back in the path) as soon as you finish the available target slots
-    *   - mutual pairs take each other's first slot, then proceed to agree on the MAX_GROUP_SIZE-1 best slots among all of theirs (slots are always sorted, use
-    *     a routine similar to merge-sort's merge), assuming each also received already the MAX_GROUP_SIZE-1 attempts to slot a node from those that lead to it
-    * - going downward:
-    *  - if your entry is still there in your target, start copying all its slot over yours, as to propagate downward the assembled group's information
-    *
-    * Beyond just the first choice:
-    * - let the candidates kernel return the top-k candidates (sorted) for each node, rather thank just pairs
-    * - run grouping like normal (even with multiple slots), but also propagate scores during the downward walk
-    * - synch after finishing the downward walk, then repeat the whole up-and-down with the next set of pairs; as they will all have lower scores, none of such
-    *   pairs will end up overwriting existing pairings (assumption: a grouping pass only creates optimal pairings)
-    *   - immediately return for nodes that already fulfilled their previous pair
-    *
-    * Note: cycles should still be impossible if I lock previous pairs! Otherwise, looking at all "second pairs" would allow for cycles longer than 2!
-    * Note: the global synch means that if a thread returns, the others are deadlocked? Check this! Otherwise just rerurn after the downward path
-    */
-
     // initialize yourself to a one-node group, unless someone already claimed you
     atomicCAS(&group_slots[tid].id, UINT32_MAX, tid);
 
-    for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
-        // if you formed a pair, stop
-        if (group_slots[tid].score == UINT32_MAX) {
-            grid.sync();
-            grid.sync();
-            continue;
-        }
-
-        uint32_t current = tid; // current node in the tree of pairs
-        uint32_t target = pairs[tid * MAX_CANDIDATES + i]; // target node of "current"
-        uint32_t target_target = pairs[target * MAX_CANDIDATES + i]; // target node of "target"
-        uint32_t score = (uint32_t)(scores[tid * MAX_CANDIDATES + i]*FIXED_POINT_SCALE); // score with which "current" points to "target"
-
-        // go up the tree
-        bool outcome = false;
-        if (target != UINT32_MAX) {
-            while (current != target_target) {
-                // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
-                outcome = atomic_max_on_slot(group_slots, target, current, score);
-                // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
-                if (!outcome) break;
-                // DEBUG: prevent cycles longer than 2!
-                /*bool die = false;
-                for (uint32_t j = 0; j < path_length; j++) {
-                    if (path[j] == target) {
-                        die = true;
-                        printf("Broke cycle between %d -> %d!\n", current, target);
-                        break;
-                    }
+    // go up the tree
+    bool outcome = false;
+    if (target != UINT32_MAX) {
+        while (current != target_target) {
+            // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
+            outcome = atomic_max_on_slot(group_slots, target, current, score);
+            // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
+            if (!outcome) break;
+            // DEBUG: prevent cycles longer than 2!
+            /*bool die = false;
+            for (uint32_t i = 0; i < path_length; i++) {
+                if (path[i] == target) {
+                    die = true;
+                    break;
                 }
-                if (die) break;*/
-                assert(path_length < PATH_SIZE);
-                path[path_length++] = target;
-                current = target;
-                target = target_target;
-                if (target == UINT32_MAX) break; // alternative root: a node with no target
-                target_target = pairs[target_target * MAX_CANDIDATES + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
-                score = (uint32_t)(scores[current * MAX_CANDIDATES + i]*FIXED_POINT_SCALE);
             }
+            if (die) break;*/
+            assert(path_length < PATH_SIZE);
+            path[path_length++] = target;
+            current = target;
+            target = target_target;
+            if (target == UINT32_MAX) break; // alternative root: a node with no target
+            target_target = pairs[target_target]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
+            score = (uint32_t)(scores[current]*FIXED_POINT_SCALE);
         }
-        // handle "root(s)" as a pair of nodes pointing to each other
-        // NOTE: concurrent writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
-        if (outcome) { // "&& target != UINT32_MAX" is implied by "outcome" not being false
-            const uint32_t lowest_id = min(current, target);
-            group_slots[current].id = lowest_id;
-            group_slots[current].score = score;
-            group_slots[target].id = lowest_id;
-            group_slots[target].score = score;
-        }
+    }
+    // handle "root(s)" as a pair of nodes pointing to each other
+    // NOTE: concurrent writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
+    if (outcome) { // "&& target != UINT32_MAX" is implied by "outcome" not being false
+        const uint32_t lowest_id = min(current, target);
+        group_slots[current].id = lowest_id;
+        group_slots[current].score = score;
+        group_slots[target].id = lowest_id;
+        group_slots[target].score = score;
+    }
 
-        // global synch
-        grid.sync();
+    // global synch
+    grid.sync();
 
-        // go down the tree
-        // it the root had no target, path[path_length - 1] is the root, if the root was a mutual-poiting pair, path[path_length - 1] is the first encountered node of the pair
-        for (path_length = path_length - 2; path_length >= 0; path_length--) {
-            // NOTE: on the first iteration, coming from the upward walk, "current" is the last node that got its slot updated
-            target = current; // this is "who current would have liked to be with", the node one step back up the ladder towards root
-            current = path[path_length];
-            if (group_slots[target].id == current) {
-                // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine
-                group_slots[current].id = current;
-                // NOTE: lock groups by setting scores to the maximum
-                group_slots[current].score = UINT32_MAX;
-                group_slots[target].score = UINT32_MAX;
-                // NOTE: after a successful link the next node down the path has already lost its target, so we might as well skip it
-                path_length--;
-            }
+    // go down the tree
+    // it the root had no target, path[path_length - 1] is the root, if the root was a mutual-poiting pair, path[path_length - 1] is the first encountered node of the pair
+    for (path_length = path_length - 2; path_length >= 0; path_length--) {
+        // NOTE: on the first iteration, coming from the upward walk, "current" is the last node that got its slot updated
+        target = current; // this is "who current would have liked to be with", the node one step back up the ladder towards root
+        current = path[path_length];
+        if (group_slots[target].id == current) {
+            // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine
+            group_slots[current].id = current;
+            // NOTE: do we even care about the score now?
+            //group_slots[current].score = group_slots[target].id;
+            // NOTE: after a successful link the next node down the path has already lost its target, so we might as well skip it
+            path_length--;
         }
-        // the path did not include the "tid" node, handle it here iff you did not happen to group path[0] with path[1] during the last iteration above (leading to path_length == -2)
-        if (path_length == -1) {
-            target = current;
-            current = tid;
-            if (group_slots[target].id == current) {
-                group_slots[current].id = current;
-                 // lock groups by setting scores to the maximum
-                group_slots[current].score = UINT32_MAX;
-                group_slots[target].score = UINT32_MAX;
-            }
+    }
+    // the path did not include the "tid" node, handle it here iff you did not happen to group path[0] with path[1] during the last iteration above (leading to path_length == -2)
+    if (path_length == -1) {
+        target = current;
+        current = tid;
+        if (group_slots[target].id == current) {
+            group_slots[current].id = current;
+            //group_slots[current].score = group_slots[target].id;
         }
-        
-        // global synch
-        grid.sync();
-
-        path_length = 0;
     }
 }
 
