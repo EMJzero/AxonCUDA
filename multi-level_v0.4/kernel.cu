@@ -743,7 +743,6 @@ void fm_refinement_gains_kernel(
 
         // scan touching hyperedges
         // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
-        // NOTE: interpret this as "for each hedge, see if you moving to a certain partition is something that they like or not"
         for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
             const uint32_t actual_hedge_idx = *hedge_idx;
             const uint32_t* my_pin_per_partition = pins_per_partitions + hedge_idx * num_partitions;
@@ -763,8 +762,8 @@ void fm_refinement_gains_kernel(
                     // hedge connected to my partition: gain the hedge's weight iff moving would disconnect it from my partition (I am its last pin left there)
                     if (counter == 1 && curr_base_part + p == my_partition)
                         gain = my_hedge_weight;
-                    // hedge not yet connected to the partition: pay the hedge's weight iff moving there connects it to the new partition (I would become its first pin there)
-                    else if (counter == 0 && curr_base_part + p != my_partition)
+                    // hedge not yet connected to my partition: pay the hedge's weight iff moving there connects it to the new partition (I would become its first pin there)
+                    else if (counter == 0 && curr_base_part + p == my_partition)
                         gain = -my_hedge_weight;
                     // update local histogram
                     histogram[p] += counter*my_hedge_weight;
@@ -793,150 +792,35 @@ void fm_refinement_gains_kernel(
     }
 }
 
-// find the gain of each move under the HP that all higher-score moves have been applied
-// SEQUENTIAL COMPLEXITY: n*h*d
-// PARALLEL OVER: n
-// SHUFFLES OVER: d
+// find moves of nodes from one partition to another that yield a positive gain
 __global__
-void fm_refinement_cascade_kernel(
-    const uint32_t* hedges,
-    const uint32_t* hedge_offsets,
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
-    const float* hedge_weights,
-    // CHOOSE: either rank nodes by their score and pass "move_ranks" or pass "scores" and sort on the fly, with the node id as a tie-breaker
-    // CHOICE: sorted scores and move_ranks, because we need to keep scores in their current (sorted) order even after updating them
-    const uint32_t* move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
-    const uint32_t* moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
-    const uint32_t* partitions, // partitions[idx] is the partition node idx is part of
-    const uint32_t* pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
+void fm_refinement_apply_kernel(
+    const uint32_t* moves_node, // moves_node[idx] -> idx of the node that proposed the i-th highest-score move
+    const uint32_t* moves, // moves[i] -> i-th positive-gain move (target partition idx) by score
+    const float* scores, // scores[i] -> gain for i-th move
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
-    float* scores // scores[move_ranks[node_idx]] -> gain for node idx's move
+    const uint32_t num_good_moves,
+    uint32_t* partitions, // partitions[idx] is the partition node idx is part of
+    uint32_t* pins_per_partitions // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
 ) {
     // STYLE: one node (move) per warp!
     const uint32_t lane_id = threadIdx.x % WARP_SIZE;
     // global across blocks - coincides with the node to handle
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_nodes) return;
+    if (warp_id >= num_good_moves) return;
 
     /*
     * Idea (from HyperG):
     * - moves are sorted from the highest to lowest score
-    * - greedy assumption: all moves with a higher score get applied
-    * - therefore, for each move, recompute its score (gain) like in "fm_refinement_gains_kernel", but now assuming
-    *   each node with a higher score changed partition to the one specified by the move
-    * - write the new score in place of the previous one for each move, this then enables a scan to find the sequence of
-        "moves as if applied in isolation" that yields the highest total gain when applied all together
+    * - blind, greedy, assumption: all moves with a higher score get applied
+    * - therefore, for each move, recompute its score like in "fm_refinement_gains_kernel", but now assuming each
     *
     * NOTE: we assume that the # of partitions is close to the avg. hedge cardinality, from which iterating over pins_per_partitions is just as efficient as it would be to iterate over hedges!
     *
     * NOTE: no need for FIXED POINT here, since we don't need neither symmetry nor invariants!
-    *
-    * NOTE: re-evaluate here EVERY move, even negative-gain ones, because after applying all previous moves, they may become positive-gained!
-    *
-    * MAYBE: do NOT read "my_move_part_counter" and "my_move_part_counter", but for every pin you see read its "partitions[pin]" and from it
-    *        just recompute them while we are at it; this allow in-place updates to my_pin_per_partition without waiting for the global sync
+    * 
+    * MUST DO: update pins_per_partition here, after a global synch!
     */
-    
-    float score = 0.0f;
-
-    const uint32_t my_partition = partitions[warp_id];
-    const uint32_t my_move_rank = move_ranks[warp_id];
-    //const uint32_t my_move_score = scores[warp_id];
-    const uint32_t my_move_part = moves[warp_id];
-
-    const uint32_t* my_touching = touching + touching_offsets[warp_id];
-    const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
-    uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
-
-    // scan touching hyperedges
-    // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
-    for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-        const uint32_t actual_hedge_idx = *hedge_idx;
-        const uint32_t* my_hedge = hedges + hedge_offsets[actual_hedge_idx];
-        my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
-        const uint32_t* not_my_hedge = hedges + hedge_offsets[actual_hedge_idx + 1];
-        const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-        const uint32_t my_curr_part_counter = pins_per_partitions[actual_hedge_idx * num_partitions + my_partition];
-        const uint32_t my_move_part_counter = pins_per_partitions[actual_hedge_idx * num_partitions + my_move_part];
-        uint32_t my_curr_part_counter_delta = 0;
-        uint32_t my_move_part_counter_delta = 0;
-        for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
-            if (my_hedge < not_my_hedge) {
-                pin = *my_hedge;
-                // Option 1: sorting scores to build and pass the ranking of moves
-                if (move_ranks[pin] < my_move_rank) { // speculation: better-ranked move -> applied
-                // Option 2: compare scores on the fly and tie-break with the node ids
-                //if (scores[pin] > my_move_score || scores[pin] == my_move_score && pin < warp_id) { // speculation: better-ranked move -> applied
-                // NOTE: MUST use option (1) because we need to keep the original sorting of the scores even after updating them!
-                    uint32_t new_pin_partition = moves[pin];
-                    uint32_t prev_pin_partition = moves[pin];
-                    if (new_pin_partition == my_partition)
-                        my_curr_part_counter_delta++;
-                    else if (new_pin_partition == my_move_part)
-                        my_move_part_counter_delta++;
-                    if (prev_pin_partition == my_partition)
-                        my_curr_part_counter_delta--;
-                    else if (prev_pin_partition == my_move_part)
-                        my_move_part_counter_delta--;
-                }
-            }
-        }
-        // Option 1: the gain is the weighted connections count with another partition <minus> the weighted connections count with the current one
-        //score -= my_hedge_weight*(my_curr_part_counter + warpReduceSumLN0<uint32_t>(my_curr_part_counter_delta));
-        //score += my_hedge_weight*(my_move_part_counter + warpReduceSumLN0<uint32_t>(my_move_part_counter_delta));
-        // Option 2: the gain is the sum the weights of hedges such that moving to a certain partition the hedge (same as HyperG)
-        // gain the hedge's weight iff moving would disconnect the hedge from my partition (I am its last pin left there)
-        if (my_curr_part_counter + warpReduceSumLN0<uint32_t>(my_curr_part_counter_delta) == 1)
-            score += my_hedge_weight;
-        // pay the hedge's weight iff moving there connects the hedge to the new partition (I would become its first pin there)
-        if (my_move_part_counter + warpReduceSumLN0<uint32_t>(my_move_part_counter_delta) == 0)
-            score -= my_hedge_weight;
-    }
-
-    if (lane_id == 0 && score > 0)
-        scores[my_move_rank] = score;
-}
-
-// apply moves with a positive gain
-// SEQUENTIAL COMPLEXITY: n*h
-// PARALLEL OVER: n
-__global__
-void fm_refinement_apply_kernel(
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
-    const uint32_t* moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
-    const uint32_t* move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    const uint32_t num_good_moves, // idx + 1 of the maximum in the updated scores
-    uint32_t* partitions, // partitions[idx] is the partition node idx is part of
-    uint32_t* pins_per_partitions // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
-) {
-    // STYLE: one node (move) per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
-    
-    // stop at the last gain-increasing move
-    if (move_ranks[tid] >= num_good_moves) return;
-
-    const uint32_t my_partition = partitions[tid];
-    const uint32_t my_move_rank = move_ranks[tid];
-    const uint32_t my_move_part = moves[tid];
-
-    // update my partition
-    partitions[tid] = my_move_part;
-
-    const uint32_t* my_touching = touching + touching_offsets[tid];
-    const uint32_t* not_my_touching = touching + touching_offsets[tid + 1];
-
-    // scan touching hyperedges and update pins_per_partitions counts
-    for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-        const uint32_t actual_hedge_idx = *hedge_idx;
-        atomicAdd(&pins_per_partitions[actual_hedge_idx * num_partitions + my_partition], -1);
-        atomicAdd(&pins_per_partitions[actual_hedge_idx * num_partitions + my_move_part], 1);
-    }
 }

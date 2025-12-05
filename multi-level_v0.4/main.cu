@@ -112,35 +112,6 @@ extern __global__ void fm_refinement_gains_kernel(
     float* scores
 );
 
-extern __global__ void fm_refinement_cascade_kernel(
-    const uint32_t* hedges,
-    const uint32_t* hedge_offsets,
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
-    const float* hedge_weights,
-    const uint32_t* move_ranks,
-    const uint32_t* moves,
-    const uint32_t* partitions,
-    const uint32_t* pins_per_partitions,
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    float* scores
-);
-
-extern __global__ void fm_refinement_apply_kernel(
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
-    const uint32_t* moves,
-    const uint32_t* move_ranks,
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    const uint32_t num_good_moves,
-    uint32_t* partitions,
-    uint32_t* pins_per_partitions
-);
-
 using namespace hgraph;
 
 #define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
@@ -457,11 +428,11 @@ int main(int argc, char** argv) {
         // order groups kernel (parallel label compression)
         // TODO: custom kernel for this?
         // NOTE: overwrite "groups" with a map node -> new node id
-        thrust::device_vector<uint32_t> t_indices(curr_num_nodes);
-        thrust::sequence(t_indices.begin(), t_indices.end());
-        // sort by groups, carrying node indices (represented by the sequence) along; after d_groups is sorted, t_indices tells where each sorted element came from
+        thrust::device_vector<uint32_t> d_indices(curr_num_nodes);
+        thrust::sequence(d_indices.begin(), d_indices.end());
+        // sort by groups, carrying node indices (represented by the sequence) along; after d_groups is sorted, d_indices tells where each sorted element came from
         thrust::device_ptr<uint32_t> t_groups(d_groups);
-        thrust::sort_by_key(t_groups, t_groups + curr_num_nodes, t_indices.begin()); // sort groups and carry indices along for a ride
+        thrust::sort_by_key(t_groups, t_groups + curr_num_nodes, d_indices.begin());
         // build "head of group flags": 1 at first occurrence of each group in the sorted array, 0 otherwise ( flags[i] = 1 if i == 0 or d_groups[i] != d_groups[i-1] )
         thrust::device_vector<uint32_t> t_headflags(curr_num_nodes);
         // the first element is always a the head of the first group
@@ -471,12 +442,10 @@ int main(int argc, char** argv) {
         thrust::exclusive_scan(t_headflags.begin(), t_headflags.end(), t_headflags.begin()); // in-place
         // the last flag, after the scan, gives you the total number of distinct groups
         uint32_t new_num_nodes = t_headflags.back() + 1;
-        // scatter the new ids back to original positions using the sequence; for sorted position i, original index is t_indices[i]; we want: d_groups[t_indices[i]] = t_headflags[i]
-        thrust::scatter(t_headflags.begin(), t_headflags.end(), t_indices.begin(), t_groups);
+        // scatter the new ids back to original positions using the sequence; for sorted position i, original index is d_indices[i]; we want: d_groups[d_indices[i]] = t_headflags[i]
+        thrust::scatter(t_headflags.begin(), t_headflags.end(), d_indices.begin(), t_groups);
         // if the number of groups has reached the required threshold, they become the partitions
 
-        // ======================================
-        // base case, return inital partitioning
         // TODO: set the threshold
         // TODO: could increase the threshold and instead of "become the partitions" run a host-side robust partitioning algorithm
         //       => what this does now is equivalent to using the coarsening algorithm also as the algorithm to perform the initial partitioning
@@ -511,7 +480,6 @@ int main(int argc, char** argv) {
 
             return new_num_nodes;
         }
-        // ======================================
 
         // =============================
         // print some temporary results
@@ -579,13 +547,13 @@ int main(int argc, char** argv) {
             d_offsets,
             num_hedges,
             d_groups,
-            d_touching_offsets // written by each group, from idx 0 to new_num_nodes - 1 + 1
+            d_touching_offsets
         );
         thrust::device_ptr<uint32_t> t_touching_offsets(d_touching_offsets);
-        thrust::exclusive_scan(t_touching_offsets, t_touching_offsets + (new_num_nodes + 1), t_touching_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
+        thrust::exclusive_scan(t_touching_offsets, t_touching_offsets + (num_nodes + 1), t_touching_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
         uint32_t *d_touching_counter = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_touching_counter, new_num_nodes * sizeof(uint32_t))); // node -> number of touching hedges seen as of now
-        CUDA_CHECK(cudaMemset(d_touching_counter, 0x00, new_num_nodes * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_touching_counter, num_nodes * sizeof(uint32_t))); // node -> number of touching hedges seen as of now
+        CUDA_CHECK(cudaMemset(d_touching_counter, 0x00, num_nodes * sizeof(uint32_t)));
         apply_coarsening_touching_scatter<<<blocks, threads_per_block>>>(
             d_hedges,
             d_offsets,
@@ -599,12 +567,10 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaFree(d_touching_counter));
 
-        // ======================================
         // recursive call, go down one more level
         uint32_t num_partitions = 0;
         //uint32_t num_partitions = coarsen_refine_uncoarsen(level_idx + 1, new_num_nodes);
-        // ======================================
-
+        
         std::cout << "Refining level " << level_idx << ", remaining nodes=" << curr_num_nodes << "number of partitions=" << num_partitions << "\n";
 
         // zero-out this kernel's outputs
@@ -632,79 +598,26 @@ int main(int argc, char** argv) {
             curr_num_nodes,
             num_partitions,
             // NOTE: repurposing those from the candidates kernel!
-            d_pairs, // -> moves
+            d_pairs,
             d_scores
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
-        // sort scores and build an array of ranks (node id -> his move's idx in sorted scores)
-        //thrust::device_vector<int> t_indices(curr_num_nodes); // temporary sequence sorted alongside scores -> ALREADY DECLARED FOR COARSEING, reuse!
-        thrust::sequence(t_indices.begin(), t_indices.end());
-        uint32_t *d_ranks = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_ranks, curr_num_nodes * sizeof(uint32_t))); // node -> number of touching hedges seen as of now
-        thrust::device_ptr<uint32_t> t_ranks(d_ranks);
-        thrust::device_ptr<uint32_t> t_scores(d_scores);
-        thrust::sort_by_key(d_scores, d_scores + curr_num_nodes, t_indices.begin()); // sort scores according to scores themselves and indices in the same way
-        thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks.begin()); // invert the permutation such that: ranks[original_index] = sorted_position
-        // launch configuration - fm-ref cascade kernel => same as "fm-ref gains kernel"
-        // compute shared memory per block (bytes)
-        bytes_per_warp = 0; //TODO
-        shared_bytes = warps_per_block * bytes_per_warp;
-        // launch - fm-ref cascade kernel
-        std::cout << "Running fm-ref gains kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        fm_refinement_cascade_kernel<<<blocks, threads_per_block, shared_bytes>>>(
-            d_hedges,
-            d_offsets,
-            d_touching,
-            d_touching_offsets,
-            d_hedge_weights,
-            d_ranks,
-            d_pairs,
-            d_partitions,
-            d_pins_per_partitions,
-            num_hedges,
-            curr_num_nodes,
-            num_partitions,
-            d_scores
-        );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        // not re-sorting the scores array means you have the array ordered as per the initial scores,
-        // but now, this scan updates the scores "as if all previous moves were applied"!
-        thrust::inclusive_scan(t_scores, t_scores + curr_num_nodes, t_scores); // in-place (we don't need scores anymore anyway)
-        auto iter_max_scores = thrust::max_element(t_scores, t_scores + curr_num_nodes); // find the point in the sequence of moves where applying them further never nets a higher gain
-        uint32_t num_good_moves = iter_max_scores - t_scores + 1; // "+1" to make this the improving moves count, rather than the last improving move's idx
-        // launch configuration - fm-ref apply kernel
-        threads_per_block = 128;
-        num_threads_needed = curr_num_nodes; // 1 thread per move to apply
-        blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-        // launch - fm-ref apply kernel
-        fm_refinement_apply_kernel<<<blocks, threads_per_block, shared_bytes>>>(
-            d_touching,
-            d_touching_offsets,
-            d_pairs,
-            d_ranks,
-            num_hedges,
-            curr_num_nodes,
-            num_partitions,
-            num_good_moves,
-            d_partitions,
-            d_pins_per_partitions
-        );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaFree(d_ranks));
+        // TODO 1: count (reduce) moves with a score > 0, that will give you the number of threads to start for the next kernel!
+        // TODO 2: thrust sort a sequence of node ids key-ed by scores
+        // TODO 2.2: then invert the sequence's context with the sequence's indices (TODO: maybe this could be done in one-shot?)
+        // TODO 3: thrust sort moves key-ed by scores
+        // TODO 4: thrust sort scores
 
         std::cout << "Uncoarsening level " << level_idx << ", remaining nodes=" << curr_num_nodes << "\n";
 
         // launch configuration - uncoarsen kernel
         // launch - uncoarsen kernel
         // required kernels:
-        // - uncoarsen touching -> set the upper bits of the hedge id in one-hot encoding for the node in the ...
-        // - NO NEED TO uncoarsen neighbors -> not used for refinement
-        // - uncoarsen hedges
+        // - uncoarsen touching -> set the upper bits of the hedge id in one-hot encoding for the node in the .
+        // - uncoarsen neighbors -> not used for refinement
+        // - NO NEED TO uncoarsen hedges -> not used for refinement
         // - uncoarsen partitions
-        // - uncoarsen pins-per-partition (compute or update? complexity is O(e*d) = O(n*h) regardless, but updating requires atomics... => if recompute, remove it from fm_refinement_apply_kernel!)
         // NOTE: no need for (multi)function bits! We never truly invert groups aside from expanding partitions!
         /*
         * To uncoarsen partitions just use "d_groups" like this:

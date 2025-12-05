@@ -53,6 +53,7 @@ run: $(TARGET)
 		./$(TARGET) -r $(RUN_ARG); \
 	fi
 
+#   make run8k
 run8k: $(TARGET)
 	./$(TARGET) -r hgraphs/8k_model_ordered_processed
 

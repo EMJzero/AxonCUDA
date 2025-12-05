@@ -700,9 +700,9 @@ int main(int argc, char** argv) {
         // launch configuration - uncoarsen kernel
         // launch - uncoarsen kernel
         // required kernels:
-        // - uncoarsen touching -> set the upper bits of the hedge id in one-hot encoding for the node in the ...
-        // - NO NEED TO uncoarsen neighbors -> not used for refinement
-        // - uncoarsen hedges
+        // - uncoarsen touching -> set the upper bits of the hedge id in one-hot encoding for the node in the .
+        // - uncoarsen neighbors -> not used for refinement
+        // - NO NEED TO uncoarsen hedges -> not used for refinement
         // - uncoarsen partitions
         // - uncoarsen pins-per-partition (compute or update? complexity is O(e*d) = O(n*h) regardless, but updating requires atomics... => if recompute, remove it from fm_refinement_apply_kernel!)
         // NOTE: no need for (multi)function bits! We never truly invert groups aside from expanding partitions!
