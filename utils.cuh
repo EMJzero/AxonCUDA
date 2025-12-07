@@ -16,6 +16,12 @@ __device__ __forceinline__ void sm_init(uint32_t* sm, const uint32_t size, const
         sm[i] = val;
 }
 
+// initialize local memory
+__device__ __forceinline__ void lm_init(uint32_t* lm, const uint32_t size, const uint32_t val) {
+    for (int i = 0; i < size; i++)
+        lm[i] = val;
+}
+
 // every warp lane sees the max
 template <typename T>
 __forceinline__ __device__ T warpReduceSum(T val) {
@@ -45,7 +51,7 @@ __forceinline__ __device__ T warpReduceSumLN0(T val) {
 // USED BY: candidates kernel AND fm refinement kernel
 
 #define HIST_SIZE 64u // must be a multiple of WARP_SIZE (for the histogram max reduction)
-#define MAX_CANDIDATES 2u // => how many candidates are proposed for a node (ranked by score)
+#define MAX_CANDIDATES 4u // => how many candidates are proposed for a node (ranked by score)
 
 typedef struct {
     uint32_t node;
@@ -69,7 +75,7 @@ __forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
 // USED BY: grouping kernel
 
 #define MAX_GROUP_SIZE 1u // => MAX_GROUP_SIZE - 1 slots per node; 2 means pairs
-#define PATH_SIZE 128u // initial slots for nodes to see while traversing the pairs three, TODO: automatically extend if needed (costly...)
+#define PATH_SIZE 192u // initial slots for nodes to see while traversing the pairs three, TODO: automatically extend if needed (costly...)
 
 typedef struct __align__(8) {
     uint32_t id; // lower 32 bits (Nvidia GPUs are little-endian)
@@ -104,18 +110,21 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* s, uint32_t idx, ui
 
 // USED BY: coarsening routines
 
-#define MAX_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
-#define SM_MAX_HASHMAP_SIZE 4096u
+// NOTE: these are local memory! No theoretical size limit!
+#define MAX_DEDUPE_BUFFER_SIZE 16384u //8192u // for hedges and touching sets
+#define MAX_LARGE_DEDUPE_BUFFER_SIZE 32768u // for neighbors
 
 
-// SHARED MEMORY HASH-SET
+// HASH-SET
 
-// NOTE: before using the set, call "sm_init" with SM_HASH_EMPTY as the value!
+// NOTE: before using the set, call "sm_init" with HASH_EMPTY as the value!
 
-#define SM_HASH_EMPTY 0xFFFFFFFFu
+// TODO: replace all "%" operations in those helpers!!!!
+
+#define HASH_EMPTY 0xFFFFFFFFu
 
 // simple 32-bit hash, should be good enough for a small shared-memory hash-set
-__device__ __forceinline__ uint32_t sm_hash_uint32(uint32_t x) {
+__device__ __forceinline__ uint32_t hash_uint32(uint32_t x) {
     x ^= x >> 17;
     x *= 0xed5ad4bbU;
     x ^= x >> 11;
@@ -126,15 +135,17 @@ __device__ __forceinline__ uint32_t sm_hash_uint32(uint32_t x) {
     return x;
 }
 
+// SHARED MEMORY VERSION
+
 // insert a value into a shared-memory hash-set, returns "true" if the value was not in the set before
 __device__ __forceinline__ bool sm_hashset_insert(uint32_t* table, const uint32_t size, const uint32_t value) {
-    uint32_t h = sm_hash_uint32(value);
+    uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
         int slot_idx = (idx + probe) % size;
         uint32_t* slot = &table[slot_idx];
-        uint32_t old = atomicCAS(slot, SM_HASH_EMPTY, value);
-        if (old == SM_HASH_EMPTY)
+        uint32_t old = atomicCAS(slot, HASH_EMPTY, value);
+        if (old == HASH_EMPTY)
             return true; // new value
         if (old == value)
             return false; // value already present
@@ -146,14 +157,14 @@ __device__ __forceinline__ bool sm_hashset_insert(uint32_t* table, const uint32_
 
 // lookup a value into a shared-memory hash-set, returns "true" if the value was found
 __device__ __forceinline__ bool sm_hashset_contains(const uint32_t* table, const uint32_t size, const uint32_t value) {
-    uint32_t h = sm_hash_uint32(value);
+    uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
         int slot_idx = (idx + probe) % size;
         uint32_t cur = table[slot_idx];
         if (cur == value)
             return true;
-        if (cur == SM_HASH_EMPTY)
+        if (cur == HASH_EMPTY)
             return false;
         // else: collision, keep probing
     }
@@ -161,10 +172,45 @@ __device__ __forceinline__ bool sm_hashset_contains(const uint32_t* table, const
     return false;
 }
 
+// LOCAL MEMORY VERSION
 
-// SHARED MEMORY HASH-MAP
+__device__ __forceinline__ bool lm_hashset_insert(uint32_t* table, const uint32_t size, const uint32_t value) {
+    uint32_t h = hash_uint32(value);
+    int idx = h % size;
+    for (int probe = 0; probe < size; ++probe) {
+        int slot_idx = (idx + probe) % size;
+        uint32_t cur = table[slot_idx];
+        if (cur == HASH_EMPTY) {
+            table[slot_idx] = value;
+            return true;
+        }
+        if (cur == value)
+            return false;
+    }
+    assert(false && "LM hash-set full!");
+    return false;
+}
+
+__device__ __forceinline__ bool lm_hashset_contains(const uint32_t* table, const uint32_t size, const uint32_t value) {
+    uint32_t h = hash_uint32(value);
+    int idx = h % size;
+    for (int probe = 0; probe < size; ++probe) {
+        int slot_idx = (idx + probe) % size;
+        uint32_t cur = table[slot_idx];
+        if (cur == value)
+            return true;
+        if (cur == HASH_EMPTY)
+            return false;
+    }
+    return false;
+}
+
+
+//  HASH-MAP
 
 // NOTE: this reuses defines and hash function from the hash-set above
+
+// SHARED MEMORY VERSION
 
 typedef struct {
     uint32_t key;
@@ -172,13 +218,13 @@ typedef struct {
 } hashmap_entry;
 
 __device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t value) {
-    uint32_t h = sm_hash_uint32(key);
+    uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
         int slot = (idx + probe) % size;
         uint32_t* key_ptr = &table[slot].key;
-        uint32_t old_key  = atomicCAS(key_ptr, SM_HASH_EMPTY, key);
-        if (old_key == SM_HASH_EMPTY) { // insert new value
+        uint32_t old_key  = atomicCAS(key_ptr, HASH_EMPTY, key);
+        if (old_key == HASH_EMPTY) { // insert new value
             table[slot].value = value;
             return true;
         }
@@ -193,7 +239,7 @@ __device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* table, const ui
 }
 
 __device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t* out_value) {
-    uint32_t h = sm_hash_uint32(key);
+    uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
         int slot = (idx + probe) % size;
@@ -202,11 +248,48 @@ __device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* table, co
             *out_value = table[slot].value;
             return true;
         }
-        if (cur_key == SM_HASH_EMPTY) {
+        if (cur_key == HASH_EMPTY)
             return false;
-        }
         // else: collision, keep probing
     }
     // table full: considered a not-found
     return false; 
+}
+
+// LOCAL MEMORY VERSION
+
+__device__ __forceinline__ bool lm_hashmap_insert(hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t value) {
+    uint32_t h = hash_uint32(key);
+    int idx = h % size;
+    for (int probe = 0; probe < size; ++probe) {
+        int slot = (idx + probe) % size;
+        uint32_t cur_key = table[slot].key;
+        if (cur_key == HASH_EMPTY) {
+            table[slot].key   = key;
+            table[slot].value = value;
+            return true;
+        }
+        if (cur_key == key) {
+            table[slot].value = value;
+            return false;
+        }
+    }
+    assert(false && "LM hash-map full!");
+    return false;
+}
+
+__device__ __forceinline__ bool lm_hashmap_lookup(const hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t* out_value) {
+    uint32_t h = hash_uint32(key);
+    int idx = h % size;
+    for (int probe = 0; probe < size; ++probe) {
+        int slot = (idx + probe) % size;
+        uint32_t cur_key = table[slot].key;
+        if (cur_key == key) {
+            *out_value = table[slot].value;
+            return true;
+        }
+        if (cur_key == HASH_EMPTY)
+            return false;
+    }
+    return false;
 }
