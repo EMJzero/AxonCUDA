@@ -163,7 +163,7 @@ void candidates_kernel(
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     uint32_t* pairs,
-    float* scores
+    uint32_t* scores
 ) {
     // STYLE: one node per warp!
     const uint32_t lane_id = threadIdx.x % WARP_SIZE;
@@ -194,8 +194,11 @@ void candidates_kernel(
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
 
     // all threads in the warp should agree on those...
-    uint32_t best_score[MAX_CANDIDATES] = {0};
-    uint32_t best_neighbor[MAX_CANDIDATES] = {UINT32_MAX};
+    // TODO: only keep these in lane 0!
+    uint32_t best_score[MAX_CANDIDATES];
+    lm_init(best_score, MAX_CANDIDATES, 0);
+    uint32_t best_neighbor[MAX_CANDIDATES];
+    lm_init(best_neighbor, MAX_CANDIDATES, UINT32_MAX);
 
     // handle HIST_SIZE neighbors at a time
     for (; my_neighbors < not_my_neighbors; my_neighbors += HIST_SIZE) {
@@ -204,8 +207,6 @@ void candidates_kernel(
             if (nb < neighbors_count) {
                 const uint32_t my_neighbor = my_neighbors[nb];
                 histogram[nb].node = my_neighbor;
-                //if (my_neighbor == UINT32_MAX) // reached blank neighbors area left by coarsening
-                //    neighbors_count = 0;
             } else
                 histogram[nb].node = UINT32_MAX;
             histogram[nb].score = 0;
@@ -252,15 +253,14 @@ void candidates_kernel(
         */
 
         // reduce local histograms between threads (each thread will see the full histogram)
-        // TODO: could stop at min(HIST_SIZE, neighbors_count) if we don't set neighbors_count to 0 as a stopping condition earliers...
-        for (uint32_t nb = 0; nb < HIST_SIZE; nb++)
+        for (uint32_t nb = 0; nb < HIST_SIZE && nb < neighbors_count; nb++)
             histogram[nb].score = warpReduceSum<uint32_t>(histogram[nb].score);
 
         // reduce max in histogram between threads (each thread grabs a different bin)
         for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
             // get the best MAX_CANDIDATES candidates out of the histogram
             uint32_t curr_neighbor = histogram[nb].node;
-            uint32_t curr_score = histogram[nb].score;
+            uint32_t curr_score = histogram[nb].score + deterministic_noise(curr_neighbor, warp_id); // NOTE: adding a little bit of symmetric deterministic noise
             for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
                 bin max = warpReduceMax(curr_score, curr_neighbor);
                 // TODO: only "lane_id = 0" actually needs to do all of this...
@@ -288,7 +288,7 @@ void candidates_kernel(
     if (lane_id == 0) {
         for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
             pairs[warp_id * MAX_CANDIDATES + i] = best_neighbor[i];
-            scores[warp_id * MAX_CANDIDATES + i] = ((float)best_score[i])/FIXED_POINT_SCALE;
+            scores[warp_id * MAX_CANDIDATES + i] = best_score[i]; // stay fixed point for now!
         }
     }
 }
@@ -300,7 +300,7 @@ void candidates_kernel(
 __global__
 void grouping_kernel(
     const uint32_t* pairs, // pairs[idx] is the partner idx wants to be grouped with
-    const float* scores, // pairs[idx] is the partner idx wants to be grouped with
+    const uint32_t* scores, // pairs[idx] is the partner idx wants to be grouped with
     const uint32_t num_nodes,
     slot* group_slots, // initialized with -1 on the id
     uint32_t* groups // uninitialized, final group id of each node (non-zero based for now)
@@ -395,11 +395,12 @@ void grouping_kernel(
 
         uint32_t current = tid; // current node in the tree of pairs
         uint32_t target = pairs[tid * MAX_CANDIDATES + i]; // target node of "current"
-        uint32_t score = (uint32_t)(scores[tid * MAX_CANDIDATES + i]*FIXED_POINT_SCALE); // score with which "current" points to "target"
+        uint32_t score = scores[tid * MAX_CANDIDATES + i]; // score with which "current" points to "target"
         
         // go up the tree
         bool outcome = false;
         if (target != UINT32_MAX) {
+            outcome = true;
             uint32_t target_target = pairs[target * MAX_CANDIDATES + i]; // target node of "target"
             while (current != target_target) {
                 // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
@@ -422,12 +423,12 @@ void grouping_kernel(
                 target = target_target;
                 if (target == UINT32_MAX) break; // alternative root: a node with no target
                 target_target = pairs[target_target * MAX_CANDIDATES + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
-                score = (uint32_t)(scores[current * MAX_CANDIDATES + i]*FIXED_POINT_SCALE);
+                score = scores[current * MAX_CANDIDATES + i];
             }
         }
         // handle "root(s)" as a pair of nodes pointing to each other
         // NOTE: concurrent writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
-        if (outcome) { // "&& target != UINT32_MAX" is implied by "outcome" not being false
+        if (outcome && target != UINT32_MAX) {
             const uint32_t lowest_id = min(current, target);
             group_slots[current*MAX_GROUP_SIZE].id = lowest_id;
             group_slots[current*MAX_GROUP_SIZE].score = score;
@@ -456,7 +457,7 @@ void grouping_kernel(
         }
         // the path did not include the "tid" node, handle it here iff you did not happen to group path[0] with path[1] during the last iteration above (leading to path_length == -2)
         if (path_length == -1) {
-            target = current;
+            target = path[0];
             current = tid;
             if (group_slots[target*MAX_GROUP_SIZE].id == current) {
                 group_slots[current*MAX_GROUP_SIZE].id = current;

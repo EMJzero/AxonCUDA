@@ -53,6 +53,8 @@ __forceinline__ __device__ T warpReduceSumLN0(T val) {
 #define HIST_SIZE 64u // must be a multiple of WARP_SIZE (for the histogram max reduction)
 #define MAX_CANDIDATES 4u // => how many candidates are proposed for a node (ranked by score)
 
+#define DETERMINISTIC_SCORE_NOISE 64u // => adds a +[0, DETERMINISTIC_SCORE_NOISE - 1]/FIXED_POINT_SCALE symmetric noise while calculating pairing scores; set to 0 to disable; keep it a power of 2 otherwise
+
 typedef struct {
     uint32_t node;
     uint32_t score;
@@ -71,6 +73,18 @@ __forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
     return {.node = payload, .score = val};
 }
 
+// symmetric and deterministic pseudo-random hash
+__device__ __forceinline__ uint32_t deterministic_noise(uint32_t a, uint32_t b) {
+    uint32_t lo = min(a, b), hi = max(a, b);
+    uint32_t x = lo * 0x9E3779B1u; // golden-ratio :)
+    x ^= hi + 0x85EBCA6Bu + (x << 6) + (x >> 2);
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 13;
+    x *= 0x9E3779B1u;
+    x ^= x >> 16;
+    return x % DETERMINISTIC_SCORE_NOISE;
+}
 
 // USED BY: grouping kernel
 
@@ -84,12 +98,12 @@ typedef struct __align__(8) {
 
 __device__ __forceinline__ unsigned long long pack_slot(uint32_t score, uint32_t node) {
     // high 32 bits = score, low 32 bits = node
-    return ( (unsigned long long)score << 32 ) | ( (unsigned long long)node & 0xffffffffull );
+    return ( (unsigned long long)score << 32 ) | ( (unsigned long long)node & 0xFFFFFFFFull );
 }
 
 __device__ __forceinline__ void unpack_slot(unsigned long long v, uint32_t &score, uint32_t &node) {
     score = (uint32_t)(v >> 32);
-    node = (uint32_t)(v & 0xffffffffu);
+    node = (uint32_t)(v & 0xFFFFFFFFu);
 }
 
 __device__ __forceinline__ bool atomic_max_on_slot(slot* s, uint32_t idx, uint32_t new_node, uint32_t new_score) {
@@ -126,11 +140,11 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* s, uint32_t idx, ui
 // simple 32-bit hash, should be good enough for a small shared-memory hash-set
 __device__ __forceinline__ uint32_t hash_uint32(uint32_t x) {
     x ^= x >> 17;
-    x *= 0xed5ad4bbU;
+    x *= 0xED5AD4BBu;
     x ^= x >> 11;
-    x *= 0xac4c1b51U;
+    x *= 0xAC4C1B51u;
     x ^= x >> 15;
-    x *= 0x31848babU;
+    x *= 0x31848BABu;
     x ^= x >> 14;
     return x;
 }

@@ -49,12 +49,12 @@ extern __global__ void candidates_kernel(
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     uint32_t* pairs,
-    float* scores
+    uint32_t* scores
 );
 
 extern __global__ void grouping_kernel(
     const uint32_t* pairs,
-    const float* scores,
+    const uint32_t* scores,
     const uint32_t num_nodes,
     slot* group_slots,
     uint32_t* groups
@@ -310,7 +310,8 @@ int main(int argc, char** argv) {
     float *d_hedge_weights = nullptr;
     uint32_t *d_pairs = nullptr;
     slot *d_slots = nullptr;
-    float *d_scores = nullptr;
+    float *d_f_scores = nullptr;
+    uint32_t *d_u_scores = nullptr;
 
     // kernel dimensions
     int blocks, threads_per_block, warps_per_block;
@@ -325,7 +326,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_touching_offsets, touching_hedges_offsets.size() * sizeof(uint32_t))); // touching_offsets[node idx] -> touching set start idx in d_touching
     CUDA_CHECK(cudaMalloc(&d_hedge_weights, num_hedges * sizeof(float))); // hedge_weights[hedge idx] -> weight
     CUDA_CHECK(cudaMalloc(&d_pairs, num_nodes * sizeof(uint32_t) * MAX_CANDIDATES)); // partitions[node idx] -> best neighbor
-    CUDA_CHECK(cudaMalloc(&d_scores, num_nodes * sizeof(float) * MAX_CANDIDATES)); // connection streght for each pair
+    CUDA_CHECK(cudaMalloc(&d_f_scores, num_nodes * sizeof(float))); // connection streght for each pair, used during refinement
+    CUDA_CHECK(cudaMalloc(&d_u_scores, num_nodes * sizeof(uint32_t) * MAX_CANDIDATES)); // fixed point version of the above, used for the multi-candidates kernel
     CUDA_CHECK(cudaMalloc(&d_slots, num_nodes * sizeof(slot) * MAX_GROUP_SIZE)); // slot to finalize node pairs during grouping (true dtype: "slot")
 
     // copy to device
@@ -372,8 +374,6 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // TODO: try to apply coarsening to each kernel!
-
     // returns the number of partitions and the pointer to the final partitions device buffer
     std::function<std::tuple<uint32_t, uint32_t*>(uint32_t, uint32_t, uint32_t*, uint32_t*, uint32_t*, uint32_t*)> coarsen_refine_uncoarsen = [&](
         uint32_t level_idx,
@@ -417,7 +417,7 @@ int main(int argc, char** argv) {
         * - d_partitions
         * Buffers updated (globally) in-place after each level:
         * - d_pairs
-        * - d_scores
+        * - d_u_scores, d_f_scores
         * - d_slots
         * - d_ranks
         * - d_neighbors, d_neighbors_offsets
@@ -433,7 +433,7 @@ int main(int argc, char** argv) {
         // zero-out candidates kernel's outputs
         // TODO: could just init. up to curr_num_nodes
         CUDA_CHECK(cudaMemset(d_pairs, 0xFF, num_nodes * sizeof(uint32_t) * MAX_CANDIDATES)); // 0xFF -> UINT32_MAX
-        // NOTE: no need to init. "d_scores" if we use "d_pairs" to see which locations are valid
+        // NOTE: no need to init. "d_u_scores" if we use "d_pairs" to see which locations are valid
         
         // launch configuration - candidates kernel
         // NOTE: choose threads_per_block multiple of WARP_SIZE
@@ -457,7 +457,7 @@ int main(int argc, char** argv) {
             num_hedges,
             curr_num_nodes,
             d_pairs,
-            d_scores
+            d_u_scores
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -466,20 +466,20 @@ int main(int argc, char** argv) {
         // print some temporary results
         #if VERBOSE
         std::vector<uint32_t> pairs_tmp(curr_num_nodes * MAX_CANDIDATES);
-        std::vector<float> scores_tmp(curr_num_nodes * MAX_CANDIDATES);
+        std::vector<uint32_t> scores_tmp(curr_num_nodes * MAX_CANDIDATES);
         std::vector<std::set<uint32_t>> candidates_count(MAX_CANDIDATES);
         CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * MAX_CANDIDATES, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_scores, curr_num_nodes * sizeof(float) * MAX_CANDIDATES, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_u_scores, curr_num_nodes * sizeof(uint32_t) * MAX_CANDIDATES, cudaMemcpyDeviceToHost));
         std::cout << "Pairing results:";
         for (uint32_t i = 0; i < curr_num_nodes; ++i) {
             if (i < std::min<uint32_t>(curr_num_nodes, 20))
             std::cout << "\n  node " << i << " ->";
             for (uint32_t j = 0; j < MAX_CANDIDATES; ++j) {
-                float score = scores_tmp[i * MAX_CANDIDATES + j];
+                float score = ((float)scores_tmp[i * MAX_CANDIDATES + j])/FIXED_POINT_SCALE;
                 uint32_t target = pairs_tmp[i * MAX_CANDIDATES + j];
                 candidates_count[j].insert(target);
                 if (i < std::min<uint32_t>(curr_num_nodes, 20)) {
-                    if (target == UINT32_MAX) std::cout << " (target=none score=none) ";
+                    if (target == UINT32_MAX) std::cout << " (" << j << " target=none score=none) ";
                     else if (target == i) std::cout << " !!SELF TARGETED!! ";
                     else std::cout << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ")";
                 }
@@ -491,8 +491,9 @@ int main(int argc, char** argv) {
         }
         std::cout << "\n";
         for (uint32_t j = 0; j < MAX_CANDIDATES; ++j)
-        std::cout << "Candidates count (" << j << "): " << candidates_count[j].size() << "\n";
+            std::cout << "Candidates count (" << j << "): " << candidates_count[j].size() << "\n";
         scores_tmp.clear();
+        candidates_count.clear();
         #endif
         // =============================
 
@@ -524,7 +525,7 @@ int main(int argc, char** argv) {
         std::cout << "Running grouping kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         void *kernel_args[] = {
             (void*)&d_pairs,
-            (void*)&d_scores,
+            (void*)&d_u_scores,
             (void*)&curr_num_nodes,
             (void*)&d_slots,
             (void*)&d_groups
@@ -597,7 +598,6 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(d_ungroups, thrust::raw_pointer_cast(t_indices.data()), curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
         thrust::device_ptr<uint32_t> t_ungroups_offsets(d_ungroups_offsets);
         // predicate to detect group starts: is_group_start(i) = (i == 0) || (headflags[i] != headflags[i-1])
-        //auto is_group_start = [groups = t_groups] __device__ (uint32_t i) { return (i == 0) || (groups[i] != groups[i - 1]); }; // WRONG: we should use heads!
         auto is_group_start = [heads = t_headflags.begin()] __device__ (uint32_t i) { return (i == 0) || (heads[i] != heads[i - 1]); };
         // counting iterator over sorted positions
         auto t_iter_begin = thrust::make_counting_iterator<uint32_t>(0);
@@ -635,6 +635,7 @@ int main(int argc, char** argv) {
         std::cout << "Groups count: " << groups_count.size() << ", Max group size: " << max_gs << "\n";
         pairs_tmp.clear();
         groups_tmp.clear();
+        groups_count.clear();
         #endif
         // =============================
 
@@ -841,6 +842,26 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaFree(d_coarse_touching_offsets));
         CUDA_CHECK(cudaFree(d_coarse_partitions)); // allocated at the next inner level, freed here!
 
+        // =============================
+        // print some temporary results
+        #if VERBOSE
+        std::vector<uint32_t> partitions_tmp(curr_num_nodes);
+        CUDA_CHECK(cudaMemcpy(partitions_tmp.data(), d_partitions, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        std::unordered_map<uint32_t, int> part_count;
+        std::cout << "Partitioning results:\n";
+        for (uint32_t i = 0; i < curr_num_nodes; ++i) {
+            uint32_t part = partitions_tmp[i];
+            part_count[part]++;
+            if (i < std::min<uint32_t>(curr_num_nodes, 20))
+                std::cout << "  node " << i << " -> " << part << "\n";
+        }
+        int max_ps = part_count.empty() ? 0 : std::max_element(part_count.begin(), part_count.end(), [](auto &a, auto &b){ return a.second < b.second; })->second;
+        std::cout << "Non-empty partitions count: " << part_count.size() << ", Max partition size: " << max_ps << "\n";
+        partitions_tmp.clear();
+        part_count.clear();
+        #endif
+        // =============================
+
         std::cout << "Refining level " << level_idx << ", remaining nodes=" << curr_num_nodes << "number of partitions=" << num_partitions << "\n";
 
         // prepare this level's pins per partition
@@ -875,7 +896,7 @@ int main(int argc, char** argv) {
         // zero-out fm-ref gains kernel's outputs
         // TODO: could lower to just curr_num_nodes...
         CUDA_CHECK(cudaMemset(d_pairs, 0xFF, num_nodes * sizeof(uint32_t))); // 0xFF -> UINT32_MAX
-        // NOTE: no need to init. "d_scores" if we use "d_pairs" to see which locations are valid
+        // NOTE: no need to init. "d_f_scores" if we use "d_pairs" to see which locations are valid
 
         // launch configuration - fm-ref gains kernel
         // NOTE: choose threads_per_block multiple of WARP_SIZE
@@ -899,7 +920,7 @@ int main(int argc, char** argv) {
             num_partitions,
             // NOTE: repurposing those from the candidates kernel!
             d_pairs, // -> moves
-            d_scores
+            d_f_scores
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -909,8 +930,8 @@ int main(int argc, char** argv) {
         uint32_t *d_ranks = nullptr;
         CUDA_CHECK(cudaMalloc(&d_ranks, curr_num_nodes * sizeof(uint32_t))); // node -> number of touching hedges seen as of now
         thrust::device_ptr<uint32_t> t_ranks(d_ranks);
-        thrust::device_ptr<float> t_scores(d_scores);
-        thrust::sort_by_key(d_scores, d_scores + curr_num_nodes, t_indices.begin()); // sort scores according to scores themselves and indices in the same way
+        thrust::device_ptr<float> t_scores(d_f_scores);
+        thrust::sort_by_key(t_scores, t_scores + curr_num_nodes, t_indices.begin()); // sort scores according to scores themselves and indices in the same way
         thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks); // invert the permutation such that: ranks[original_index] = sorted_position
         // free up thrust vectors
         thrust::device_vector<uint32_t>().swap(t_indices);
@@ -933,7 +954,7 @@ int main(int argc, char** argv) {
             num_hedges,
             curr_num_nodes,
             num_partitions,
-            d_scores
+            d_f_scores
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -1002,7 +1023,9 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> partitions(num_nodes);
     CUDA_CHECK(cudaMemcpy(partitions.data(), d_partitions, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
+    // =============================
     // print some example outputs
+    #if VERBOSE
     std::set<uint32_t> part_count;
     std::cout << "Results:\n";
     for (uint32_t i = 0; i < num_nodes; ++i) {
@@ -1013,7 +1036,9 @@ int main(int argc, char** argv) {
             else std::cout << "node " << i << " ->" << " part=" << part << "\n";
         }
     }
-    std::cout << "Partitions count: " << part_count.size() << "(" << num_partitions - part_count.size() << " empty)" << "\n";
+    std::cout << "Partitions count: " << part_count.size() << " (" << num_partitions - part_count.size() << " empty)" << "\n";
+    #endif
+    // =============================
 
     // cleanup device memory
     CUDA_CHECK(cudaFree(d_hedges));
@@ -1024,14 +1049,15 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_touching_offsets));
     CUDA_CHECK(cudaFree(d_hedge_weights));
     CUDA_CHECK(cudaFree(d_pairs));
-    CUDA_CHECK(cudaFree(d_scores));
+    CUDA_CHECK(cudaFree(d_f_scores));
+    CUDA_CHECK(cudaFree(d_u_scores));
     CUDA_CHECK(cudaFree(d_partitions));
-
-    // TODO: apply the partitioning!
-    // TODO: print the initial and final weight: hg.totalWeight(); !!
 
     // === CUDA STUFF ENDS HERE ===
     // ============================
+
+    // TODO: apply the partitioning!
+    // TODO: print the initial and final weight: hg.totalWeight(); !!
 
     // save hypergraph
     if (!save_path.empty()) {
