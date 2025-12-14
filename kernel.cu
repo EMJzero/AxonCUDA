@@ -6,6 +6,10 @@
 
 namespace cg = cooperative_groups;
 
+// DEVICE CONSTANTS:
+__constant__ uint32_t max_nodes_per_part;
+__constant__ uint32_t max_inbound_per_part;
+
 // REMEMBER: "const" means the data pointed to is not modified, not the pointer itself!
 
 // count the number of distinct neighbors of each node (to then perform a scan and find offsets where to write the neighborhoods)
@@ -13,12 +17,12 @@ namespace cg = cooperative_groups;
 // PARALLEL OVER: n
 __global__
 void neighborhoods_count_kernel(
-    const uint32_t* hedges,
-    const uint32_t* hedges_offsets,
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
+    const uint32_t* __restrict__ hedges,
+    const uint32_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const uint32_t* __restrict__ touching_offsets,
     const uint32_t num_nodes,
-    uint32_t* neighbors_offsets // here filled as counters of "how many neighbors per node" -> then do a prefix sum for the offsets
+    uint32_t* __restrict__ neighbors_offsets // here filled as counters of "how many neighbors per node" -> then do a prefix sum for the offsets
 ) {
     /*
     * Idea: BIN pattern of count->scan->scatter
@@ -85,13 +89,13 @@ void neighborhoods_count_kernel(
 // PARALLEL OVER: n
 __global__
 void neighborhoods_scatter_kernel(
-    const uint32_t* hedges,
-    const uint32_t* hedges_offsets,
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
+    const uint32_t* __restrict__ hedges,
+    const uint32_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const uint32_t* __restrict__ touching_offsets,
     const uint32_t num_nodes,
-    const uint32_t* neighbors_offsets,
-    uint32_t* neighbors
+    const uint32_t* __restrict__ neighbors_offsets,
+    uint32_t* __restrict__ neighbors
 ) {
     // STYLE: one node per block, one touching hedge per warp, distinct neighbors in shared memory!
     const uint32_t node_id = blockIdx.x;
@@ -153,17 +157,18 @@ void neighborhoods_scatter_kernel(
 // SHUFFLES OVER: h*d (neighbors)
 __global__
 void candidates_kernel(
-    const uint32_t* hedges,
-    const uint32_t* hedges_offsets,
-    const uint32_t* neighbors,
-    const uint32_t* neighbors_offsets,
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
-    const float* hedge_weights,
+    const uint32_t* __restrict__ hedges,
+    const uint32_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ neighbors,
+    const uint32_t* __restrict__ neighbors_offsets,
+    const uint32_t* __restrict__ touching,
+    const uint32_t* __restrict__ touching_offsets,
+    const float* __restrict__ hedge_weights,
+    const uint32_t* __restrict__ nodes_sizes,
     const uint32_t num_hedges,
     const uint32_t num_nodes,
-    uint32_t* pairs,
-    uint32_t* scores
+    uint32_t* __restrict__ pairs,
+    uint32_t* __restrict__ scores
 ) {
     // STYLE: one node per warp!
     const uint32_t lane_id = threadIdx.x % WARP_SIZE;
@@ -193,6 +198,8 @@ void candidates_kernel(
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
 
+    const uint32_t my_size = nodes_sizes[warp_id];
+
     // all threads in the warp should agree on those...
     // TODO: only keep these in lane 0!
     uint32_t best_score[MAX_CANDIDATES];
@@ -206,6 +213,13 @@ void candidates_kernel(
         for (uint32_t nb = 0; nb < HIST_SIZE; nb++) {
             if (nb < neighbors_count) {
                 const uint32_t my_neighbor = my_neighbors[nb];
+                // skip incompatible neighbors due to size constraints
+                if (my_size + nodes_sizes[my_neighbor] > max_nodes_per_part) {
+                    neighbors_count--;
+                    my_neighbors++;
+                    nb--; // TODO: not the best idea ever to decrement this here, just for it to re-increment on the for...
+                    continue;
+                }
                 histogram[nb].node = my_neighbor;
             } else
                 histogram[nb].node = UINT32_MAX;
@@ -213,6 +227,10 @@ void candidates_kernel(
         }
 
         // TODO: shared memory caching of hyperedges!!
+
+        // if no neighbor passed constraints checks (histogram is all UINT32_MAXs), exit the loop early
+        if (neighbors_count == 0)
+            break;
 
         // scan touching hyperedges
         // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
@@ -247,9 +265,10 @@ void candidates_kernel(
 
         /*
         * Idea, dramatic coarsening speedup:
-        * - we need to keep connections symmetric
+        * - we need to keep connections symmetric -> ids-based and permutation-invariant "deterministic_noise"!
         * - during pairs construction, nudge up or down the hedge’s weight based on a very fast hash of the two node ids involved (order of the node ids must not matter)
-        * => we could sum the node ids and pick the last 4 bits, adding those to the fixed point weight?
+        * 
+        * TODO: simpler/faster hash, e.g. we could sum the node ids and pick the last 4 bits, adding those to the fixed point weight?
         */
 
         // reduce local histograms between threads (each thread will see the full histogram)
@@ -299,11 +318,12 @@ void candidates_kernel(
 // PARALLEL OVER: n
 __global__
 void grouping_kernel(
-    const uint32_t* pairs, // pairs[idx] is the partner idx wants to be grouped with
-    const uint32_t* scores, // pairs[idx] is the partner idx wants to be grouped with
+    const uint32_t* __restrict__ pairs, // pairs[idx] is the partner idx wants to be grouped with
+    const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be grouped with pairs[idx]
+    const uint32_t* __restrict__ nodes_sizes,
     const uint32_t num_nodes,
-    slot* group_slots, // initialized with -1 on the id
-    uint32_t* groups // uninitialized, final group id of each node (non-zero based for now)
+    slot* __restrict__ group_slots, // initialized with -1 on the id
+    uint32_t* __restrict__ groups // uninitialized, final group id of each node (non-zero based for now)
 ) {
     // SETUP FOR GLOBAL SYNC
     cg::grid_group grid = cg::this_grid();
@@ -370,6 +390,9 @@ void grouping_kernel(
     * - going downward:
     *  - if your entry is still there in your target, start copying all its slot over yours, as to propagate downward the assembled group's information
     * Important: at the end of this, all nodes of a group must have IDENTICAL slots (all slots), then the minimum id in the slots will be used to tag the group.
+    *
+    * TODO: for now, nodes_sizes is not used, because we assume pairs are already filtered by the candidates kernel, however allowing larger groups requries
+    *       introducing constraint checks here as well...
     *
     * Beyond just the first choice:
     * - let the candidates kernel return the top-k candidates (sorted) for each node, rather thank just pairs
@@ -485,11 +508,11 @@ void grouping_kernel(
 // PARALLEL OVER: e
 __global__
 void apply_coarsening_hedges_count(
-    const uint32_t* hedges,
-    const uint32_t* hedges_offsets,
+    const uint32_t* __restrict__ hedges,
+    const uint32_t* __restrict__ hedges_offsets,
     const uint32_t num_hedges,
-    const uint32_t* groups, // groups[node idx] -> new group/node id
-    uint32_t* coarse_hedges_offsets // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
+    const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
+    uint32_t* __restrict__ coarse_hedges_offsets // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
 ) {
     // STYLE: one hedge per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -533,12 +556,12 @@ void apply_coarsening_hedges_count(
 // PARALLEL OVER: e
 __global__
 void apply_coarsening_hedges_scatter(
-    const uint32_t* hedges,
-    const uint32_t* hedges_offsets,
+    const uint32_t* __restrict__ hedges,
+    const uint32_t* __restrict__ hedges_offsets,
     const uint32_t num_hedges,
-    const uint32_t* groups, // groups[node idx] -> new group/node id
-    const uint32_t* coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
-    uint32_t* coarse_hedges
+    const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
+    const uint32_t* __restrict__ coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
+    uint32_t* __restrict__ coarse_hedges
 ) {
     // STYLE: one hedge per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -572,13 +595,13 @@ void apply_coarsening_hedges_scatter(
 // PARALLEL OVER: n
 __global__
 void apply_coarsening_neighbors_count(
-    const uint32_t* neighbors,
-    const uint32_t* neighbors_offsets,
-    const uint32_t* groups, // groups[node id] -> node's group id
-    const uint32_t* ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const uint32_t* ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
+    const uint32_t* __restrict__ neighbors,
+    const uint32_t* __restrict__ neighbors_offsets,
+    const uint32_t* __restrict__ groups, // groups[node id] -> node's group id
+    const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
+    const uint32_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
     const uint32_t num_groups,
-    uint32_t* coarse_neighbors_offsets // group id -> count of distinct neighbors
+    uint32_t* __restrict__ coarse_neighbors_offsets // group id -> count of distinct neighbors
 ) {
     // STYLE: one group (new node) per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -635,14 +658,14 @@ void apply_coarsening_neighbors_count(
 // PARALLEL OVER: n
 __global__
 void apply_coarsening_neighbors_scatter(
-    const uint32_t* neighbors,
-    const uint32_t* neighbors_offsets,
-    const uint32_t* groups, // groups[node id] -> node's group id
-    const uint32_t* ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const uint32_t* ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
+    const uint32_t* __restrict__ neighbors,
+    const uint32_t* __restrict__ neighbors_offsets,
+    const uint32_t* __restrict__ groups, // groups[node id] -> node's group id
+    const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
+    const uint32_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
     const uint32_t num_groups,
-    const uint32_t* coarse_neighbors_offsets, // group id -> count of distinct neighbors
-    uint32_t* coarse_neighbors
+    const uint32_t* __restrict__ coarse_neighbors_offsets, // group id -> count of distinct neighbors
+    uint32_t* __restrict__ coarse_neighbors
 ) {
     // STYLE: one group (new node) per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -684,10 +707,10 @@ void apply_coarsening_neighbors_scatter(
 // PARALLEL OVER: e
 __global__
 void apply_coarsening_touching_count(
-    const uint32_t* hedges, // already coarsened as of here, thus contain group ids!
-    const uint32_t* hedges_offsets,
+    const uint32_t* __restrict__ hedges, // already coarsened as of here, thus contain group ids!
+    const uint32_t* __restrict__ hedges_offsets,
     const uint32_t num_hedges,
-    uint32_t* coarse_touching_offsets // here filled as counters of "how many hedges per node" -> then do a prefix sum for the offsets
+    uint32_t* __restrict__ coarse_touching_offsets // here filled as counters of "how many hedges per node" -> then do a prefix sum for the offsets
 ) {
     // STYLE: one hedge per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -727,13 +750,13 @@ void apply_coarsening_touching_count(
 // PARALLEL OVER: n
 __global__
 void apply_coarsening_touching_scatter(
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
-    const uint32_t* ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const uint32_t* ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
+    const uint32_t* __restrict__ touching,
+    const uint32_t* __restrict__ touching_offsets,
+    const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
+    const uint32_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
     const uint32_t num_groups,
-    const uint32_t* coarse_touching_offsets, // group id -> count of distinct touching hedges
-    uint32_t* coarse_touching
+    const uint32_t* __restrict__ coarse_touching_offsets, // group id -> count of distinct touching hedges
+    uint32_t* __restrict__ coarse_touching
 ) {
     // STYLE: one group (new node) per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -773,10 +796,10 @@ void apply_coarsening_touching_scatter(
 // write to each node the partition of its group
 __global__
 void apply_uncoarsening_partitions(
-    const uint32_t* groups, // groups[node id] -> node's group
-    const uint32_t* coarse_partitions, // coarse_partitions[group id] -> group's partition
+    const uint32_t* __restrict__ groups, // groups[node id] -> node's group
+    const uint32_t* __restrict__ coarse_partitions, // coarse_partitions[group id] -> group's partition
     const uint32_t num_nodes,
-    uint32_t* partitions // partitions[node id] -> group's partition
+    uint32_t* __restrict__ partitions // partitions[node id] -> group's partition
 ) {
     // STYLE: one node per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -794,12 +817,12 @@ void apply_uncoarsening_partitions(
 // PARALLEL OVER: e
 __global__
 void pins_per_partition_kernel(
-    const uint32_t* hedges,
-    const uint32_t* hedges_offsets,
-    const uint32_t* partitions, // partitions[idx] is the partition node idx is part of
+    const uint32_t* __restrict__ hedges,
+    const uint32_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
     const uint32_t num_hedges,
     const uint32_t num_partitions,
-    uint32_t* pins_per_partitions // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
+    uint32_t* __restrict__ pins_per_partitions // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
 ) {
     // STYLE: one hedge per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -827,17 +850,19 @@ void pins_per_partition_kernel(
 // SHUFFLES OVER: partitions
 __global__
 void fm_refinement_gains_kernel(
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
-    const float* hedge_weights,
-    const uint32_t* partitions, // partitions[idx] is the partition node idx is part of
-    const uint32_t* pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
+    const uint32_t* __restrict__ touching,
+    const uint32_t* __restrict__ touching_offsets,
+    const float* __restrict__ hedge_weights,
+    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
+    const uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
+    const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ partitions_sizes,
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
     // NOTE: we repurpose the arrays allocated for the "candidates kernel" for those!
-    uint32_t* moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx
-    float* scores // scores[idx] -> gain for move in position idx
+    uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx
+    float* __restrict__ scores // scores[idx] -> gain for move in position idx
 ) { 
     // STYLE: one node per warp!
     const uint32_t lane_id = threadIdx.x % WARP_SIZE;
@@ -848,61 +873,75 @@ void fm_refinement_gains_kernel(
     /*
     * Idea:
     * - one node per warp
-    * - same part of the histogram (one bin per partition) in each thread's registers
-    * - scan hyperedges, specifically their pins per hedge (with caching in shared memory - either passive or automatic) once per histogram part
-    * - warp primitives to both reduce each bin and find the maximum bin
+    * - different part of the histogram (different partitions - one bin per partition) in each thread's registers
+    * - repeat enough times for finite-sized (PART_HIST_SIZE) histogram parts among threads to cover all partitions
+    * - scan hyperedges, specifically their pins per hedge (with manual caching in shared memory?) enough times to have each partition once in the histogram
+    * - maximum bin inside each thread, then warp primitives to find the maximum bin per node
+    *
+    * Upgrade: since in "pins_per_partitions", each hedge has an entry for each partition, and they are all always in the same order, we can just
+    *          assign a thread in each warp to a few partitions, and always make it see those! No need for the whole histogram of all partitions
+    *          per thread where each bin is then reduced! Just each thread in the warp is in charge of num_partitions/warp_size partitions!
     *
     * TODO: this kernel could undergo the same multi-candidate upgrade as "pairs"! Tho here it would be much harder with the moves sorting mechanism...
     *
     * TODO: like in HyperG, we could repurpose neighbors to keep a list of neighboring hedges to each node (maybe one-hot encoded), and thus
     *       not build the full histogram, but build it only for those neighboring partitions...
     *
-    * NOTE: no need for FIXED POINT here, since we don't need neither symmetry nor invariants!
+    * NOTE: no need for FIXED POINT here, since we don't need symmetry nor other invariants!
     */
-
+    
     const uint32_t my_partition = partitions[warp_id];
 
+    const uint32_t my_size = nodes_sizes[warp_id];
+    
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
     //uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
-    float histogram[HIST_SIZE]; // make sure this fits in registers (no spill) !! Store here only the score, the partition id can be inferred!
+    float histogram[PART_HIST_SIZE]; // make sure this fits in registers (no spill) !! Store here only the score, the partition id can be inferred!
+    // each thread handles, at once, min(PART_HIST_SIZE, partitions_per_thread) partitions, each partition is handled by exactly one thread per warp
+    uint32_t partitions_per_thread = min((num_partitions + WARP_SIZE - 1) / WARP_SIZE, PART_HIST_SIZE); // ceiled
 
     // all threads in the warp should agree on those...
     uint32_t best_score = 0;
     uint32_t best_move = UINT32_MAX;
 
-    // handle HIST_SIZE partitions at a time
-    for (uint32_t curr_base_part = 0; curr_base_part < num_partitions; curr_base_part += HIST_SIZE) {
+    // handle PART_HIST_SIZE*WARP_SIZE partitions at a time, that is partitions_per_thread per thread in the warp
+    for (uint32_t curr_base_part = 0; curr_base_part < num_partitions; curr_base_part += PART_HIST_SIZE*WARP_SIZE) {
+        // TODO: could make threads that have 0 partitions left (my_initial_part >= num_partitions) skip the iterations
+        partitions_per_thread = min((num_partitions - curr_base_part + WARP_SIZE - 1) / WARP_SIZE, PART_HIST_SIZE);
+        const uint32_t my_initial_part = curr_base_part + lane_id * partitions_per_thread;
+        const uint32_t my_final_part = min(curr_base_part + (lane_id + 1) * partitions_per_thread, num_partitions);
+
         // clear per-thread local histograms
-        for (uint32_t p = 0; p < HIST_SIZE; p++)
+        for (uint32_t p = 0; p < partitions_per_thread; p++)
             histogram[p] = 0.0f;
 
-        // TODO: shared memory caching of pins_per_partitions!!
+        // TODO: shared memory caching of pins_per_partitions!! (maybe not worth it if PART_HIST_SIZE is large enough...)
 
         // scan touching hyperedges
-        // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
         // NOTE: interpret this as "for each hedge, see if you moving to a certain partition is something that they like or not"
         for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
             const uint32_t actual_hedge_idx = *hedge_idx;
             const uint32_t* my_pin_per_partition = pins_per_partitions + actual_hedge_idx * num_partitions;
-            my_pin_per_partition += lane_id; // each thread in the warp reads one every WARP_SIZE counters
+            my_pin_per_partition += my_initial_part;
             const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-            for (uint32_t p = 0; p < HIST_SIZE; p += WARP_SIZE) {
-                if (curr_base_part + p < num_partitions) {
+            // each thread in the warp reads partitions_per_thread counters
+            for (uint32_t p = 0; p < partitions_per_thread; p++) {
+                if (my_initial_part + p < my_final_part) {
                     // Option 1: the gain is the weighted connections count with another partition <minus> the weighted connections count with the current one
-                    /*uint32_t counter = my_pin_per_partition[curr_base_part + p];
-                    if (curr_base_part + p == my_partition)
+                    /*uint32_t counter = my_pin_per_partition[my_initial_part + p];
+                    if (my_initial_part + p == my_partition)
                         counter--; // exclude your presence in the hyperedge from the count for your partition
                     // update local histogram
                     histogram[p] += counter*my_hedge_weight;*/
                     // Option 2: the gain is the sum the weights of hedges such that moving to a certain partition the hedge (same as HyperG)
-                    uint32_t counter = my_pin_per_partition[curr_base_part + p];
+                    uint32_t counter = my_pin_per_partition[my_initial_part + p];
                     float gain = 0.0f;
                     // hedge connected to my partition: gain the hedge's weight iff moving would disconnect it from my partition (I am its last pin left there)
-                    if (counter == 1 && curr_base_part + p == my_partition)
+                    if (counter == 1 && my_initial_part + p == my_partition)
                         gain = my_hedge_weight;
                     // hedge not yet connected to the partition: pay the hedge's weight iff moving there connects it to the new partition (I would become its first pin there)
-                    else if (counter == 0 && curr_base_part + p != my_partition)
+                    else if (counter == 0 && my_initial_part + p != my_partition)
                         gain = -my_hedge_weight;
                     // update local histogram
                     histogram[p] += gain;
@@ -910,19 +949,22 @@ void fm_refinement_gains_kernel(
             }
         }
 
-        // reduce local histograms between threads (each thread will see the full histogram)
-        // TODO: could use the stopping condition "p < HIST_SIZE && curr_base_part + p < num_partitions", but would lose unrolling...
-        for (uint32_t p = 0; p < HIST_SIZE; p++)
-            histogram[p] = warpReduceSum<float>(histogram[p]);
-
-        // reduce max in histogram between threads (each thread grabs a different bin)
-        for (uint32_t p = lane_id; p < HIST_SIZE; p += WARP_SIZE) {
-            bin max = warpReduceMax(histogram[p], p);
-            if (max.score > best_score || max.score == best_score && max.node < best_move) {
-                best_score = max.score;
-                best_move = max.node; // yeah, "node" should be called "partition" here, but this way we repurpose the struct...
+        // reduce max inside each threads
+        for (uint32_t p = 0; p < partitions_per_thread; p++) {
+            float score = histogram[p];
+            uint32_t part = my_initial_part + p;
+            // TODO: could anticipate the constraint check! E.g. at the beginning of the iteration, entirely removing some partitions from the histogram,
+            //       but this will require keeping a list of active partitions, since the initial-final indices won't suffice anymore...
+            if (partitions_sizes[part] + my_size < max_nodes_per_part && (score > best_score || score == best_score && part < best_move)) {
+                best_score = score;
+                best_move = part;
             }
         }
+
+        // reduce max between threads
+        bin max = warpReduceMax(best_score, best_move);
+        best_score = max.score;
+        best_move = max.node; // yeah, "node" should be called "partition" here, but this way we repurpose the struct...
     }
 
     if (lane_id == 0) {
@@ -937,21 +979,21 @@ void fm_refinement_gains_kernel(
 // SHUFFLES OVER: d
 __global__
 void fm_refinement_cascade_kernel(
-    const uint32_t* hedges,
-    const uint32_t* hedges_offsets,
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
+    const uint32_t* __restrict__ hedges,
+    const uint32_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const uint32_t* __restrict__ touching_offsets,
     const float* hedge_weights,
     // CHOOSE: either rank nodes by their score and pass "move_ranks" or pass "scores" and sort on the fly, with the node id as a tie-breaker
     // CHOICE: sorted scores and move_ranks, because we need to keep scores in their current (sorted) order even after updating them
-    const uint32_t* move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
-    const uint32_t* moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
-    const uint32_t* partitions, // partitions[idx] is the partition node idx is part of
-    const uint32_t* pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
+    const uint32_t* __restrict__ move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
+    const uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
+    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
+    const uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
-    float* scores // scores[move_ranks[node_idx]] -> gain for node idx's move
+    float* __restrict__ scores // scores[move_ranks[node_idx]] -> gain for node idx's move
 ) {
     // STYLE: one node (move) per warp!
     const uint32_t lane_id = threadIdx.x % WARP_SIZE;
@@ -1043,15 +1085,15 @@ void fm_refinement_cascade_kernel(
 // PARALLEL OVER: n
 __global__
 void fm_refinement_apply_kernel(
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
-    const uint32_t* moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
-    const uint32_t* move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
+    const uint32_t* __restrict__ touching,
+    const uint32_t* __restrict__ touching_offsets,
+    const uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
+    const uint32_t* __restrict__ move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
     const uint32_t num_good_moves, // idx + 1 of the maximum in the updated scores
-    uint32_t* partitions // partitions[idx] is the partition node idx is part of
+    uint32_t* __restrict__ partitions // partitions[idx] is the partition node idx is part of
     //uint32_t* pins_per_partitions // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
 ) {
     // STYLE: one node (move) per thread!
@@ -1076,4 +1118,60 @@ void fm_refinement_apply_kernel(
         atomicAdd(&pins_per_partitions[actual_hedge_idx * num_partitions + my_partition], -1);
         atomicAdd(&pins_per_partitions[actual_hedge_idx * num_partitions + my_move_part], 1);
     }*/
+}
+
+// transform moves into a sequence of size-altering events for capacity constraint checks
+__global__
+void build_size_events_kernel(
+    const uint32_t* __restrict__ moves,
+    const uint32_t* __restrict__ ranks,
+    const uint32_t* __restrict__ partitions,
+    const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t num_nodes,
+    uint32_t* __restrict__ ev_partition,
+    uint32_t* __restrict__ ev_index,
+    int32_t* __restrict__ ev_delta
+) {
+    // STYLE: one node (move) per thread!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_nodes) return;
+
+    const uint32_t size = nodes_sizes[tid];
+
+    // first event: node leaves its current partition
+    const uint32_t e0 = 2 * tid;
+    ev_partition[e0] = partitions[tid];
+    ev_index[e0] = ranks[tid];
+    ev_delta[e0] = -static_cast<int32_t>(size);
+
+    // second event: node enters its destination partition
+    const uint32_t e1 = e0 + 1;
+    ev_partition[e1] = moves[tid];
+    ev_index[e1] = ranks[tid];
+    ev_delta[e1] = static_cast<int32_t>(size);
+}
+
+// mark moves that are valid points in the sequence w.r.t. size constraints
+__global__
+void flag_size_events_kernel(
+    const uint32_t* __restrict__ ev_partition,
+    const uint32_t* __restrict__ ev_index,
+    const int32_t* __restrict__ ev_delta,
+    const uint32_t* __restrict__ partitions_sizes,
+    const uint32_t num_events,
+    bool* __restrict__ d_valid_moves
+) {
+    // STYLE: one event per thread!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_events) return;
+
+    const uint32_t part = ev_partition[tid];
+    const uint32_t rank = ev_index[tid];
+
+    const int32_t base_size = static_cast<int32_t>(partitions_sizes[part]);
+    const int32_t curr_size = base_size + static_cast<int32_t>(ev_delta[tid]);
+
+    // no atomics needed, assume initialized with 1s
+    if (curr_size > max_nodes_per_part)
+        d_valid_moves[rank] = false;
 }

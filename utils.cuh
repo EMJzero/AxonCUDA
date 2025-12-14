@@ -1,4 +1,6 @@
 #pragma once
+#include <cfloat>
+#include <cstdint>
 #include <stdint.h>
 
 // USED BY: everyone
@@ -48,7 +50,7 @@ __forceinline__ __device__ T warpReduceSumLN0(T val) {
 #define SM_MAX_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
 
 
-// USED BY: candidates kernel AND fm refinement kernel
+// USED BY: candidates kernel
 
 #define HIST_SIZE 64u // must be a multiple of WARP_SIZE (for the histogram max reduction)
 #define MAX_CANDIDATES 4u // => how many candidates are proposed for a node (ranked by score)
@@ -127,6 +129,11 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* s, uint32_t idx, ui
 // NOTE: these are local memory! No theoretical size limit!
 #define MAX_DEDUPE_BUFFER_SIZE 16384u //8192u // for hedges and touching sets
 #define MAX_LARGE_DEDUPE_BUFFER_SIZE 32768u // for neighbors
+
+
+// USED BY: fm refinement kernel
+
+#define PART_HIST_SIZE 64u // best if it is a multiple of WARP_SIZE, best if partitions_per_thread * WARP_SIZE <= num_partitions
 
 
 // HASH-SET
@@ -307,3 +314,12 @@ __device__ __forceinline__ bool lm_hashmap_lookup(const hashmap_entry* table, co
     }
     return false;
 }
+
+
+// VALID VALUES FILTERING FUNCTOR
+
+struct masked_value_functor {
+    const float* value;
+    const bool* valid;
+    __host__ __device__ float operator()(uint32_t i) const { return valid[i] ? value[i] : -FLT_MAX; }
+};

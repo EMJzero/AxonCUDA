@@ -1,14 +1,14 @@
 #pragma once
-#include <vector>
-#include <unordered_set>
-#include <unordered_map>
-#include <cstdint>
 #include <cmath>
-#include <algorithm>
+#include <vector>
+#include <cstdint>
 #include <numeric>
-#include <stdexcept>
 #include <iostream>
 #include <optional>
+#include <algorithm>
+#include <stdexcept>
+#include <unordered_set>
+#include <unordered_map>
 
 #include "hgraph.hpp"
 
@@ -27,8 +27,8 @@ namespace hwgeom {
     };
 
     struct Coord2DHash {
-        std::size_t operator()(const Coord2D& c) const noexcept {
-            return (static_cast<std::size_t>(c.x) << 32) ^ static_cast<std::size_t>(c.y);
+        uint64_t operator()(const Coord2D& c) const noexcept {
+            return (static_cast<uint64_t>(c.x) << 32) ^ static_cast<uint64_t>(c.y);
         }
     };
 
@@ -90,7 +90,7 @@ namespace hwgeom {
 
     // point in convex polygon (inclusive), polygon must be in CCW order and non-empty
     inline bool pointInConvexPolygon(const Coord2D& p, const std::vector<Coord2D>& poly) {
-        const std::size_t n = poly.size();
+        const uint32_t n = poly.size();
         if (n == 0) return false;
         if (n == 1) {
             return p.x == poly[0].x && p.y == poly[0].y;
@@ -100,7 +100,7 @@ namespace hwgeom {
         }
 
         // Check all directed edges have cross >= 0
-        for (std::size_t i = 0; i < n; ++i) {
+        for (uint32_t i = 0; i < n; ++i) {
             const Coord2D& a = poly[i];
             const Coord2D& b = poly[(i + 1) % n];
             if (cross(a, b, p) < 0) {
@@ -112,9 +112,7 @@ namespace hwgeom {
 
     // count how many lattice points (x, y) with 0 <= x < width and 0 <= y < height
     // lie inside (or on the boundary of) the convex hull of "hull_points"
-    inline int intersectionWithConvexHull(const std::vector<Coord2D>& hull_points,
-                                        int width,
-                                        int height) {
+    inline uint32_t intersectionWithConvexHull(const std::vector<Coord2D>& hull_points, int width, int height) {
         if (hull_points.empty()) return 0;
 
         auto hull = convexHull(hull_points);
@@ -143,7 +141,7 @@ namespace hwgeom {
 
         if (min_x > max_x || min_y > max_y) return 0;
 
-        int count = 0;
+        uint32_t count = 0;
         for (int x = min_x; x <= max_x; ++x) {
             for (int y = min_y; y <= max_y; ++y) {
                 Coord2D pt{x, y};
@@ -162,8 +160,7 @@ namespace hwgeom {
 
     Note: this coincides with an enumeration by increasing manhattan distance from (x_beg, y_beg).
     */
-    inline std::vector<Coord2D>
-    iterMajorDiagonals(int x_beg, int y_beg, int x_end, int y_end, bool end_included = false) {
+    inline std::vector<Coord2D> iterMajorDiagonals(int x_beg, int y_beg, int x_end, int y_end, bool end_included = false) {
         int x_sign = (x_beg < x_end) ? 1 : -1;
         int y_sign = (y_beg < y_end) ? 1 : -1;
         if (end_included) {
@@ -178,7 +175,7 @@ namespace hwgeom {
             // Degenerate case: no interior points to traverse
             return out;
         }
-        out.reserve(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+        out.reserve(static_cast<uint32_t>(width) * static_cast<uint32_t>(height));
 
         for (int i = 0; i < height; ++i) {
             for (int j = 0; j < std::min(i + 1, width); ++j) {
@@ -192,10 +189,8 @@ namespace hwgeom {
                                 y_end - y_sign * (1 + i));
             }
         }
-
         return out;
     }
-
 }
 
 
@@ -226,51 +221,56 @@ namespace hwmodel {
         std::optional<double> max_congestion;
         std::optional<ConnectionsLocalityMetrics> connections_locality;
     };
+    
+    struct HardwareModelConfig {
+        std::string name;
+        uint32_t neurons_per_core;
+        uint32_t synapses_per_core;
+        uint32_t cores_per_chip_x;
+        uint32_t cores_per_chip_y;
+        uint32_t chips_per_system_x;
+        uint32_t chips_per_system_y;
+        double energy_per_routing;
+        double energy_per_wire;
+        double latency_per_routing;
+        double latency_per_wire;
+    };
 
     // partitionSequential: sequential greedy partitioning with constraints on
     // max neurons (N), max inbound synapses (M), and max partitions (K).
-    std::vector<int> partitionSequential(const HyperGraph& hg, std::size_t N, std::size_t M, std::size_t K);
+    std::vector<uint32_t> partitionSequential(const HyperGraph& hg, uint32_t N, uint32_t M, uint32_t K);
 
     class HardwareModel {
-        public:
-        using Node = std::uint32_t;
-
         private:
+        std::string name_;
         // CONSTRAINTS
-        std::size_t neurons_per_core_;
-        std::size_t synapses_per_core_;
-        std::size_t cores_per_chip_x_;
-        std::size_t cores_per_chip_y_;
-        std::size_t chips_per_system_x_;
-        std::size_t chips_per_system_y_;
+        uint32_t neurons_per_core_;
+        uint32_t synapses_per_core_;
+        uint32_t cores_per_chip_x_;
+        uint32_t cores_per_chip_y_;
+        uint32_t chips_per_system_x_;
+        uint32_t chips_per_system_y_;
 
         // COSTS
-        double energy_per_routing_;
-        double energy_per_wire_;
-        double latency_per_routing_;
-        double latency_per_wire_;
+        double energy_per_routing_; // in [pJ]
+        double energy_per_wire_; // in [pJ]
+        double latency_per_routing_; // in [ns]
+        double latency_per_wire_; // in [ns]
 
         public:
-        HardwareModel(std::size_t neurons_per_core,
-                    std::size_t synapses_per_core,
-                    std::size_t cores_per_chip_x,
-                    std::size_t cores_per_chip_y,
-                    std::size_t chips_per_system_x,
-                    std::size_t chips_per_system_y,
-                    double energy_per_routing,
-                    double energy_per_wire,
-                    double latency_per_routing,
-                    double latency_per_wire) :
-            neurons_per_core_(neurons_per_core),
-            synapses_per_core_(synapses_per_core),
-            cores_per_chip_x_(cores_per_chip_x),
-            cores_per_chip_y_(cores_per_chip_y),
-            chips_per_system_x_(chips_per_system_x),
-            chips_per_system_y_(chips_per_system_y),
-            energy_per_routing_(energy_per_routing),
-            energy_per_wire_(energy_per_wire),
-            latency_per_routing_(latency_per_routing),
-            latency_per_wire_(latency_per_wire) {
+        HardwareModel(const HardwareModelConfig& cfg) :
+            name_(cfg.name),
+            neurons_per_core_(cfg.neurons_per_core),
+            synapses_per_core_(cfg.synapses_per_core),
+            cores_per_chip_x_(cfg.cores_per_chip_x),
+            cores_per_chip_y_(cfg.cores_per_chip_y),
+            chips_per_system_x_(cfg.chips_per_system_x),
+            chips_per_system_y_(cfg.chips_per_system_y),
+            energy_per_routing_(cfg.energy_per_routing),
+            energy_per_wire_(cfg.energy_per_wire),
+            latency_per_routing_(cfg.latency_per_routing),
+            latency_per_wire_(cfg.latency_per_wire)
+        {
             if (!(neurons_per_core_ > 0 && synapses_per_core_ > 0 &&
                 cores_per_chip_x_ > 0 && cores_per_chip_y_ > 0 &&
                 chips_per_system_x_ > 0 && chips_per_system_y_ > 0)) {
@@ -281,28 +281,31 @@ namespace hwmodel {
                 throw std::invalid_argument("All hardware costs must be >= 0.");
             }
             if (!(chips_per_system_x_ == 1 && chips_per_system_y_ == 1)) {
-                throw std::invalid_argument("Functionality not yet implemented, ensure that 'chips_per_system_x' and 'chips_per_system_y' are 1.");
+                throw std::invalid_argument(
+                    "Functionality not yet implemented: chips_per_system_x and chips_per_system_y must be 1."
+                );
             }
         }
 
         // accessors
-        std::size_t neuronsPerCore() const { return neurons_per_core_; }
-        std::size_t synapsesPerCore() const { return synapses_per_core_; }
-        std::size_t coresPerChipX() const { return cores_per_chip_x_; }
-        std::size_t coresPerChipY() const { return cores_per_chip_y_; }
-        std::size_t chipsPerSystemX() const { return chips_per_system_x_; }
-        std::size_t chipsPerSystemY() const { return chips_per_system_y_; }
+        std::string name() const { return name_; }
+        uint32_t neuronsPerCore() const { return neurons_per_core_; }
+        uint32_t synapsesPerCore() const { return synapses_per_core_; }
+        uint32_t coresPerChipX() const { return cores_per_chip_x_; }
+        uint32_t coresPerChipY() const { return cores_per_chip_y_; }
+        uint32_t chipsPerSystemX() const { return chips_per_system_x_; }
+        uint32_t chipsPerSystemY() const { return chips_per_system_y_; }
 
         double energyPerRouting() const { return energy_per_routing_; }
         double energyPerWire() const { return energy_per_wire_; }
         double latencyPerRouting() const { return latency_per_routing_; }
         double latencyPerWire() const { return latency_per_wire_; }
 
-        std::size_t coresCount() const { return (cores_per_chip_x_ * cores_per_chip_y_) * chips_per_system_x_ * chips_per_system_y_; }
-        std::size_t coresPerChipCount() const { return cores_per_chip_x_ * cores_per_chip_y_; }
-        std::size_t chipsCount() const { return chips_per_system_x_ * chips_per_system_y_; }
-        std::size_t coresAlongX() const { return cores_per_chip_x_ * chips_per_system_x_; }
-        std::size_t coresAlongY() const { return cores_per_chip_y_ * chips_per_system_y_; }
+        uint32_t coresCount() const { return (cores_per_chip_x_ * cores_per_chip_y_) * chips_per_system_x_ * chips_per_system_y_; }
+        uint32_t coresPerChipCount() const { return cores_per_chip_x_ * cores_per_chip_y_; }
+        uint32_t chipsCount() const { return chips_per_system_x_ * chips_per_system_y_; }
+        uint32_t coresAlongX() const { return cores_per_chip_x_ * chips_per_system_x_; }
+        uint32_t coresAlongY() const { return cores_per_chip_y_ * chips_per_system_y_; }
 
         // empirical: can have false negatives (no false positives tho)
         bool checkSnnFit(const HyperGraph& snn,
@@ -310,7 +313,7 @@ namespace hwmodel {
                         bool verbose = false) const;
 
         bool checkPartitionValidity(const HyperGraph& snn,
-                                    const std::vector<int>& partitions,
+                                    const std::vector<uint32_t>& partitions,
                                     bool verbose = false) const;
 
         bool checkPlacementValidity(const HyperGraph& part_snn,
@@ -318,7 +321,7 @@ namespace hwmodel {
                                     bool verbose = false) const;
 
         SynapticReuseMetrics synapticReuse(const HyperGraph& snn,
-                                        const std::vector<int>& partitions) const;
+                                        const std::vector<uint32_t>& partitions) const;
 
         ConnectionsLocalityMetrics connectionsLocality(
             const HyperGraph& part_snn,
@@ -354,13 +357,13 @@ namespace hwmodel {
             const std::vector<hwgeom::Coord2D>& placement) const;
     };
 
-    std::vector<int> partitionSequential(const HyperGraph& hg, std::size_t N, std::size_t M, std::size_t K) {
-        std::vector<int> partitioning;
+    std::vector<uint32_t> partitionSequential(const HyperGraph& hg, uint32_t N, uint32_t M, uint32_t K) {
+        std::vector<uint32_t> partitioning;
         partitioning.reserve(hg.nodes());
 
-        std::unordered_set<std::uint32_t> inbound_edges;
-        std::size_t assigned_nodes = 0;
-        std::size_t current_partition = 0;
+        std::unordered_set<uint32_t> inbound_edges;
+        uint32_t assigned_nodes = 0;
+        uint32_t current_partition = 0;
 
         for (std::uint32_t node = 0; node < hg.nodes(); ++node) {
             ++assigned_nodes;
@@ -379,7 +382,7 @@ namespace hwmodel {
                 }
             }
 
-            partitioning.push_back(static_cast<int>(current_partition));
+            partitioning.push_back(static_cast<uint32_t>(current_partition));
         }
 
         return partitioning;
@@ -426,18 +429,18 @@ namespace hwmodel {
         return true;
     }
 
-    bool HardwareModel::checkPartitionValidity(const HyperGraph& snn, const std::vector<int>& partitions, bool verbose) const {
+    bool HardwareModel::checkPartitionValidity(const HyperGraph& snn, const std::vector<uint32_t>& partitions, bool verbose) const {
         if (partitions.size() != snn.nodes())
             throw std::runtime_error("Each neuron must be assigned to a partition.");
 
         // count neurons per partition and distinct partitions.
-        std::unordered_map<int, std::size_t> partitions_counter;
+        std::unordered_map<uint32_t, uint32_t> partitions_counter;
         partitions_counter.reserve(partitions.size());
-        for (int p : partitions) {
+        for (uint32_t p : partitions) {
             ++partitions_counter[p];
         }
 
-        const std::size_t partitions_count = partitions_counter.size();
+        const uint32_t partitions_count = partitions_counter.size();
         if (partitions_count > coresCount()) {
             if (verbose)
                 std::cout << "INVALID PARTITIONING: more partitions than cores\n";
@@ -454,28 +457,28 @@ namespace hwmodel {
         }
 
         // ensure partitions are incrementally indexed from 0 onward
-        for (std::size_t i = 0; i < partitions_count; ++i) {
-            if (!partitions_counter.count(static_cast<int>(i)))
+        for (uint32_t i = 0; i < partitions_count; ++i) {
+            if (!partitions_counter.count(i))
                 throw std::runtime_error("Partitions must be incrementally indexed from 0 onward.");
         }
 
-        std::vector<std::size_t> synapses_per_partition(partitions_count, 0);
+        std::vector<uint32_t> synapses_per_partition(partitions_count, 0);
 
         // for each hyperedge, count distinct inbound synapses per partition
         for (const auto& he : snn.hedges()) {
-            std::unordered_set<int> already_seen;
+            std::unordered_set<uint32_t> already_seen;
             already_seen.reserve(he.length());
 
             for (auto neuron : he.destinations()) {
-                int partition = partitions[neuron];
+                uint32_t partition = partitions[neuron];
                 if (!already_seen.count(partition)) {
-                    ++synapses_per_partition[static_cast<std::size_t>(partition)];
+                    ++synapses_per_partition[partition];
                     already_seen.insert(partition);
                 }
             }
         }
 
-        for (std::size_t i = 0; i < partitions_count; ++i) {
+        for (uint32_t i = 0; i < partitions_count; ++i) {
             if (synapses_per_partition[i] > synapses_per_core_) {
                 if (verbose)
                     std::cout << "INVALID PARTITIONING: more inbound synapses per partition than a core can handle\n";
@@ -492,13 +495,13 @@ namespace hwmodel {
         std::unordered_set<hwgeom::Coord2D, hwgeom::Coord2DHash> seen_cores;
         seen_cores.reserve(placement.size());
 
-        const std::size_t max_x = coresAlongX();
-        const std::size_t max_y = coresAlongY();
+        const uint32_t max_x = coresAlongX();
+        const uint32_t max_y = coresAlongY();
 
         for (const auto& core : placement) {
             if (core.x < 0 || core.y < 0 ||
-                static_cast<std::size_t>(core.x) >= max_x ||
-                static_cast<std::size_t>(core.y) >= max_y) {
+                static_cast<uint32_t>(core.x) >= max_x ||
+                static_cast<uint32_t>(core.y) >= max_y) {
                 if (verbose)
                     std::cout << "INVALID PLACEMENT: a core's coordinates are out of the hardware's range\n";
                 return false;
@@ -513,32 +516,32 @@ namespace hwmodel {
         return true;
     }
 
-    SynapticReuseMetrics HardwareModel::synapticReuse(const HyperGraph& snn, const std::vector<int>& partitions) const {
+    SynapticReuseMetrics HardwareModel::synapticReuse(const HyperGraph& snn, const std::vector<uint32_t>& partitions) const {
         if (partitions.empty())
             return {};
 
-        int max_partition = *std::max_element(partitions.begin(), partitions.end());
-        std::size_t partitions_count = static_cast<std::size_t>(max_partition + 1);
+        uint32_t max_partition = *std::max_element(partitions.begin(), partitions.end());
+        uint32_t partitions_count = max_partition + 1;
 
-        std::vector<std::int64_t> synapses_count(partitions_count, 0);
-        std::vector<std::int64_t> axons_count(partitions_count, 0);
+        std::vector<uint64_t> synapses_count(partitions_count, 0);
+        std::vector<uint64_t> axons_count(partitions_count, 0);
 
         for (const auto& he : snn.hedges()) {
-            std::unordered_set<int> already_seen;
+            std::unordered_set<uint32_t> already_seen;
             already_seen.reserve(he.length());
 
             for (auto neuron : he.destinations()) {
-                int partition = partitions[neuron];
+                uint32_t partition = partitions[neuron];
                 if (!already_seen.count(partition)) {
-                    ++axons_count[static_cast<std::size_t>(partition)];
+                    ++axons_count[partition];
                     already_seen.insert(partition);
                 }
-                ++synapses_count[static_cast<std::size_t>(partition)];
+                ++synapses_count[partition];
             }
         }
 
         std::vector<double> reuse(partitions_count, 0.0);
-        for (std::size_t i = 0; i < partitions_count; ++i) {
+        for (uint32_t i = 0; i < partitions_count; ++i) {
             if (axons_count[i] > 0)
                 reuse[i] = static_cast<double>(synapses_count[i]) / static_cast<double>(axons_count[i]);
         }
@@ -577,10 +580,7 @@ namespace hwmodel {
             for (auto n : nodes)
                 pts.push_back(placement[n]);
 
-            int traversed_cores = hwgeom::intersectionWithConvexHull(
-                pts,
-                static_cast<int>(coresAlongX()),
-                static_cast<int>(coresAlongY()));
+            int traversed_cores = hwgeom::intersectionWithConvexHull(pts, static_cast<int>(coresAlongX()), static_cast<int>(coresAlongY()));
 
             // should not happen for a valid placement, but ...
             if (traversed_cores <= 0)
@@ -596,7 +596,7 @@ namespace hwmodel {
             weights_sum += w;
         }
 
-        std::size_t hedge_count = hedges.size();
+        uint32_t hedge_count = hedges.size();
         ar_mean /= static_cast<double>(hedge_count);
         geo_mean = std::exp(geo_mean / static_cast<double>(hedge_count));
 
@@ -671,9 +671,7 @@ namespace hwmodel {
         return result;
     }
 
-    std::vector<std::vector<double>>
-    HardwareModel::expectedSpikeTransitProbability(int x_src, int y_src, int x_dst, int y_dst) const {
-
+    std::vector<std::vector<double>> HardwareModel::expectedSpikeTransitProbability(int x_src, int y_src, int x_dst, int y_dst) const {
         int width  = std::abs(x_dst - x_src) + 1;
         int height = std::abs(y_dst - y_src) + 1;
 
@@ -737,8 +735,8 @@ namespace hwmodel {
     }
 
     double HardwareModel::placementMaximumCongestion(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
-        std::size_t max_x = coresAlongX();
-        std::size_t max_y = coresAlongY();
+        uint32_t max_x = coresAlongX();
+        uint32_t max_y = coresAlongY();
 
         std::vector<std::vector<double>> congestion_matrix(max_x, std::vector<double>(max_y, 0.0));
 
@@ -757,7 +755,7 @@ namespace hwmodel {
 
                 for (int x = 0; x < dx; ++x) {
                     for (int y = 0; y < dy; ++y) {
-                        congestion_matrix[static_cast<std::size_t>(x_base + x)][static_cast<std::size_t>(y_base + y)] += static_cast<double>(he.weight()) * transit_prob_matrix[x][y];
+                        congestion_matrix[static_cast<uint32_t>(x_base + x)][static_cast<uint32_t>(y_base + y)] += static_cast<double>(he.weight()) * transit_prob_matrix[x][y];
                     }
                 }
             }
