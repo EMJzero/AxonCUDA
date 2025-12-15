@@ -24,6 +24,7 @@
 #define DEVICE_ID 0
 
 #define VERBOSE true
+#define VERBOSE_LENGTH 20
 
 extern __global__ void neighborhoods_count_kernel(
     const uint32_t* hedges,
@@ -577,14 +578,14 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_u_scores, curr_num_nodes * sizeof(uint32_t) * MAX_CANDIDATES, cudaMemcpyDeviceToHost));
         std::cout << "Pairing results:";
         for (uint32_t i = 0; i < curr_num_nodes; ++i) {
-            if (i < std::min<uint32_t>(curr_num_nodes, 20))
-            std::cout << "\n  node " << i << " ->";
+            if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH))
+                std::cout << "\n  node " << i << " ->";
             for (uint32_t j = 0; j < MAX_CANDIDATES; ++j) {
                 float score = ((float)scores_tmp[i * MAX_CANDIDATES + j])/FIXED_POINT_SCALE;
                 uint32_t target = pairs_tmp[i * MAX_CANDIDATES + j];
                 candidates_count[j].insert(target);
-                if (i < std::min<uint32_t>(curr_num_nodes, 20)) {
-                    if (target == UINT32_MAX) std::cout << " (" << j << " target=none score=none) ";
+                if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
+                    if (target == UINT32_MAX) std::cout << " (" << j << " target=none score=none)";
                     else if (target == i) std::cout << " !!SELF TARGETED!! ";
                     else std::cout << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ")";
                 }
@@ -603,7 +604,7 @@ int main(int argc, char** argv) {
         // =============================
 
         // zero-out grouping kernel's outputs
-        slot init_slot; init_slot.id = 0xFFFFFFFFu; init_slot.score = 0u;
+        slot init_slot; init_slot.id = UINT32_MAX; init_slot.score = 0u;
         thrust::device_ptr<slot> d_slots_ptr(d_slots);
         // TODO: could lower to just curr_num_nodes
         thrust::fill(d_slots_ptr, d_slots_ptr + num_nodes * MAX_GROUP_SIZE, init_slot); // upper 32 bits to 0x00, lower 32 to 0xFF
@@ -753,7 +754,7 @@ int main(int argc, char** argv) {
             uint32_t group = groups_tmp[i];
             uint32_t group_size = groups_sizes_tmp[group];
             groups_count[group]++;
-            if (i < std::min<uint32_t>(curr_num_nodes, 20)) {
+            if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
                 std::cout << "  node " << i << " ->";
                 for (uint32_t j = 0; j < MAX_CANDIDATES; ++j) {
                     uint32_t target = pairs_tmp[i * MAX_CANDIDATES + j];
@@ -991,7 +992,7 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < curr_num_nodes; ++i) {
             uint32_t part = partitions_tmp[i];
             part_count[part]++;
-            if (i < std::min<uint32_t>(curr_num_nodes, 20))
+            if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH))
                 std::cout << "  node " << i << " -> " << part << "\n";
         }
         int max_ps = part_count.empty() ? 0 : std::max_element(part_count.begin(), part_count.end(), [](auto &a, auto &b){ return a.second < b.second; })->second;
@@ -1072,7 +1073,14 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMalloc(&d_ranks, curr_num_nodes * sizeof(uint32_t))); // node -> number of touching hedges seen as of now
         thrust::device_ptr<uint32_t> t_ranks(d_ranks);
         thrust::device_ptr<float> t_scores(d_f_scores);
-        thrust::sort_by_key(t_scores, t_scores + curr_num_nodes, t_indices.begin()); // sort scores according to scores themselves and indices in the same way
+        // sort scores according to scores themselves and indices in the same way
+        // use node ids as a tie-breaker when sorting moves
+        auto rank_keys_begin = thrust::make_zip_iterator(thrust::make_tuple(t_scores, t_indices.begin()));
+        auto rank_keys_end = rank_keys_begin + curr_num_nodes;
+        thrust::sort(rank_keys_begin, rank_keys_end, [] __device__ (const thrust::tuple<float, uint32_t>& a, const thrust::tuple<float, uint32_t>& b) {
+                float sa = thrust::get<0>(a), sb = thrust::get<0>(b);
+                if (sa < sb) return true; if (sa > sb) return false; return thrust::get<1>(a) < thrust::get<1>(b); // deterministic tie-break
+        });
         thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks); // invert the permutation such that: ranks[original_index] = sorted_position
         // free up thrust vectors
         thrust::device_vector<uint32_t>().swap(t_indices);
@@ -1135,9 +1143,9 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         // sort events by (partition, move) [in lexicographical order for the tuple] and carry events_delta along
-        auto key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_events_partition, t_events_index));
-        auto key_end = key_begin + num_events;
-        thrust::sort_by_key(key_begin, key_end, t_events_delta);
+        auto events_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_events_partition, t_events_index));
+        auto events_key_end = events_key_begin + num_events;
+        thrust::sort_by_key(events_key_begin, events_key_end, t_events_delta);
         // inclusive scan inside each key (= partition) on the event deltas => for each event we get the cumulative size delta for that partition at that point in the sequence
         thrust::inclusive_scan_by_key(t_events_partition, t_events_partition + num_events, t_events_delta, t_events_delta);
         // now mark moves that would violate size constraint if the sequence were to end on them
@@ -1238,7 +1246,7 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < num_nodes; ++i) {
         uint32_t part = partitions[i];
         part_count.insert(part);
-        if (i < std::min<uint32_t>(num_nodes, 20)) {
+        if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
             if (part == UINT32_MAX) std::cout << "node " << i << " -> part=none\n";
             else std::cout << "node " << i << " ->" << " part=" << part << "\n";
         }

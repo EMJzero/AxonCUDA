@@ -125,7 +125,7 @@ void neighborhoods_scatter_kernel(
     // can return only after helping initializing shared memory
     if (warp_id >= my_touching_count) return;
 
-    // TOOD: could optimize by iterating directly on pointers
+    // TODO: could optimize by iterating directly on pointers
     for (uint32_t touching_hedge_idx = warp_id; touching_hedge_idx < my_touching_count; touching_hedge_idx += warps_per_block) { // the block loops over touching hedges
         if (touching_hedge_idx < my_touching_count) {
             const uint32_t my_hedge_idx = my_touching[touching_hedge_idx];
@@ -371,6 +371,15 @@ void grouping_kernel(
     *   => you get a tree with single roots or 2-cycles as roots
     *
     * Could the upward walk be done in a single shot, no path required? Yes! But then you'd loose the ability to deterministially walk back and group by score!
+    *
+    * Note: the only true requirement is that each thread starts going backward from a point that is guaranteed to determine its first decision correctly
+    *       (and failing a max gives this, since you know you will never claim the next node, and so do the other stopping conditions for the upward walk,
+    *       the roots). Every decision that follows the first, if the first is correct, is deterministic and identical for all threads!
+    *       This means it is fine for threads to non-deterministically pass through some atomic max and continue if they came first!
+    *       => the downward pass is designed to "wash out" the fact that multiple threads may have climbed past the same node! The fact that some threads
+    *          climbed "too far" and some stopped early wouldn’t change the logical decisions, only how many redundant times those decisions are re-applied.
+    *
+    * Note: the downward walk could be replaced with a second upward walk, no need to track "path", but requires re-reading pairs...
     */
 
     /*
@@ -406,7 +415,7 @@ void grouping_kernel(
     */
 
     // initialize yourself to a one-node group, unless someone already claimed you
-    atomicCAS(&group_slots[tid*MAX_GROUP_SIZE].id, UINT32_MAX, tid);
+    atomicCAS(&reinterpret_cast<unsigned long long*>(group_slots)[tid*MAX_GROUP_SIZE], pack_slot(0u, UINT32_MAX), pack_slot(0u, tid));
 
     for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
         // if you formed a pair, stop
@@ -429,6 +438,8 @@ void grouping_kernel(
                 // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
                 outcome = atomic_max_on_slot(group_slots, target*MAX_GROUP_SIZE, current, score);
                 // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
+                // NOTE: if the atomic already sees the value you were about to write (strict), you CANNOT stop, you must know what happens to your target before taking the final decision on your path
+                // => with the second note being a <cannot>, we can't guarantee that exactly one thread will go up any piece of path, but we still don't need atomics in the downward walk, as every thread takes the same decisions regardless
                 if (!outcome) break;
                 // DEBUG: prevent cycles longer than 2!
                 /*bool die = false;
@@ -453,10 +464,8 @@ void grouping_kernel(
         // NOTE: concurrent writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
         if (outcome && target != UINT32_MAX) {
             const uint32_t lowest_id = min(current, target);
-            group_slots[current*MAX_GROUP_SIZE].id = lowest_id;
-            group_slots[current*MAX_GROUP_SIZE].score = score;
-            group_slots[target*MAX_GROUP_SIZE].id = lowest_id;
-            group_slots[target*MAX_GROUP_SIZE].score = score;
+            set_slot(group_slots, current*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
+            set_slot(group_slots, target*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
         }
 
         // global synch
@@ -466,7 +475,7 @@ void grouping_kernel(
         // it the root had no target, path[path_length - 1] is the root, if the root was a mutual-poiting pair, path[path_length - 1] is the first encountered node of the pair
         for (path_length = path_length - 2; path_length >= 0; path_length--) {
             // NOTE: on the first iteration, coming from the upward walk, "current" is the last node that got its slot updated
-            target = current; // this is "who current would have liked to be with", the node one step back up the ladder towards root
+            target = path[path_length + 1]; // this is "who current would have liked to be with", the node one step back up the ladder towards root
             current = path[path_length];
             if (group_slots[target*MAX_GROUP_SIZE].id == current) {
                 // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine

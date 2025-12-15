@@ -91,7 +91,7 @@ __device__ __forceinline__ uint32_t deterministic_noise(uint32_t a, uint32_t b) 
 // USED BY: grouping kernel
 
 #define MAX_GROUP_SIZE 1u // => MAX_GROUP_SIZE - 1 slots per node; 2 means pairs
-#define PATH_SIZE 192u // initial slots for nodes to see while traversing the pairs three, TODO: automatically extend if needed (costly...)
+#define PATH_SIZE 192u // initial slots for nodes to see while traversing the pairs tree, TODO: automatically extend if needed (costly...)
 
 typedef struct __align__(8) {
     uint32_t id; // lower 32 bits (Nvidia GPUs are little-endian)
@@ -108,6 +108,18 @@ __device__ __forceinline__ void unpack_slot(unsigned long long v, uint32_t &scor
     node = (uint32_t)(v & 0xFFFFFFFFu);
 }
 
+// 64bit atomic store to a slot
+__device__ __forceinline__ void set_slot(slot* s, uint32_t idx, uint32_t new_node, uint32_t new_score) {
+    unsigned long long* s64 = reinterpret_cast<unsigned long long*>(s);
+    unsigned long long new_val = pack_slot(new_score, new_node);
+    //s64[idx] = new_val; // => needs to be atomic because 64bit stores are not by default...
+    //__nv_atomic_store_n(&s64[idx], new_val, 0); // => not cross-version compatible...
+    //cuda::std::atomic_ref<unsigned long long> a(* (unsigned long long*) &s64[idx]);
+    //a.store(new_val, cuda::std::memory_order_relaxed); // wants "#include <cuda/std/atomic>"
+    atomicExch(&s64[idx], new_val);
+}
+
+// 64bit atomic max on a slot, returns true iff the slot's content is the new node and score (even if they already were)
 __device__ __forceinline__ bool atomic_max_on_slot(slot* s, uint32_t idx, uint32_t new_node, uint32_t new_score) {
     unsigned long long* s64 = reinterpret_cast<unsigned long long*>(s);
     unsigned long long new_val = pack_slot(new_score, new_node);
@@ -115,6 +127,19 @@ __device__ __forceinline__ bool atomic_max_on_slot(slot* s, uint32_t idx, uint32
     return read_val <= new_val;
 }
 
+// 64bit atomic max on a slot, returns true iff the slot's content was changed from something else to the new node and score
+__device__ __forceinline__ bool atomic_max_on_slot_strict(slot* s, uint32_t idx, uint32_t new_node, uint32_t new_score) {
+    unsigned long long* s64 = reinterpret_cast<unsigned long long*>(s) + idx;
+    unsigned long long new_val = pack_slot(new_score, new_node);
+    while (true) {
+        unsigned long long old_val = *s64;
+        if (old_val >= new_val) return false; // no change needed
+        unsigned long long prev = atomicCAS(s64, old_val, new_val);
+        if (prev == old_val) return true; // successfully updated
+    }
+}
+
+// same as 'atomic_max_on_slot' but provides the previous slot's content via 'ret'
 __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* s, uint32_t idx, uint32_t new_node, uint32_t new_score, slot &ret) {
     unsigned long long* s64 = reinterpret_cast<unsigned long long*>(s);
     unsigned long long new_val = pack_slot(new_score, new_node);
