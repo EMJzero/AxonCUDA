@@ -443,7 +443,7 @@ namespace hwmodel {
         const uint32_t partitions_count = partitions_counter.size();
         if (partitions_count > coresCount()) {
             if (verbose)
-                std::cout << "INVALID PARTITIONING: more partitions than cores\n";
+                std::cout << "INVALID PARTITIONING: more partitions (" << partitions_count << ") than cores (" << coresCount() << ")\n";
             return false;
         }
 
@@ -451,7 +451,7 @@ namespace hwmodel {
         for (const auto& kv : partitions_counter) {
             if (kv.second > neurons_per_core_) {
                 if (verbose)
-                    std::cout << "INVALID PARTITIONING: more neurons per partition than a core can store\n";
+                    std::cout << "INVALID PARTITIONING: more neurons per partition (" << kv.second << ") than a core can store (" << neurons_per_core_ << ")\n";
                 return false;
             }
         }
@@ -481,7 +481,7 @@ namespace hwmodel {
         for (uint32_t i = 0; i < partitions_count; ++i) {
             if (synapses_per_partition[i] > synapses_per_core_) {
                 if (verbose)
-                    std::cout << "INVALID PARTITIONING: more inbound synapses per partition than a core can handle\n";
+                    std::cout << "INVALID PARTITIONING: more inbound synapses per partition (" << synapses_per_partition[i] << ") than a core can handle (" << synapses_per_core_ << ")\n";
                 return false;
             }
         }

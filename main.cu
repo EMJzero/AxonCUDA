@@ -183,11 +183,13 @@ extern __global__ void fm_refinement_apply_kernel(
     const uint32_t* touching_offsets,
     const uint32_t* moves,
     const uint32_t* move_ranks,
+    const uint32_t* nodes_sizes,
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
     const uint32_t num_good_moves,
-    uint32_t* partitions
+    uint32_t* partitions,
+    uint32_t* partitions_sizes
     //uint32_t* pins_per_partitions
 );
 
@@ -208,7 +210,7 @@ extern __global__ void flag_size_events_kernel(
     const int32_t* ev_delta,
     const uint32_t* partitions_sizes,
     const uint32_t num_events,
-    bool* d_valid_moves
+    uint32_t* d_valid_moves
 );
 
 extern __constant__ uint32_t max_nodes_per_part;
@@ -380,6 +382,7 @@ int main(int argc, char** argv) {
     const uint32_t h_max_nodes_per_part = hw.neuronsPerCore();
     const uint32_t h_max_inbound_per_part = hw.synapsesPerCore();
     const uint32_t max_parts = hw.coresCount(); // not needed in kernels
+    const uint32_t target_parts = min(max_parts, (num_nodes + h_max_nodes_per_part - 1) / h_max_nodes_per_part);
     /*
     * How to check them:
     * - max_nodes_per_part: keep a running total count of nodes-per-group, that ultimately becomes nodes-per-partition
@@ -668,9 +671,9 @@ int main(int argc, char** argv) {
         thrust::device_ptr<uint32_t> t_groups_sizes(d_groups_sizes);
         thrust::device_ptr<const uint32_t> t_nodes_sizes(d_nodes_sizes);
         // premute node sizes in "sorted-by-group" order, using indices that already reflect such ordering ( t_indices[i] tells which original idx got sorted in position i )
-        auto values_begin = thrust::make_permutation_iterator(t_nodes_sizes, t_indices.begin());
+        auto nodes_sizes_values_begin = thrust::make_permutation_iterator(t_nodes_sizes, t_indices.begin());
         // reduce (sum) nodes_sizes inside each group (group = key, marked by having the same headflag, that by now corresponds to the zero-based group id) ( headflags[i] is the new group ID for sorted position i )
-        thrust::reduce_by_key(t_headflags.begin(), t_headflags.end(), values_begin, thrust::make_discard_iterator(), t_groups_sizes);
+        thrust::reduce_by_key(t_headflags.begin(), t_headflags.end(), nodes_sizes_values_begin, thrust::make_discard_iterator(), t_groups_sizes);
         // => now "d_groups_sizes[idx]" holds the sum of nodes_size over all nodes in group idx, for idx in [0, new_num_nodes)
         // ======================================
         // scatter the new ids back to original positions using the sequence; for sorted position i, original index is t_indices[i]; we want: d_groups[t_indices[i]] = t_headflags[i]
@@ -684,8 +687,7 @@ int main(int argc, char** argv) {
         //       => what this does now is equivalent to using the coarsening algorithm also as the algorithm to perform the initial partitioning
         // NOTE: with the current setup, we stop as soon as we clear "max_parts" and let refinement eventually empty some if they are too many
         //       => and alternative solution could be to always wait for "new_num_nodes == curr_num_nodes" and then enforce "max_parts" to spot failures
-        if (new_num_nodes <= max_parts || new_num_nodes == curr_num_nodes) {
-            
+        if (new_num_nodes <= target_parts || new_num_nodes == curr_num_nodes) {
             // HERE we repurpose the coarsening routine as the routine for initial partitions:
             // - num_partitions = new_num_nodes
             // - partitions = groups
@@ -707,9 +709,7 @@ int main(int argc, char** argv) {
             // base case, reached the target number of partitions
             if (new_num_nodes <= max_parts) {
                 std::cout << "Initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
-            }
-            // base case, failure to coarsen further
-            if (new_num_nodes == curr_num_nodes) {
+            } else { // base case, failure to coarsen further
                 std::cout << "FAILED TO COARSEN FURTHER at level " << level_idx << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << new_num_nodes << "\n";
                 std::cout << "WARNING: falling back to returning current groups as individual partitions...\n";
             }
@@ -987,6 +987,8 @@ int main(int argc, char** argv) {
         #if VERBOSE
         std::vector<uint32_t> partitions_tmp(curr_num_nodes);
         CUDA_CHECK(cudaMemcpy(partitions_tmp.data(), d_partitions, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        std::vector<uint32_t> partitions_sizes_tmp(num_partitions);
+        CUDA_CHECK(cudaMemcpy(partitions_sizes_tmp.data(), d_partitions_sizes, num_partitions * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         std::unordered_map<uint32_t, int> part_count;
         std::cout << "Partitioning results:\n";
         for (uint32_t i = 0; i < curr_num_nodes; ++i) {
@@ -995,9 +997,15 @@ int main(int argc, char** argv) {
             if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH))
                 std::cout << "  node " << i << " -> " << part << "\n";
         }
+        for (uint32_t i = 0; i < num_partitions; ++i) {
+            uint32_t part_size = partitions_sizes_tmp[i];
+            if (part_size > h_max_nodes_per_part)
+                std::cout << "  WARNING, max partition size constraint (" << h_max_nodes_per_part << ") violated by part=" << i << " with part_size=" << part_size << " !!\n";
+        }
         int max_ps = part_count.empty() ? 0 : std::max_element(part_count.begin(), part_count.end(), [](auto &a, auto &b){ return a.second < b.second; })->second;
         std::cout << "Non-empty partitions count: " << part_count.size() << ", Max partition size: " << max_ps << "\n";
         partitions_tmp.clear();
+        partitions_sizes_tmp.clear();
         part_count.clear();
         #endif
         // =============================
@@ -1079,7 +1087,9 @@ int main(int argc, char** argv) {
         auto rank_keys_end = rank_keys_begin + curr_num_nodes;
         thrust::sort(rank_keys_begin, rank_keys_end, [] __device__ (const thrust::tuple<float, uint32_t>& a, const thrust::tuple<float, uint32_t>& b) {
                 float sa = thrust::get<0>(a), sb = thrust::get<0>(b);
-                if (sa < sb) return true; if (sa > sb) return false; return thrust::get<1>(a) < thrust::get<1>(b); // deterministic tie-break
+                if (sa > sb) return true; // highest score first
+                if (sa < sb) return false;
+                return thrust::get<1>(a) < thrust::get<1>(b); // deterministic tie-break
         });
         thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks); // invert the permutation such that: ranks[original_index] = sorted_position
         // free up thrust vectors
@@ -1114,6 +1124,7 @@ int main(int argc, char** argv) {
         // ======================================
         // extra step: compute moves validity (same HP as the kernel above: all previous higher-gain moves will be applied)
         // explode each move into two events, one decrementing and incrementing the size of the src and dst partition respectively
+        // => seeing each move as two distinct events makes us able to identify sequences of useful events first, then moves
         uint32_t *d_events_partition = nullptr, *d_events_index = nullptr;
         int32_t *d_events_delta = nullptr;
         const uint32_t num_events = 2 * curr_num_nodes;
@@ -1149,10 +1160,10 @@ int main(int argc, char** argv) {
         // inclusive scan inside each key (= partition) on the event deltas => for each event we get the cumulative size delta for that partition at that point in the sequence
         thrust::inclusive_scan_by_key(t_events_partition, t_events_partition + num_events, t_events_delta, t_events_delta);
         // now mark moves that would violate size constraint if the sequence were to end on them
-        bool *d_valid_moves = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_valid_moves, curr_num_nodes * sizeof(bool))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
-        CUDA_CHECK(cudaMemset(d_valid_moves, true, curr_num_nodes * sizeof(bool)));
-        thrust::device_ptr<bool> t_valid_moves(d_valid_moves);
+        uint32_t *d_valid_moves = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_valid_moves, curr_num_nodes * sizeof(uint32_t))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
+        CUDA_CHECK(cudaMemset(d_valid_moves, 0u, curr_num_nodes * sizeof(uint32_t)));
+        thrust::device_ptr<uint32_t> t_valid_moves(d_valid_moves);
         // launch configuration - flag size events kernel
         threads_per_block = 128;
         num_threads_needed = num_events; // 1 thread per event
@@ -1172,6 +1183,8 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaFree(d_events_partition));
         CUDA_CHECK(cudaFree(d_events_index));
         CUDA_CHECK(cudaFree(d_events_delta));
+        // compute, as of each event, the cumulative number of partitions that are invalid by summing the count of those made/unmade invalid at each event
+        thrust::inclusive_scan(t_valid_moves, t_valid_moves + curr_num_nodes, t_valid_moves);
         // ======================================
         // find the move in the sequence that yields both the highest gain and a valid state (when all moves before it are applied)
         // index space 0..curr_num_nodes - 1
@@ -1182,8 +1195,8 @@ int main(int argc, char** argv) {
         auto masked_end = masked_begin + curr_num_nodes;
         // max over valid endpoints only, find the point in the sequence of moves where applying them further never nets a higher gain in a valid state
         auto best_iterator_entry = thrust::max_element(masked_begin, masked_end);
-        uint32_t best_rank = static_cast<uint32_t>(best_iterator_entry - masked_begin);
-        uint32_t num_good_moves = best_rank + 1; // "+1" to make this the improving moves count, rather than the last improving move's idx
+        const uint32_t best_rank = static_cast<uint32_t>(best_iterator_entry - masked_begin);
+        const uint32_t num_good_moves = best_rank + 1; // "+1" to make this the improving moves count, rather than the last improving move's idx
         // launch configuration - fm-ref apply kernel
         threads_per_block = 128;
         num_threads_needed = curr_num_nodes; // 1 thread per move to apply
@@ -1195,11 +1208,13 @@ int main(int argc, char** argv) {
             d_touching_offsets,
             d_pairs,
             d_ranks,
+            d_nodes_sizes,
             num_hedges,
             curr_num_nodes,
             num_partitions,
             num_good_moves,
-            d_partitions
+            d_partitions,
+            d_partitions_sizes
             //d_pins_per_partitions
         );
         CUDA_CHECK(cudaGetLastError());
@@ -1254,6 +1269,7 @@ int main(int argc, char** argv) {
     std::cout << "Partitions count: " << part_count.size() << " (plus " << num_partitions - part_count.size() << " empty ones)" << "\n";
     if (new_num_partitions != part_count.size())
         std::cout << "WARNING, distinct partitions count (" << part_count.size() << ") does not match the computed number of partitions when zero-ing their ids (" << new_num_partitions << ") !!\n";
+    part_count.clear();
     #endif
     // =============================
 

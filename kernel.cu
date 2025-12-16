@@ -461,8 +461,9 @@ void grouping_kernel(
             }
         }
         // handle "root(s)" as a pair of nodes pointing to each other
-        // NOTE: concurrent writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
-        if (outcome && target != UINT32_MAX) {
+        // NOTE: forceful writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
+        // NOTE: prevent locked groups from forming a 2-cycle after the next pairing candidates are considered
+        if (outcome && target != UINT32_MAX && group_slots[target*MAX_GROUP_SIZE].score != UINT32_MAX) {
             const uint32_t lowest_id = min(current, target);
             set_slot(group_slots, current*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
             set_slot(group_slots, target*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
@@ -911,7 +912,7 @@ void fm_refinement_gains_kernel(
     uint32_t partitions_per_thread = min((num_partitions + WARP_SIZE - 1) / WARP_SIZE, PART_HIST_SIZE); // ceiled
 
     // all threads in the warp should agree on those...
-    uint32_t best_score = 0;
+    float best_score = 0.0f;
     uint32_t best_move = UINT32_MAX;
 
     // handle PART_HIST_SIZE*WARP_SIZE partitions at a time, that is partitions_per_thread per thread in the warp
@@ -964,7 +965,7 @@ void fm_refinement_gains_kernel(
             uint32_t part = my_initial_part + p;
             // TODO: could anticipate the constraint check! E.g. at the beginning of the iteration, entirely removing some partitions from the histogram,
             //       but this will require keeping a list of active partitions, since the initial-final indices won't suffice anymore...
-            if (partitions_sizes[part] + my_size < max_nodes_per_part && (score > best_score || score == best_score && part < best_move)) {
+            if (my_initial_part + p < my_final_part && partitions_sizes[part] + my_size < max_nodes_per_part && (score > best_score || score == best_score && part < best_move)) {
                 best_score = score;
                 best_move = part;
             }
@@ -1030,16 +1031,19 @@ void fm_refinement_cascade_kernel(
     */
     
     float score = 0.0f;
-
-    const uint32_t my_partition = partitions[warp_id];
-    const uint32_t my_move_rank = move_ranks[warp_id];
+    
     //const uint32_t my_move_score = scores[warp_id];
     const uint32_t my_move_part = moves[warp_id];
-
+    // no need to update invalid moves
+    if (my_move_part == UINT32_MAX) return;
+    
+    const uint32_t my_partition = partitions[warp_id];
+    const uint32_t my_move_rank = move_ranks[warp_id];
+    
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
     //uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
-
+    
     // scan touching hyperedges
     // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
     for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
@@ -1060,8 +1064,9 @@ void fm_refinement_cascade_kernel(
                 // Option 2: compare scores on the fly and tie-break with the node ids
                 //if (scores[pin] > my_move_score || scores[pin] == my_move_score && pin < warp_id) { // speculation: better-ranked move -> applied
                 // NOTE: MUST use option (1) because we need to keep the original sorting of the scores even after updating them!
+                    // NOTE: invalid moves should all have a lower score and thus a higher rank than all others, never being see here
                     uint32_t new_pin_partition = moves[pin];
-                    uint32_t prev_pin_partition = moves[pin];
+                    uint32_t prev_pin_partition = partitions[pin];
                     if (new_pin_partition == my_partition)
                         my_curr_part_counter_delta++;
                     else if (new_pin_partition == my_move_part)
@@ -1098,11 +1103,13 @@ void fm_refinement_apply_kernel(
     const uint32_t* __restrict__ touching_offsets,
     const uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
     const uint32_t* __restrict__ move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
+    const uint32_t* __restrict__ nodes_sizes,
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
     const uint32_t num_good_moves, // idx + 1 of the maximum in the updated scores
-    uint32_t* __restrict__ partitions // partitions[idx] is the partition node idx is part of
+    uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
+    uint32_t* __restrict__ partitions_sizes
     //uint32_t* pins_per_partitions // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
 ) {
     // STYLE: one node (move) per thread!
@@ -1110,10 +1117,16 @@ void fm_refinement_apply_kernel(
     if (tid >= num_nodes) return;
     
     // stop at the last gain-increasing move
-    if (move_ranks[tid] >= num_good_moves) return;
+    // TODO: remove "moves[tid] == UINT32_MAX", it's redundant and here "just in case", invalid moves should always be outside of num_good_moves
+    if (move_ranks[tid] >= num_good_moves || moves[tid] == UINT32_MAX) return;
 
-    //const uint32_t my_partition = partitions[tid];
+    const uint32_t my_partition = partitions[tid];
     const uint32_t my_move_part = moves[tid];
+    const uint32_t my_size = nodes_sizes[tid];
+
+    // update partition sizes
+    atomicSub(&partitions_sizes[my_partition], my_size);
+    atomicAdd(&partitions_sizes[my_move_part], my_size);
 
     // update my partition
     partitions[tid] = my_move_part;
@@ -1147,6 +1160,8 @@ void build_size_events_kernel(
 
     const uint32_t size = nodes_sizes[tid];
 
+    // TODO: create no events when moves[tid] == UINT32_MAX, or set for both the ev_partition to UINT32_MAX
+
     // first event: node leaves its current partition
     const uint32_t e0 = 2 * tid;
     ev_partition[e0] = partitions[tid];
@@ -1168,19 +1183,45 @@ void flag_size_events_kernel(
     const int32_t* __restrict__ ev_delta,
     const uint32_t* __restrict__ partitions_sizes,
     const uint32_t num_events,
-    bool* __restrict__ d_valid_moves
+    uint32_t* __restrict__ d_valid_moves // initialized with 0s
 ) {
     // STYLE: one event per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_events) return;
 
+    /*
+    * Idea:
+    * - for each move, compute how many partitions it brings to be invalid or it brings back to a valid state
+    * - then compute the number of invalid partitions at each point in time as the prefix sum of the number going from ok to not-ok (+1) and not-ok to ok (-1)
+    *
+    * How:
+    * - one thread per event
+    * - all flags start at 0
+    * - add 1 to the flag when you are the event making it invalid: the sum before you was valid, with you it is not
+    * - add -1 to the flag when you are the event making the sum valid again: you are valid, then one before you was not
+    * - do a scan of the flags and search for when the count is 0, when it is zero they are valid states
+    * - essentially, the counter in the flags after the scan is the count of invalid partitions as of that move
+    * - pick the zero-flag highest-gain move
+    */
+
     const uint32_t part = ev_partition[tid];
     const uint32_t rank = ev_index[tid];
 
+    // dispose of invalid moves
+    if (part == UINT32_MAX) {
+        d_valid_moves[rank] = 1;
+        return;
+    }
+
     const int32_t base_size = static_cast<int32_t>(partitions_sizes[part]);
     const int32_t curr_size = base_size + static_cast<int32_t>(ev_delta[tid]);
+    const bool is_valid = curr_size <= max_nodes_per_part; // true iff after this event the partition's size is valid
 
-    // no atomics needed, assume initialized with 1s
-    if (curr_size > max_nodes_per_part)
-        d_valid_moves[rank] = false;
+    const uint32_t pred_part = tid > 0 ? ev_partition[tid - 1] : UINT32_MAX; // partition acted upon by the event before this one
+    const bool was_valid = pred_part != part || base_size + static_cast<int32_t>(ev_delta[tid - 1]) <= max_nodes_per_part; // true iff before this event the partition's size is valid
+
+    if (was_valid && !is_valid) // this event made the partition invalid -> track a +1 in invalid partitions as of this event
+        atomicAdd(&d_valid_moves[rank], 1);
+    if (!was_valid && is_valid) // this event made the partition invalid -> track a -1 in invalid partitions as of this event
+        atomicSub(&d_valid_moves[rank], 1);
 }

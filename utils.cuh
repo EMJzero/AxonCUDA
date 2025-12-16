@@ -345,6 +345,6 @@ __device__ __forceinline__ bool lm_hashmap_lookup(const hashmap_entry* table, co
 
 struct masked_value_functor {
     const float* value;
-    const bool* valid;
-    __host__ __device__ float operator()(uint32_t i) const { return valid[i] ? value[i] : -FLT_MAX; }
+    const uint32_t* valid;
+    __host__ __device__ float operator()(uint32_t i) const { return valid[i] == 0 ? value[i] : -FLT_MAX; }
 };

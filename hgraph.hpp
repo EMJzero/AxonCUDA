@@ -183,7 +183,7 @@ namespace hgraph {
         float totalWeight() const {
             float total = 0.0f;
             for (auto& he : hedges_)
-                total += he.weight()*he.length();
+                total += he.weight()*(he.length() - 1);
             return total;
         }
         // aliases for compatibility
