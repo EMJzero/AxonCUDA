@@ -163,7 +163,6 @@ void candidates_kernel(
     const uint32_t* __restrict__ neighbors_offsets,
     const uint32_t* __restrict__ touching,
     const uint32_t* __restrict__ touching_offsets,
-    const uint32_t* __restrict__ inbound_count,
     const float* __restrict__ hedge_weights,
     const uint32_t* __restrict__ nodes_sizes,
     const uint32_t num_hedges,
@@ -198,7 +197,6 @@ void candidates_kernel(
 
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
-    const uint32_t my_inbound_count = inbound_count[warp_id];
 
     const uint32_t my_size = nodes_sizes[warp_id];
 
@@ -212,27 +210,11 @@ void candidates_kernel(
     // handle HIST_SIZE neighbors at a time
     for (; my_neighbors < not_my_neighbors; my_neighbors += HIST_SIZE) {
         // load the first HIST_SIZE neighbors and setup per-thread local histograms
-        // TODO: see if letting only lane zero do this and then broadcast the histogram between threads is faster
         for (uint32_t nb = 0; nb < HIST_SIZE; nb++) {
             if (nb < neighbors_count) {
                 const uint32_t my_neighbor = my_neighbors[nb];
                 // skip incompatible neighbors due to size constraints
                 if (my_size + nodes_sizes[my_neighbor] > max_nodes_per_part) {
-                    neighbors_count--;
-                    my_neighbors++;
-                    nb--; // TODO: not the best idea ever to decrement this here, just for it to re-increment on the for...
-                    continue;
-                }
-                uint32_t new_inbound_count = my_inbound_count;
-                const uint32_t* neighbor_inbound = touching + touching_offsets[my_neighbor];
-                const uint32_t* not_neighbor_inbound = neighbor_inbound + inbound_count[my_neighbor];
-                // count additional inbound hyperedges
-                // NOTE: this is one costly loop...
-                // TODO: let each thread in the warp handle different inbound hedges of the neighbor, then reduce the count!
-                for (; neighbor_inbound < not_neighbor_inbound; neighbor_inbound++)
-                    new_inbound_count += binary_search(my_touching, my_inbound_count, *neighbor_inbound) == UINT32_MAX ? 1 : 0; // binary search only among the inbounds part of my_touching
-                // skip incompatible neighbors due to inbound constraints
-                if (new_inbound_count > max_inbound_per_part) {
                     neighbors_count--;
                     my_neighbors++;
                     nb--; // TODO: not the best idea ever to decrement this here, just for it to re-increment on the for...
@@ -780,13 +762,11 @@ __global__
 void apply_coarsening_touching_scatter(
     const uint32_t* __restrict__ touching,
     const uint32_t* __restrict__ touching_offsets,
-    const uint32_t* __restrict__ inbound_count,
     const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
     const uint32_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
     const uint32_t num_groups,
     const uint32_t* __restrict__ coarse_touching_offsets, // group id -> count of distinct touching hedges
-    uint32_t* __restrict__ coarse_touching,
-    uint32_t* __restrict__ coarse_inbound_count
+    uint32_t* __restrict__ coarse_touching
 ) {
     // STYLE: one group (new node) per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -800,8 +780,7 @@ void apply_coarsening_touching_scatter(
     const uint32_t coarse_touching_start_idx = coarse_touching_offsets[tid];
     const uint32_t coarse_touching_size = coarse_touching_offsets[tid + 1] - coarse_touching_offsets[tid];
     uint32_t *coarse_touching_start = coarse_touching + coarse_touching_start_idx;
-    uint32_t distinct = 0u;
-    uint32_t new_inbound_count = 0u;
+    uint32_t distinct = 0;
     // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
     uint32_t new_touching[MAX_DEDUPE_BUFFER_SIZE];
     lm_init(new_touching, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
@@ -810,31 +789,17 @@ void apply_coarsening_touching_scatter(
     for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
         const uint32_t node = *ungroup;
         const uint32_t* my_touching = touching + touching_offsets[node];
-        const uint32_t my_touching_count = touching_offsets[node + 1] - touching_offsets[node];
-        const uint32_t my_inbound_count = inbound_count[node];
-        for (uint32_t i = 0; i < my_touching_count; i++) {
-            const uint32_t hedge_idx = my_touching[i];
-            bool not_seen = lm_hashset_insert(new_touching, MAX_DEDUPE_BUFFER_SIZE, hedge_idx);
+        const uint32_t* not_my_touching = touching + touching_offsets[node + 1];
+        for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
+            const uint32_t actual_hedge_idx = *hedge_idx;
+            bool not_seen = lm_hashset_insert(new_touching, MAX_DEDUPE_BUFFER_SIZE, actual_hedge_idx);
             if (not_seen) {
                 assert(distinct < coarse_touching_size);
-                coarse_touching_start[distinct] = hedge_idx;
+                coarse_touching_start[distinct] = actual_hedge_idx;
                 distinct++;
-                if (i < my_inbound_count) new_inbound_count++;
             }
         }
     }
-
-    /*
-    * Important: here hedges that are both inbound and outbound are lost on one side, the outbound one specifically.
-    *            In other words, and hedge both entering and leaving a group will only be remembered as an inbound one,
-    *            this is because the deduplication is done for all touching at once, while the inbound count is incremented
-    *            only for the first occurrence, that is, the inbound one!
-    */
-
-    coarse_inbound_count[tid] = new_inbound_count;
-
-    // ensure touching hedges are always sorted
-    introsort(coarse_touching_start, distinct);
 }
 
 

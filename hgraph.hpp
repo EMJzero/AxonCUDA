@@ -180,6 +180,18 @@ namespace hgraph {
             return inbound_[n];
         }
 
+        // like outboundIds/inboundIds, these getters give you raw hedge ids w.r.t. the hedges array, also sorting them for each node
+        // => std::set always stores elements sorted by its comparator so this is easy!
+        const std::ranges::subrange<std::set<uint32_t>::const_iterator> outboundSortedIds(Node n) const {
+            if (n >= node_count_) throw std::runtime_error("Invalid node");
+            return {outbound_[n].begin(), outbound_[n].end()};
+        }
+        // |
+        const std::ranges::subrange<std::set<uint32_t>::const_iterator> inboundSortedIds(Node n) const {
+            if (n >= node_count_) throw std::runtime_error("Invalid node");
+            return {inbound_[n].begin(), inbound_[n].end()};
+        }
+
         float totalWeight() const {
             float total = 0.0f;
             for (auto& he : hedges_)

@@ -52,7 +52,6 @@ extern __global__ void candidates_kernel(
     const uint32_t* neighbor_offsets,
     const uint32_t* touching,
     const uint32_t* touching_offsets,
-    const uint32_t* inbound_count,
     const float* hedge_weights,
     const uint32_t* nodes_sizes,
     const uint32_t num_hedges,
@@ -125,13 +124,11 @@ extern __global__ void apply_coarsening_touching_count(
 extern __global__ void apply_coarsening_touching_scatter(
     const uint32_t* touching,
     const uint32_t* touching_offsets,
-    const uint32_t* inbound_count,
     const uint32_t* ungroups,
     const uint32_t* ungroups_offsets,
     const uint32_t num_groups,
     const uint32_t* coarse_touching_offsets,
-    uint32_t* coarse_touching,
-    uint32_t* coarse_inbound_count
+    uint32_t* coarse_touching
 );
 
 extern __global__ void apply_uncoarsening_partitions(
@@ -365,10 +362,9 @@ int main(int argc, char** argv) {
     // prepare touching sets
     for (uint32_t n = 0; n < hg.nodes(); ++n) {
         touching_hedges_offsets.push_back(touching_hedges.size());
-        // NOTE: must put in inbounds first!
-        for (uint32_t h : hg.inboundSortedIds(n))
+        for (uint32_t h : hg.outboundIds(n))
             touching_hedges.push_back(h);
-        for (uint32_t h : hg.outboundSortedIds(n))
+        for (uint32_t h : hg.inboundIds(n))
             touching_hedges.push_back(h);
     }
     touching_hedges_offsets.push_back(touching_hedges.size());
@@ -396,7 +392,7 @@ int main(int argc, char** argv) {
     // device pointers
     uint32_t *d_hedges_offsets = nullptr, *d_hedges = nullptr;
     uint32_t *d_neighbors = nullptr, *d_neighbors_offsets = nullptr;
-    uint32_t *d_touching = nullptr, *d_touching_offsets = nullptr, *d_inbound_count = nullptr;
+    uint32_t *d_touching = nullptr, *d_touching_offsets = nullptr;
     float *d_hedge_weights = nullptr;
     uint32_t *d_pairs = nullptr;
     float *d_f_scores = nullptr;
@@ -413,10 +409,9 @@ int main(int argc, char** argv) {
 
     // allocate device memory
     CUDA_CHECK(cudaMalloc(&d_hedges, hg.hedgesFlat().size() * sizeof(uint32_t))); // contigous hedges array
-    CUDA_CHECK(cudaMalloc(&d_hedges_offsets, (num_hedges + 1) * sizeof(uint32_t))); // hedges_offsets[hedge idx] -> hedge start idx in d_hedges
-    CUDA_CHECK(cudaMalloc(&d_touching, touching_hedges.size() * sizeof(uint32_t))); // contigous inbound+outbout sets array (first inbound, then outbound)
-    CUDA_CHECK(cudaMalloc(&d_touching_offsets, (num_nodes + 1) * sizeof(uint32_t))); // touching_offsets[node idx] -> touching set start idx in d_touching
-    CUDA_CHECK(cudaMalloc(&d_inbound_count, num_nodes * sizeof(uint32_t))); // inbound_count[node idx] -> how many hedge of touching[node idx] are inbound (inbound hedges are before inbound_count[node idx], then outbound)
+    CUDA_CHECK(cudaMalloc(&d_hedges_offsets, hedges_offsets.size() * sizeof(uint32_t))); // hedges_offsets[hedge idx] -> hedge start idx in d_hedges
+    CUDA_CHECK(cudaMalloc(&d_touching, touching_hedges.size() * sizeof(uint32_t))); // contigous inbound+outbout sets array
+    CUDA_CHECK(cudaMalloc(&d_touching_offsets, touching_hedges_offsets.size() * sizeof(uint32_t))); // touching_offsets[node idx] -> touching set start idx in d_touching
     CUDA_CHECK(cudaMalloc(&d_hedge_weights, num_hedges * sizeof(float))); // hedge_weights[hedge idx] -> weight
     CUDA_CHECK(cudaMalloc(&d_pairs, num_nodes * sizeof(uint32_t) * MAX_CANDIDATES)); // partitions[node idx] -> best neighbor
     CUDA_CHECK(cudaMalloc(&d_f_scores, num_nodes * sizeof(float))); // connection streght for each pair, used during refinement
@@ -426,18 +421,14 @@ int main(int argc, char** argv) {
 
     // copy to device
     CUDA_CHECK(cudaMemcpy(d_hedges, hg.hedgesFlat().data(), hg.hedgesFlat().size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_hedges_offsets, hedges_offsets.data(), (num_hedges + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_hedges_offsets, hedges_offsets.data(), hedges_offsets.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_touching, touching_hedges.data(), touching_hedges.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_touching_offsets, touching_hedges_offsets.data(), (num_nodes + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_touching_offsets, touching_hedges_offsets.data(), touching_hedges_offsets.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_hedge_weights, hedge_weights.data(), num_hedges * sizeof(float), cudaMemcpyHostToDevice));
 
     // initialize
     thrust::device_ptr<uint32_t> t_nodes_sizes(d_nodes_sizes);
     thrust::fill(t_nodes_sizes, t_nodes_sizes + num_nodes, 1u); // each initial node counts as 1 (NOTE: can be tuned to give some nodes more "space")
-    thrust::device_ptr<uint32_t> t_inbound_count(d_inbound_count);
-    thrust::device_ptr<uint32_t> t_touching_offsets(d_touching_offsets);
-    // each initial node has one outbound hyperedge -> init. inbound counts to the number of touching - 1
-    thrust::transform(t_touching_offsets + 1, t_touching_offsets + 1 + num_nodes, t_touching_offsets, t_inbound_count, [] __device__ (int next, int curr) { return next - curr - 1; });
     
     // copy constants to device
     CUDA_CHECK(cudaMemcpyToSymbol(max_nodes_per_part, &h_max_nodes_per_part, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
@@ -480,14 +471,13 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // returns the number of partitions and the pointer to the final partitions device buffer
-    std::function<std::tuple<uint32_t, uint32_t*>(const uint32_t, const uint32_t, uint32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*)> coarsen_refine_uncoarsen = [&](
+    std::function<std::tuple<uint32_t, uint32_t*>(const uint32_t, const uint32_t, uint32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*)> coarsen_refine_uncoarsen = [&](
         const uint32_t level_idx,
         const uint32_t curr_num_nodes,
         uint32_t* d_hedges,
         uint32_t* d_hedges_offsets,
         uint32_t* d_touching,
         uint32_t* d_touching_offsets,
-        uint32_t* d_inbound_count,
         uint32_t* d_nodes_sizes
     ) { // this is a lambda
         std::cout << "Coarsening level " << level_idx << ", remaining nodes=" << curr_num_nodes << "\n";
@@ -519,7 +509,7 @@ int main(int argc, char** argv) {
         * - d_pins_per_partitions
         * Buffers constructed anew before (and passed as args to) each level:
         * - d_hedges, d_hedges_offsets
-        * - d_touching, d_touching_offsets, d_inbound_count
+        * - d_touching, d_touching_offsets
         * - d_nodes_sizes / d_groups_sizes
         * Buffers (constructed by and) returned from each level:
         * - d_partitions
@@ -571,7 +561,6 @@ int main(int argc, char** argv) {
             d_neighbors_offsets,
             d_touching,
             d_touching_offsets,
-            d_inbound_count,
             d_hedge_weights,
             d_nodes_sizes,
             num_hedges,
@@ -875,10 +864,9 @@ int main(int argc, char** argv) {
         d_neighbors = d_coarse_neighbors;
         d_neighbors_offsets = d_coarse_neighbors_offsets;
 
-        uint32_t *d_coarse_touching = nullptr, *d_coarse_touching_offsets = nullptr, *d_coarse_inbound_count = nullptr;
+        uint32_t *d_coarse_touching = nullptr, *d_coarse_touching_offsets = nullptr;
         CUDA_CHECK(cudaMalloc(&d_coarse_touching_offsets, (1 + new_num_nodes) * sizeof(uint32_t))); // NOTE: the number nodes decreases!
         CUDA_CHECK(cudaMemset(d_coarse_touching_offsets, 0x00, (1 + new_num_nodes) * sizeof(uint32_t))); // remember to leave the first offset at 0
-        CUDA_CHECK(cudaMalloc(&d_coarse_inbound_count, new_num_nodes * sizeof(uint32_t)));
         // launch configuration - coarsening kernel (touching - count)
         threads_per_block = 128;
         num_threads_needed = num_hedges; // 1 thread per hedge
@@ -907,13 +895,11 @@ int main(int argc, char** argv) {
         apply_coarsening_touching_scatter<<<blocks, threads_per_block>>>(
             d_touching,
             d_touching_offsets,
-            d_inbound_count,
             d_ungroups,
             d_ungroups_offsets,
             new_num_nodes,
             d_coarse_touching_offsets,
-            d_coarse_touching,
-            d_coarse_inbound_count
+            d_coarse_touching
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -958,7 +944,6 @@ int main(int argc, char** argv) {
             d_coarse_hedges_offsets,
             d_coarse_touching,
             d_coarse_touching_offsets,
-            d_coarse_inbound_count,
             d_groups_sizes
         );
         // ======================================
@@ -994,7 +979,6 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaFree(d_coarse_hedges_offsets));
         CUDA_CHECK(cudaFree(d_coarse_touching));
         CUDA_CHECK(cudaFree(d_coarse_touching_offsets));
-        CUDA_CHECK(cudaFree(d_coarse_inbound_count));
         CUDA_CHECK(cudaFree(d_groups_sizes));
         CUDA_CHECK(cudaFree(d_coarse_partitions)); // allocated at the next inner level, freed here!
 
@@ -1250,7 +1234,6 @@ int main(int argc, char** argv) {
         d_hedges_offsets,
         d_touching,
         d_touching_offsets,
-        d_inbound_count,
         d_nodes_sizes
     );
 
@@ -1297,7 +1280,6 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_neighbors_offsets));
     CUDA_CHECK(cudaFree(d_touching));
     CUDA_CHECK(cudaFree(d_touching_offsets));
-    CUDA_CHECK(cudaFree(d_inbound_count));
     CUDA_CHECK(cudaFree(d_hedge_weights));
     CUDA_CHECK(cudaFree(d_pairs));
     CUDA_CHECK(cudaFree(d_f_scores));

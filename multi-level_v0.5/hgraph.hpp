@@ -145,8 +145,7 @@ namespace hgraph {
 
                 outbound_[src].insert(idx);
 
-                for (uint32_t i = 1; i < he.length(); i++) {
-                    uint32_t dst = hedges_flat_[he.offset() + i];
+                for (uint32_t dst : he.destinations()) {
                     if (dst >= nodes)
                         throw std::runtime_error("Invalid destination node");
 
@@ -180,6 +179,15 @@ namespace hgraph {
             if (n >= node_count_) throw std::runtime_error("Invalid node");
             return inbound_[n];
         }
+
+        float totalWeight() const {
+            float total = 0.0f;
+            for (auto& he : hedges_)
+                total += he.weight()*(he.length() - 1);
+            return total;
+        }
+        // aliases for compatibility
+        float totalSpikeFrequency() const { return totalWeight(); }
 
         HyperGraph getPartitionsHypergraph(const std::vector<uint32_t>& part, bool keep_self_cycles, bool squish_hyperedges) const {
             if (part.size() != node_count_)
@@ -288,6 +296,7 @@ namespace hgraph {
                     }
                 }
 
+                neigh.erase(n);
                 neighborhoods_.insert(neighborhoods_.end(), neigh.begin(), neigh.end());
                 write_pos += neigh.size();
             }

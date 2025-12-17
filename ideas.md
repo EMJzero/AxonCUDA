@@ -60,3 +60,37 @@ Important:
 Already do the constraints checks in isolation, propose only the best moves that already satisfy the constraints by themselves!
 
 Possible way to work with all the scans over the 3D data of partitions x moves x hedges (or nodes): store it compressed (sparse CSR) along one dimension, possible hedges! The issue is how to do the scans quickly…
+
+---
+
+Soluzione inbound constraints check per refinement:
+- traccia il numero di volte che ogni hedge è touching su ogni partition (costruiscilo una volta a fine coarsening e tienitelo aggiornato, come con i partition sizes)
+- tecnica degli eventi, genera per ogni move due eventi con le inbound hedge che rimuovi (count -1) e aggiungi (count +1) for every partition -> ogni evento contiene solo un vettore di delta dei counter per ogni hedge inbound alla partizione
+=> issue, tenere tutto il vettore richiederebbe tenere un int32 per hedge per evento!
+  => ogni evento tiene solo la lista della hedge i cui counter va ad alterare!
+  => tieni gli eventi compressi con la tecnica dei due passi! Prima esecuzione del kernel per calcolare lo spazio da allocare per gli eventi e scan per gli offset (degli eventi) a cui ogni thread scrive, secondo pass per scrivere il contenuto di ogni evento (hedge counters da incrementare/decrementare)
+  => per ogni evento salva giusto una volta il verso del counter come -1 o +1 per tutte le hedge listate (ogni evento avrà quindi <lista di hedge affette> <partizione i cui counter sono da updatare> <direzione>)
+- ora puoi usare, esattamente come per i size, un “event flags” kernel che confronta ogni stato as of un evento con il precedente e incrementa di 1 il contatore di partizioni invalide, finendo con una scan per trovare le mosse con 0 invalide
+=> prima del kernel sulle event flags, per avere il totale dei counter per partizione, sorta gli eventi per partizione, e scrivi una custom scan by key che dentro ogni partizione accumula, in ordine di move rank / score gli update per ogni hedge counter! Questo kernel scorre, dentro gli eventi di ogni partizioni, tutti i counter delle hedges, e fa una scan per ognuno in ordine di rank!
+- concludi con l’event flags kernel che conta le partizioni invalide e le isola facendo una scan
+
+Little issue: tenere traccia dei contatori (uno per hedge) per tutte le partition!
+Soluzione: tieni, per ogni partition, solo un counter per ogni hedge nel suo touching set, ed ogni volta che li aggiorni usa il doppio kernel, il primo per calcolare il size ed il secondo per ri-allocare tutti i contatori nuovi (che possono essere di più!) -> update out of place, invece che in place come per i sizes! Ma almeno risparmi spazio!
+
+Tech for the scans: one warp per partitions (handling the event for that partition), doing the scans on shots of 32? Better: one block per partition and CUB scan at the block level!
+
+—
+
+Summary:
+- build touching set per hedge at the coarsest level
+- build events per move with the +/-1 per hedge for the event’s partition
+- sort events by partition
+- scan inside each partition for each hedge (both existing and new ones, first a pass to create the slots for all the same hedges in all events, then the scans per hedge)
+- flag events kernel followed by a scan to count the number of invalid partitions as of every move 
+- re-build with the two-step kernel the touching set per hedge
+
+
+---
+
+Idea:
+As the hypergraph gets coarser, switch many kernels from one node/hedge per thread to one node/hedge per BLOCK, this way all the local memory buffers become shared memory buffers!

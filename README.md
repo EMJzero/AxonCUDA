@@ -29,3 +29,8 @@ For convenience, we discuss algorithmic complexity using the following variables
 - $e$ : number of hgraph hedges, $|E|$
 - $d$ : average cardinality of each hedge, $(\sum_{(s, D) \in E} 1 + |D|) / |E|$
 - $h$ : average connections per node, $(\sum_{v \in V} |\{(s, D) \in E | v = s \vee v \in D\}|) / |V| = e \cdot d / n$
+
+# Some Terminology
+
+- *in-isolation*: gain calculated for a move applied by itself
+- *in-sequence*: gain for a move calculated assuming all higher-gain moves already applied
