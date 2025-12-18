@@ -223,14 +223,14 @@ void candidates_kernel(
                     nb--; // TODO: not the best idea ever to decrement this here, just for it to re-increment on the for...
                     continue;
                 }
-                uint32_t new_inbound_count = my_inbound_count;
+                uint32_t new_inbound_count = 0u;
                 const uint32_t* neighbor_inbound = touching + touching_offsets[my_neighbor];
                 const uint32_t* not_neighbor_inbound = neighbor_inbound + inbound_count[my_neighbor];
                 // count additional inbound hyperedges
-                // NOTE: this is one costly loop...
-                // TODO: let each thread in the warp handle different inbound hedges of the neighbor, then reduce the count!
-                for (; neighbor_inbound < not_neighbor_inbound; neighbor_inbound++)
+                // NOTE: this is one costly loop...but at least it is spread over the warp!
+                for (neighbor_inbound += lane_id; neighbor_inbound < not_neighbor_inbound; neighbor_inbound += WARP_SIZE)
                     new_inbound_count += binary_search(my_touching, my_inbound_count, *neighbor_inbound) == UINT32_MAX ? 1 : 0; // binary search only among the inbounds part of my_touching
+                new_inbound_count = warpReduceSum<uint32_t>(new_inbound_count) + my_inbound_count;
                 // skip incompatible neighbors due to inbound constraints
                 if (new_inbound_count > max_inbound_per_part) {
                     neighbors_count--;
