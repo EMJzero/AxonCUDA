@@ -24,11 +24,14 @@ Tested with:
 
 An hypergraph (hgraph) is defined as $H_g = (V, E, w_e)$, where $V = \{0, 1, \dots N - 1\}$ is the set of vertices, or nodes, $E = \{(s, D) | s \in V, D \subseteq V\}$ is the set of hyperedges (hedges), each with a source $s$ and one or more destinations $D$ ($D = \emptyset$) is a degenerate, admissible case), and $w_e : E \rightarrow \mathbb{R}$ is the weight of each hedge.
 
+A partitioning of $H_g$ is defined as a function $\rho(V) \rightarrow P$, where $P$ is the set of partitions.
+
 For convenience, we discuss algorithmic complexity using the following variables w.r.t. a generic hgraph:
 - $n$ : number of hgraph nodes, $|V|$
 - $e$ : number of hgraph hedges, $|E|$
 - $d$ : average cardinality of each hedge, $(\sum_{(s, D) \in E} 1 + |D|) / |E|$
 - $h$ : average connections per node, $(\sum_{v \in V} |\{(s, D) \in E | v = s \vee v \in D\}|) / |V| = e \cdot d / n$
+- $p$ : number of achieved partitions, $|P|$
 
 # Some Terminology
 

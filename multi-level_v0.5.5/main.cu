@@ -147,16 +147,7 @@ extern __global__ void pins_per_partition_kernel(
     const uint32_t* partitions,
     const uint32_t num_hedges,
     const uint32_t num_partitions,
-    uint32_t* pins_per_partitions
-);
-
-extern __global__ void inbound_pins_per_partition_kernel(
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
-    const uint32_t* inbound_count,
-    const uint32_t* partitions,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
+    uint32_t* pins_per_partitions,
     uint32_t* inbound_pins_per_partitions,
     uint32_t* partitions_inbound_sizes
 );
@@ -1075,12 +1066,7 @@ int main(int argc, char** argv) {
         // while computing pins per partition also compute the distinct inbound counts per partition (number of pins with a count > 0)
         uint32_t *d_partitions_inbound_sizes = nullptr;
         CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, num_partitions * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemset(d_partitions_inbound_sizes, 0x00, num_partitions * sizeof(uint32_t)));
         
-        // TODO: if you are struggling for memory, store both pins per partition in a compact for
-        // TODO: compute both pins per partition (inbound only and not) via a highly optimized map+histogram pattern
-        //       => map from edges of nodes to hedges of partitions, then histogram for each hedge in // (by key)
-
         // launch configuration - pins per partition kernel
         // TODO: do we really need to recompute pins per partition, or can we update them in-place?
         // PITFALL: we don't know which node of a group was with which hedge...
@@ -1100,26 +1086,7 @@ int main(int argc, char** argv) {
             d_partitions,
             num_hedges,
             num_partitions,
-            d_pins_per_partitions
-        );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        // launch configuration - inbound pins per partition kernel
-        threads_per_block = 256;
-        num_threads_needed = curr_num_nodes; // 1 thread per node
-        blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-        bytes_per_thread = 0; //TODO
-        shared_bytes = threads_per_block * bytes_per_thread;
-        // launch - inbound pins per partition kernel
-        std::cout << "Running inbound pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        // NOTE: inbound-only version of the above used for constraints checks...
-        inbound_pins_per_partition_kernel<<<blocks, threads_per_block, shared_bytes>>>(
-            d_touching,
-            d_touching_offsets,
-            d_inbound_count,
-            d_partitions,
-            curr_num_nodes,
-            num_partitions,
+            d_pins_per_partitions,
             d_inbound_pins_per_partitions,
             d_partitions_inbound_sizes
         );
@@ -1313,18 +1280,17 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceSynchronize());
         // sort events by (partition, hedge, rank) [in lexicographical order for the tuple] and carry events_delta along
         // the resulting array will have events sorted by partition, and inside each partition sorted by hedge, and inside each hedge sorted by rank!
-        auto count_events_sort_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_inbound_count_events_partition, t_inbound_count_events_hedge, t_inbound_count_events_index));
+        auto count_events_sort_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_size_events_partition, t_inbound_count_events_hedge, t_size_events_index));
         auto count_events_sort_key_end = count_events_sort_key_begin + num_inbound_count_events;
         thrust::sort_by_key(count_events_sort_key_begin, count_events_sort_key_end, t_inbound_count_events_delta);
         // inclusive scan by key of the deltas, the key being (partition, hedge) -> we now have the total number of times each hedge appears in the inbound set as of each move (in order of rank)
-        auto count_events_scan_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_inbound_count_events_partition, t_inbound_count_events_hedge));
+        auto count_events_scan_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_size_events_partition, t_inbound_count_events_hedge));
         auto count_events_scan_key_end = count_events_scan_key_begin + num_inbound_count_events;
         thrust::inclusive_scan_by_key(count_events_scan_key_begin, count_events_scan_key_end, t_inbound_count_events_delta, t_inbound_count_events_delta);
         // new array of events, one event for each time the counter of an hedge in the inbound set (+ the overall inbounds per partition counter) goes from 0 to >0,
         // the event carrying a +1 to the inbound set size, one event for each time the counter of an hedge goes from >0 to 0 carrying a -1 to the inbound set size for that partition
         uint32_t *d_inbound_size_events_offsets = nullptr;
         CUDA_CHECK(cudaMalloc(&d_inbound_size_events_offsets, (num_inbound_count_events + 1) * sizeof(uint32_t))); // inbound_size_events_offsets[event idx] -> initially a flag of whether each event will produce an increase/decrese in inbound counts, after the scan it becomes the offset of each new event
-        CUDA_CHECK(cudaMemset(d_inbound_size_events_offsets, 0u, (num_inbound_count_events + 1) * sizeof(uint32_t)));
         // launch configuration - count inbound events kernel
         threads_per_block = 128;
         num_threads_needed = num_inbound_count_events; // 1 thread per hedge event
@@ -1347,7 +1313,7 @@ int main(int argc, char** argv) {
         thrust::device_ptr<uint32_t> t_inbound_size_events_offsets(d_inbound_size_events_offsets);
         thrust::inclusive_scan(t_inbound_size_events_offsets, t_inbound_size_events_offsets + num_inbound_count_events + 1, t_inbound_size_events_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
         uint32_t num_inbound_size_events = 0; // last value in the inclusive scan = full reduce = total number of touching hedges among all sets
-        CUDA_CHECK(cudaMemcpy(&num_inbound_size_events, d_inbound_size_events_offsets + num_inbound_count_events, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&num_inbound_size_events, d_inbound_size_events_offsets + curr_num_nodes, sizeof(uint32_t), cudaMemcpyDeviceToHost));
         uint32_t *d_inbound_size_events_partition = nullptr, *d_inbound_size_events_index = nullptr;
         int32_t *d_inbound_size_events_delta = nullptr;
         CUDA_CHECK(cudaMalloc(&d_inbound_size_events_partition, num_inbound_size_events * sizeof(uint32_t))); // inbound_size_events_partition[ev] -> partition affected by the event
@@ -1413,50 +1379,41 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaFree(d_inbound_size_events_index));
         CUDA_CHECK(cudaFree(d_inbound_size_events_delta));
         // compute, as of each event, the cumulative number of partitions that are invalid by summing the count of those made/unmade invalid at each event
-        thrust::inclusive_scan(t_inbound_valid_moves, t_inbound_valid_moves + curr_num_nodes, t_inbound_valid_moves);
+        thrust::inclusive_scan(d_inbound_valid_moves, d_inbound_valid_moves + curr_num_nodes, d_inbound_valid_moves);
         // ======================================
         // find the move in the sequence that yields both the highest gain and a valid state (when all moves before it are applied)
         // index space 0..curr_num_nodes - 1
         auto idx_begin = thrust::make_counting_iterator<uint32_t>(0);
         // functor masking invalid endpoints in the sequence => invalid moves get a -inf score
-        // NOTE: valid_moves => the move is valid when the counter is 0!
-        masked_value_functor masked_scores { thrust::raw_pointer_cast(t_scores), thrust::raw_pointer_cast(t_valid_moves), thrust::raw_pointer_cast(t_inbound_valid_moves) };
+        masked_value_functor masked_scores { thrust::raw_pointer_cast(t_scores), thrust::raw_pointer_cast(t_valid_moves), thrust::raw_pointer_cast(d_inbound_valid_moves) };
         auto masked_begin = thrust::make_transform_iterator(idx_begin, masked_scores);
         auto masked_end = masked_begin + curr_num_nodes;
         // max over valid endpoints only, find the point in the sequence of moves where applying them further never nets a higher gain in a valid state
         auto best_iterator_entry = thrust::max_element(masked_begin, masked_end);
         const uint32_t best_rank = static_cast<uint32_t>(best_iterator_entry - masked_begin);
         const uint32_t num_good_moves = best_rank + 1; // "+1" to make this the improving moves count, rather than the last improving move's idx
-        // validity double-check (if there were no valid moves...)
-        uint32_t size_validity, inbounds_validity;
-        CUDA_CHECK(cudaMemcpy(&size_validity, d_valid_moves + best_rank, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(&inbounds_validity, d_inbound_valid_moves + best_rank, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        if (size_validity == 0 && inbounds_validity == 0) {
-            // launch configuration - fm-ref apply kernel
-            threads_per_block = 128;
-            num_threads_needed = curr_num_nodes; // 1 thread per move to apply
-            blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-            // launch - fm-ref apply kernel
-            std::cout << "Running fm-ref apply (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            fm_refinement_apply_kernel<<<blocks, threads_per_block>>>(
-                d_touching,
-                d_touching_offsets,
-                d_pairs,
-                d_ranks,
-                d_nodes_sizes,
-                num_hedges,
-                curr_num_nodes,
-                num_partitions,
-                num_good_moves,
-                d_partitions,
-                d_partitions_sizes
-                //d_pins_per_partitions
-            );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
-        } else {
-            std::cout << "WARNING: no valid refinement move found on level " << level_idx << " !!\n";
-        }
+        // launch configuration - fm-ref apply kernel
+        threads_per_block = 128;
+        num_threads_needed = curr_num_nodes; // 1 thread per move to apply
+        blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+        // launch - fm-ref apply kernel
+        std::cout << "Running fm-ref apply (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        fm_refinement_apply_kernel<<<blocks, threads_per_block>>>(
+            d_touching,
+            d_touching_offsets,
+            d_pairs,
+            d_ranks,
+            d_nodes_sizes,
+            num_hedges,
+            curr_num_nodes,
+            num_partitions,
+            num_good_moves,
+            d_partitions,
+            d_partitions_sizes
+            //d_pins_per_partitions
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaFree(d_ranks));
         CUDA_CHECK(cudaFree(d_valid_moves));
         CUDA_CHECK(cudaFree(d_inbound_valid_moves));

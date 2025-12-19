@@ -180,26 +180,3 @@ Answer: yes, kinda! partition inbound counts is stored in a sparse form (with of
 => I can use pins-per-partition instead of computing inbound counters!
 => As extra, I just need to compute, while doing pins-per-partition, the distinct inbound count per partition
   -> can be done with a later count of the non-zero pin counters by key (= partition)!
-
----
-
-BUG FIXING:
-
-Questions:
-- is the new logic for ordering touching hedges correct with the subtraction at the index?
-- am I looking only at inbound hedges when creating events for each move?
-- so long as you are not in your neighbors, it should not be a problem to be both the source and destination of an hedge, check if neighbors are coarsened correctly when the source is also a destination (self-cycle)!
-- refinement should not care about seeing self-cycles in hedges, since it should skip the current node the hedges it visits anyway. Different story if there are duplicates in touching tho!
-=> touching must prioritize inbounds, and remove duplicates from outbounds!
-- check that inbound_counts is passed correctly as a recursive argument (check the arguments position!!)
-
-TODO:
-- must reshape the loops for the touching scatter! First handle (and dedupe) all inbounds of all nodes, then all outbounds!
-
-Final solution:
-- no funny business with hedges, continue deduplicating destinations wrt the source (everything as it was before)
-- create another kernel to build “inbound pins per partition” by iterating over node hedges (e*d) but touching (n*h, same cost), since in touching you will use the new logic (see above) to separate inbounds from the rest
-=> call it “inbound_pins_per_partition_kernel”!
-=> kernel: one thread per node!
-
-=> ultimate solution: track the separation between inbounds and outbounds in the “touching” sets only! Where you remove duplicates from “outbounds” first (the last survivor shall be an inbound)!

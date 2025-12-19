@@ -556,6 +556,8 @@ void apply_coarsening_hedges_count(
     * - for now we just do atomics towards global memory, because nodes are too many for shared memory, eventually:
     *   => use the shared memory hash-map to keep a "first-come-first-served" set of counters in shared memory,
     *     and reditect additional entries to global counters, then atomically increment global memory
+    *
+    * Must always preserve the source (and self-cycles)
     */
 
     const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
@@ -566,7 +568,7 @@ void apply_coarsening_hedges_count(
     // TODO: maybe "memset(pins, 0xFF, sizeof(pins))" is faster?
     lm_init(pins, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
 
-    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
+    for (const uint32_t* curr = hedge_start + 1; curr < hedge_end; curr++) { // +1, skip the source, that is always kept
         const uint32_t pin = groups[*curr]; // read and map pin to its new id
         bool not_seen = lm_hashset_insert(pins, MAX_DEDUPE_BUFFER_SIZE, pin);
         if (not_seen) {
@@ -575,7 +577,8 @@ void apply_coarsening_hedges_count(
     }
 
     // leave the first entry to be 0 (offset of the first hedge)
-    coarse_hedges_offsets[tid + 1] = distinct;
+    // +1 -> the source is always preserved
+    coarse_hedges_offsets[tid + 1] = distinct + 1;
 }
 
 // write the new distinct pins of hedges
@@ -607,7 +610,8 @@ void apply_coarsening_hedges_scatter(
     uint32_t pins[MAX_DEDUPE_BUFFER_SIZE];
     lm_init(pins, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
 
-    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
+    coarse_hedge_start[distinct++] = groups[*hedge_start]; // always keep the source
+    for (const uint32_t* curr = hedge_start + 1; curr < hedge_end; curr++) {
         const uint32_t pin = groups[*curr]; // read and map pin to its new id
         bool not_seen = lm_hashset_insert(pins, MAX_DEDUPE_BUFFER_SIZE, pin);
         if (not_seen) {
@@ -800,6 +804,40 @@ void apply_coarsening_touching_scatter(
     * - inbound hedges are sorted by id
     */
 
+    const uint32_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
+    const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
+    const uint32_t coarse_touching_start_idx = coarse_touching_offsets[tid];
+    const uint32_t coarse_touching_size = coarse_touching_offsets[tid + 1] - coarse_touching_offsets[tid];
+    uint32_t *coarse_touching_start = coarse_touching + coarse_touching_start_idx;
+    uint32_t new_inbound_count = 0u;
+    uint32_t new_outbound_count = 0u;
+    // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
+    uint32_t new_touching[MAX_DEDUPE_BUFFER_SIZE];
+    lm_init(new_touching, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+
+    // for every original node in the group, go over its touching set
+    for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
+        const uint32_t node = *ungroup;
+        const uint32_t* my_touching = touching + touching_offsets[node];
+        const uint32_t my_touching_count = touching_offsets[node + 1] - touching_offsets[node];
+        const uint32_t my_inbound_count = inbound_count[node];
+        for (uint32_t i = 0; i < my_touching_count; i++) {
+            const uint32_t hedge_idx = my_touching[i];
+            bool not_seen = lm_hashset_insert(new_touching, MAX_DEDUPE_BUFFER_SIZE, hedge_idx);
+            if (not_seen) {
+                assert(new_inbound_count + new_outbound_count < coarse_touching_size);
+                if (i < my_inbound_count) {
+                    coarse_touching_start[new_inbound_count] = hedge_idx; // inbound, store it at the start of the set
+                    new_inbound_count++;
+                } else {
+                    coarse_touching_start[coarse_touching_size - new_outbound_count - 1] = hedge_idx; // outbound, store it at the end of the set
+                    new_outbound_count++;
+                }
+
+            }
+        }
+    }
+
     /*
     * Important: here hedges that are both inbound and outbound are lost on one side, the outbound one specifically.
     *            In other words, and hedge both entering and leaving a group will only be remembered as an inbound one,
@@ -807,54 +845,12 @@ void apply_coarsening_touching_scatter(
     *            only for the first occurrence, that is, the inbound one!
     */
 
-    const uint32_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
-    const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
-    const uint32_t coarse_touching_start_idx = coarse_touching_offsets[tid];
-    const uint32_t coarse_touching_size = coarse_touching_offsets[tid + 1] - coarse_touching_offsets[tid];
-    uint32_t *coarse_touching_start = coarse_touching + coarse_touching_start_idx;
-    uint32_t distinct = 0u;
-    // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
-    uint32_t new_touching[MAX_DEDUPE_BUFFER_SIZE];
-    lm_init(new_touching, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-
-    // for every original node in the group, go over its inbound set
-    for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
-        const uint32_t node = *ungroup;
-        const uint32_t* my_inbound = touching + touching_offsets[node];
-        const uint32_t my_inbound_count = inbound_count[node];
-        for (uint32_t i = 0; i < my_inbound_count; i++) {
-            const uint32_t hedge_idx = my_inbound[i];
-            bool not_seen = lm_hashset_insert(new_touching, MAX_DEDUPE_BUFFER_SIZE, hedge_idx);
-            if (not_seen) {
-                assert(distinct < coarse_touching_size);
-                coarse_touching_start[distinct] = hedge_idx;
-                distinct++;
-            }
-        }
-    }
-    const uint32_t new_inbound_count = distinct;
-
-    // for every original node in the group, go over its outbound set
-    for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
-        const uint32_t node = *ungroup;
-        const uint32_t* my_outbound = touching + touching_offsets[node] + inbound_count[node];
-        const uint32_t my_outbound_count = touching_offsets[node + 1] - touching_offsets[node] - inbound_count[node];
-        for (uint32_t i = 0; i < my_outbound_count; i++) {
-            const uint32_t hedge_idx = my_outbound[i];
-            bool not_seen = lm_hashset_insert(new_touching, MAX_DEDUPE_BUFFER_SIZE, hedge_idx);
-            if (not_seen) {
-                assert(distinct < coarse_touching_size);
-                coarse_touching_start[distinct] = hedge_idx;
-                distinct++;
-            }
-        }
-    }
-
     coarse_inbound_count[tid] = new_inbound_count;
-    
+
     // ensure inbound hedges are always sorted
     introsort(coarse_touching_start, new_inbound_count);
 }
+
 
 // write to each node the partition of its group
 __global__
@@ -885,7 +881,9 @@ void pins_per_partition_kernel(
     const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
     const uint32_t num_hedges,
     const uint32_t num_partitions,
-    uint32_t* __restrict__ pins_per_partitions // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
+    uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
+    uint32_t* __restrict__ inbound_pins_per_partitions, // same as the above, except it does not count outbound pins
+    uint32_t* __restrict__ partitions_inbound_sizes // partitions_inbound_sizes[part] -> number of inbound_pins_per_partitions for 'part' that are not zero
 ) {
     // STYLE: one hedge per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -893,52 +891,23 @@ void pins_per_partition_kernel(
 
     /*
     * TODO Upgrade:
-    * - one hedge per warp -> go over the hedge in // in the warp
+    * - one hedge per warp
     * - shared memory histogram per hyperedge
+    *
+    * SAD NOTE: DAMN, THESE ATOMICS PILED UP QUICKLY, and surely hit DRAM quite hard...
     */
 
     const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
     uint32_t *my_pins_per_partitions = pins_per_partitions + tid * num_partitions;
+    uint32_t *my_inbound_pins_per_partitions = inbound_pins_per_partitions + tid * num_partitions;
 
-    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
+    atomicAdd(&my_pins_per_partitions[partitions[*hedge_start]], 1);
+    for (const uint32_t* curr = hedge_start + 1; curr < hedge_end; curr++) {
         const uint32_t part = partitions[*curr];
         atomicAdd(&my_pins_per_partitions[part], 1);
-    }
-}
-
-// for each node in each partition, count how many of times each hedge is seen in its inbound set
-// SEQUENTIAL COMPLEXITY: n*h
-// PARALLEL OVER: n
-__global__
-void inbound_pins_per_partition_kernel(
-    const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
-    const uint32_t* __restrict__ inbound_count,
-    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    uint32_t* __restrict__ inbound_pins_per_partitions, // inbound_pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of inbound pins of that partition owned by this hedge
-    uint32_t* __restrict__ partitions_inbound_sizes // partitions_inbound_sizes[part] -> number of inbound_pins_per_partitions for 'part' that are not zero
-) {
-    // STYLE: one node per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
-
-    /*
-    * TODO (VERY IMPORTANT) Upgrade:
-    * - one node per warp -> go over touching in // in the warp
-    * - shared memory histogram per partition
-    */
-
-    const uint32_t *my_inbound = touching + touching_offsets[tid];
-    const uint32_t *not_my_inbound = my_inbound + inbound_count[tid];
-    const uint32_t my_part = partitions[tid];
-
-    for (const uint32_t* curr = my_inbound; curr < not_my_inbound; curr++) {
-        const uint32_t hedge = *curr;
-        const uint32_t prev = atomicAdd(&inbound_pins_per_partitions[hedge * num_partitions + my_part], 1);
-        if (prev == 0) atomicAdd(&partitions_inbound_sizes[my_part], 1);
+        const uint32_t prev = atomicAdd(&my_inbound_pins_per_partitions[part], 1);
+        if (prev == 0) atomicAdd(&partitions_inbound_sizes[part], 1);
     }
 }
 
@@ -1171,10 +1140,10 @@ void fm_refinement_cascade_kernel(
         //score += my_hedge_weight*(my_move_part_counter + warpReduceSumLN0<uint32_t>(my_move_part_counter_delta));
         // Option 2: the gain is the sum the weights of hedges such that moving to a certain partition the hedge (same as HyperG)
         // gain the hedge's weight iff moving would disconnect the hedge from my partition (I am its last pin left there)
-        if (my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta) == 1)
+        if (my_curr_part_counter + warpReduceSumLN0<uint32_t>(my_curr_part_counter_delta) == 1)
             score += my_hedge_weight;
         // pay the hedge's weight iff moving there connects the hedge to the new partition (I would become its first pin there)
-        if (my_move_part_counter + warpReduceSumLN0<int32_t>(my_move_part_counter_delta) == 0)
+        if (my_move_part_counter + warpReduceSumLN0<uint32_t>(my_move_part_counter_delta) == 0)
             score -= my_hedge_weight;
     }
 
@@ -1303,10 +1272,10 @@ void flag_size_events_kernel(
 
     const int32_t base_size = static_cast<int32_t>(partitions_sizes[part]);
     const int32_t curr_size = base_size + static_cast<int32_t>(ev_delta[tid]);
-    const bool is_valid = curr_size <= static_cast<int32_t>(max_nodes_per_part); // true iff after this event the partition's size is valid
+    const bool is_valid = curr_size <= max_nodes_per_part; // true iff after this event the partition's size is valid
 
     const uint32_t pred_part = tid > 0 ? ev_partition[tid - 1] : UINT32_MAX; // partition acted upon by the event before this one
-    const bool was_valid = pred_part != part || base_size + static_cast<int32_t>(ev_delta[tid - 1]) <= static_cast<int32_t>(max_nodes_per_part); // true iff before this event the partition's size is valid
+    const bool was_valid = pred_part != part || base_size + static_cast<int32_t>(ev_delta[tid - 1]) <= max_nodes_per_part; // true iff before this event the partition's size is valid
 
     if (was_valid && !is_valid) // this event made the partition invalid -> track a +1 in invalid partitions as of this event
         atomicAdd(&valid_moves[rank], 1);
@@ -1315,8 +1284,6 @@ void flag_size_events_kernel(
 }
 
 // for every move, generate two events for every inbound hedge, one removing it front the src, one adding it back
-// SEQUENTIAL COMPLEXITY: n*h (h -> inbound only)
-// PARALLEL OVER: n
 __global__
 void build_hedge_events_kernel(
     const uint32_t* __restrict__ moves,
@@ -1343,10 +1310,10 @@ void build_hedge_events_kernel(
     *   move's, but we can easily filter those out later by identifying them from the UINT32_MAX ev_partition...
     */
 
-    uint32_t *my_ev_partition = ev_partition + 2 * touching_offsets[warp_id] + 2 * lane_id;
-    uint32_t *my_ev_index = ev_index + 2 * touching_offsets[warp_id] + 2 * lane_id;
-    uint32_t *my_ev_hedge = ev_hedge + 2 * touching_offsets[warp_id] + 2 * lane_id;
-    int32_t *my_ev_delta = ev_delta + 2 * touching_offsets[warp_id] + 2 * lane_id;
+    uint32_t *my_ev_partition = ev_partition + touching_offsets[warp_id] + 2 * lane_id;
+    uint32_t *my_ev_index = ev_index + touching_offsets[warp_id] + 2 * lane_id;
+    uint32_t *my_ev_hedge = ev_hedge + touching_offsets[warp_id] + 2 * lane_id;
+    int32_t *my_ev_delta = ev_delta + touching_offsets[warp_id] + 2 * lane_id;
 
     const uint32_t src_part = partitions[warp_id];
     const uint32_t dst_part = moves[warp_id];
@@ -1354,7 +1321,7 @@ void build_hedge_events_kernel(
 
     const uint32_t* inbound = touching + touching_offsets[warp_id];
     const uint32_t my_inbound_count = inbound_count[warp_id];
-    for (uint32_t i = lane_id; i < my_inbound_count; i += WARP_SIZE) {
+    for (uint32_t i = 0; i < my_inbound_count; i += WARP_SIZE) {
         if (i < my_inbound_count) {
             uint32_t hedge = inbound[i];
             // first event: hedge does not touches one less time the node's current partition
@@ -1385,7 +1352,7 @@ void count_inbound_size_events_kernel(
     const int32_t* __restrict__ ev_delta,
     uint32_t num_events,
     uint32_t num_partitions,
-    uint32_t* inbound_size_events_offsets // init. to zero
+    uint32_t* inbound_size_events_offsets
 ) {
     // STYLE: one event per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1394,7 +1361,10 @@ void count_inbound_size_events_kernel(
     const uint32_t part = ev_partition[tid];
 
     // dispose of invalid events
-    if (part == UINT32_MAX) return;
+    if (part == UINT32_MAX) {
+        inbound_size_events_offsets[tid + 1] = 0; // +1 to do an inclusive scan and keep the final count
+        return;
+    }
 
     const uint32_t hedge = ev_hedge[tid];
     const uint32_t init_hedge_inbound_count = partitions_inbound_counts[hedge*num_partitions + part];
@@ -1405,7 +1375,9 @@ void count_inbound_size_events_kernel(
     uint32_t curr_hedge_inbound_count = init_hedge_inbound_count + ev_delta[tid];
 
     if (prev_hedge_inbound_count == 0 && curr_hedge_inbound_count > 0 || prev_hedge_inbound_count > 0 && curr_hedge_inbound_count == 0)
-        inbound_size_events_offsets[tid + 1] = 1; // +1 to do an inclusive scan and keep the final count
+        inbound_size_events_offsets[tid + 1] = 1;
+    else
+        inbound_size_events_offsets[tid + 1] = 0;
 }
 
 // for every inbound hedge event that adds/removes an inbound hedge to a partition, create a new inbound size event
@@ -1488,10 +1460,10 @@ void flag_inbound_events_kernel(
 
     const int32_t base_size = static_cast<int32_t>(partitions_inbound_sizes[part]);
     const int32_t curr_size = base_size + ev_delta[tid];
-    const bool is_valid = curr_size <= static_cast<int32_t>(max_inbound_per_part); // true iff after this event the partition's inbound set size is valid
+    const bool is_valid = curr_size <= max_nodes_per_part; // true iff after this event the partition's size is valid
 
     const uint32_t pred_part = tid > 0 ? ev_partition[tid - 1] : UINT32_MAX; // partition acted upon by the event before this one
-    const bool was_valid = pred_part != part || base_size + ev_delta[tid - 1] <= static_cast<int32_t>(max_inbound_per_part); // true iff before this event the partition's inbound set size is valid
+    const bool was_valid = pred_part != part || base_size + ev_delta[tid - 1] <= max_inbound_per_part; // true iff before this event the partition's size is valid
 
     if (was_valid && !is_valid) // this event made the partition invalid -> track a +1 in invalid partitions as of this event
         atomicAdd(&valid_moves[rank], 1);
