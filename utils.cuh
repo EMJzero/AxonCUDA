@@ -10,16 +10,26 @@
 #define FIXED_POINT_SCALE 262144u // used to convert scores to fixed point
 
 // initialize shared memory: one consecutive chunk per warp
-__device__ __forceinline__ void sm_init(uint32_t* sm, const uint32_t size, const uint32_t val) {
+template <typename T>
+__device__ __forceinline__ void sm_init(T* sm, const uint32_t size, const T val) {
     const int warp_id = threadIdx.x / WARP_SIZE;
-    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int lane_id = threadIdx.x & (WARP_SIZE - 1);
     const int num_warps = blockDim.x / WARP_SIZE;
     for (int i = warp_id * WARP_SIZE + lane_id; i < size; i += num_warps * WARP_SIZE)
         sm[i] = val;
 }
 
+// initialize per-warp shared memory: for shared memory dedicated to a single warp
+template <typename T>
+__device__ __forceinline__ void wm_init(T* sm, const uint32_t size, const T val) {
+    const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    for (int i = lane_id; i < size; i += WARP_SIZE)
+        sm[i] = val;
+}
+
 // initialize local memory
-__device__ __forceinline__ void lm_init(uint32_t* lm, const uint32_t size, const uint32_t val) {
+template <typename T>
+__device__ __forceinline__ void lm_init(T* lm, const uint32_t size, const T val) {
     for (int i = 0; i < size; i++)
         lm[i] = val;
 }
@@ -44,7 +54,6 @@ __forceinline__ __device__ T warpReduceSumLN0(T val) {
     return val;
 }
 
-
 // USED BY: neighborhoods kernel
 
 #define SM_MAX_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
@@ -52,12 +61,12 @@ __forceinline__ __device__ T warpReduceSumLN0(T val) {
 
 // USED BY: candidates kernel
 
-#define HIST_SIZE 64u // must be a multiple of WARP_SIZE (for the histogram max reduction)
+#define HIST_SIZE 512u // must be a multiple of WARP_SIZE (for the histogram max reduction)
 #define MAX_CANDIDATES 4u // => how many candidates are proposed for a node (ranked by score)
 
 #define DETERMINISTIC_SCORE_NOISE 64u // => adds a +[0, DETERMINISTIC_SCORE_NOISE - 1]/FIXED_POINT_SCALE symmetric noise while calculating pairing scores; set to 0 to disable; keep it a power of 2 otherwise
 
-typedef struct {
+typedef struct __align__(8) {
     uint32_t node;
     uint32_t score;
 } bin;
@@ -85,7 +94,7 @@ __device__ __forceinline__ uint32_t deterministic_noise(uint32_t a, uint32_t b) 
     x ^= x >> 13;
     x *= 0x9E3779B1u;
     x ^= x >> 16;
-    return x % DETERMINISTIC_SCORE_NOISE;
+    return x & (DETERMINISTIC_SCORE_NOISE - 1);
 }
 
 // USED BY: grouping kernel
@@ -468,13 +477,47 @@ __device__ __forceinline__ void introsort(uint32_t* a, int n) {
     }
 }
 
+// bitonic sort within a single warp over a portion of shared memory
+// IMPORTANT: 'N' must be a multiple of 'WARP_SIZE' !!
+template <typename T, uint32_t N>
+__device__ __forceinline__ void wm_bitonic_sort(T* sm) {
+    static_assert(N % WARP_SIZE == 0);
+    constexpr uint32_t STRIDE = WARP_SIZE;
+    constexpr uint32_t BLOCKS = N / WARP_SIZE;
+    const uint32_t lane = threadIdx.x & (WARP_SIZE - 1);
+    #pragma unroll
+    for (uint32_t k = 2; k <= N; k <<= 1) {
+        #pragma unroll
+        for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+            #pragma unroll
+            for (uint32_t b = 0; b < BLOCKS; ++b) {
+                uint32_t i = lane + b * STRIDE;
+                uint32_t ixj = i ^ j;
+                if (ixj > i) {
+                    bool ascending = ((i & k) == 0);
+                    T a = sm[i];
+                    T bval = sm[ixj];
+                    if ((a > bval) == ascending) {
+                        sm[i] = bval;
+                        sm[ixj] = a;
+                    }
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+
+
 // binary search, returns the index of 'value' in 'a' or UINT32_MAX if it is not found
-__device__ __forceinline__ uint32_t binary_search(const uint32_t* a, int n, uint32_t value) {
+template <typename T>
+__device__ __forceinline__ uint32_t binary_search(const T* a, uint32_t n, T value) {
     int lo = 0;
     int hi = n - 1;
     while (lo <= hi) {
         int mid = (lo + hi) >> 1;
-        uint32_t v = a[mid];
+        T v = a[mid];
         if (v < value)
             lo = mid + 1;
         else if (v > value)

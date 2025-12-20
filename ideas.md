@@ -216,3 +216,30 @@ Wait, but for how they are constructed, the src of hedges isn’t always the sam
 - the issue is then how to compute the inbound set sizes when src and dsts mix, and the best option if either a count-reduce per partition over pins per partition (issue: strides accesses unless they are done histogram vector by vector)
 
 Maybe it would be faster to build pins per partition with touching, by going one block per partition, 256 threads digesting touching hedge with an hash-map in shared memory, then dumped to global with one streak of atomics?
+
+---
+
+Optimizing the candidates kernel...
+
+IDEA:
+- every lane picks up HIST_SIZE/WARP_SIZE neighbors and filles HIST_SIZE/WARP_SIZE
+- reduce to count valid neighbors (or no? Just leave blanks there?)
+- warp shuffles to make all histograms identical
+=> or maybe keep using the warps like now, for neighbor inbounds?
+
+Plan:
+- shared memory bin ids (to then sort)
+- local score accumulators only (one per bin)
+
+- each thread in a warp reads a neighbor (coalesced accesses) (use an if to see if lane_id exceeds neighbors count, then don't read)
+- then, in a loop, one thread at a time (up to the number that did the read = remaining number of neighbors):
+  - checks the neighbor's validity, if not valid, continue
+  - if valid, broadcasts the neighbor with a shuffle to other threads in the warp
+  - threads proceed to check the validity w.r.t. the inbound set intersection in parallel
+  - if valid, the original owner writes the entry to the histogram and decrements the remaining bins count
+
+- sort shared memory id bins
+- init local score bins to 0
+
+- lane 0 reads hedge offset and weight, broadcasting it with a shuffle
+- binary search for the histogram bin

@@ -153,11 +153,10 @@ extern __global__ void pins_per_partition_kernel(
 );
 
 extern __global__ void inbound_pins_per_partition_kernel(
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
-    const uint32_t* inbound_count,
+    const uint32_t* hedges,
+    const uint32_t* hedges_offsets,
     const uint32_t* partitions,
-    const uint32_t num_nodes,
+    const uint32_t num_hedges,
     const uint32_t num_partitions,
     uint32_t* inbound_pins_per_partitions,
     uint32_t* partitions_inbound_sizes
@@ -634,7 +633,7 @@ int main(int argc, char** argv) {
         num_warps_needed = curr_num_nodes ; // 1 warp per node
         blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
         // compute shared memory per block (bytes)
-        bytes_per_warp = 0; //TODO
+        bytes_per_warp = 2 * HIST_SIZE * sizeof(uint32_t);
         shared_bytes = warps_per_block * bytes_per_warp;
         // launch - candidates kernel
         std::cout << "Running candidates kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
@@ -1260,19 +1259,16 @@ int main(int argc, char** argv) {
         // simultaneously, also correct the calculation for partitions_inbound_sizes by removing outbounds
         // launch configuration - inbound pins per partition kernel
         threads_per_block = 256;
-        num_threads_needed = curr_num_nodes; // 1 thread per node
+        num_threads_needed = num_hedges; // 1 thread per hedge
         blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-        bytes_per_thread = 0; //TODO
-        shared_bytes = threads_per_block * bytes_per_thread;
         // launch - inbound pins per partition kernel
         std::cout << "Running inbound pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         // NOTE: inbound-only version of the above used for constraints checks...
-        inbound_pins_per_partition_kernel<<<blocks, threads_per_block, shared_bytes>>>(
-            d_touching,
-            d_touching_offsets,
-            d_inbound_count,
+        inbound_pins_per_partition_kernel<<<blocks, threads_per_block>>>(
+            d_hedges,
+            d_hedges_offsets,
             d_partitions,
-            curr_num_nodes,
+            num_hedges,
             num_partitions,
             d_pins_per_partitions, // from now it represents inbound sets only
             d_partitions_inbound_sizes
