@@ -203,3 +203,16 @@ Final solution:
 => kernel: one thread per node!
 
 => ultimate solution: track the separation between inbounds and outbounds in the “touching” sets only! Where you remove duplicates from “outbounds” first (the last survivor shall be an inbound)!
+
+TODO:
+- allocate once and for all pins per partition
+- compute pins per partition once per level
+- transform pins per partition, after refinement, by have one thread per node go fetch the node’s outbound set and substract it from the counters
+
+Wait, but for how they are constructed, the src of hedges isn’t always the same anyway? Even if without self-cycles?
+=> if so:
+- verify it by moving to the host the hedges at every round and checking that srcs correspond
+- write the kernel that updates counters just as a map, one thread per hedge, fetched the src and goes decrement its counter in pins per hedge
+- the issue is then how to compute the inbound set sizes when src and dsts mix, and the best option if either a count-reduce per partition over pins per partition (issue: strides accesses unless they are done histogram vector by vector)
+
+Maybe it would be faster to build pins per partition with touching, by going one block per partition, 256 threads digesting touching hedge with an hash-map in shared memory, then dumped to global with one streak of atomics?

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <filesystem>
 
 #include </home/mronzani/cuda/include/cuda_runtime.h>
 
@@ -147,7 +148,8 @@ extern __global__ void pins_per_partition_kernel(
     const uint32_t* partitions,
     const uint32_t num_hedges,
     const uint32_t num_partitions,
-    uint32_t* pins_per_partitions
+    uint32_t* pins_per_partitions,
+    uint32_t* partitions_inbound_sizes
 );
 
 extern __global__ void inbound_pins_per_partition_kernel(
@@ -332,6 +334,9 @@ int main(int argc, char** argv) {
 
     if (!load_path.empty()) {
         try {
+            std::cout << "Loading hypergraph from: " << load_path << " ...\n";
+            if (!std::filesystem::is_regular_file(load_path)) throw std::runtime_error("The provided path is not a file.");
+            std::cout << "Hypergraph file size: " << (std::filesystem::file_size(load_path) >> 20) << " MB\n";
             hg = HyperGraph::load(load_path);
             loaded = true;
         } catch (const std::exception& e) {
@@ -345,6 +350,8 @@ int main(int argc, char** argv) {
         std::cout << "  Hyperedges:  " << hg.hedges().size() << "\n";
         std::cout << "  Total pins:  " << hg.hedgesFlat().size() << "\n";
         std::cout << "  Total Spike Frequency: " << std::fixed << std::setprecision(3) << hg.totalSpikeFrequency() << "\n";
+    } else {
+        std::cout << "WARNING, no hypergraph provided (-r), performing a dry-run !!\n";
     }
 
     // setup the hardware model
@@ -463,6 +470,8 @@ int main(int argc, char** argv) {
     slot *d_slots = nullptr;
     uint32_t *d_nodes_sizes = nullptr;
     uint32_t *d_partitions_sizes = nullptr;
+    uint32_t *d_pins_per_partitions = nullptr;
+    uint32_t *d_partitions_inbound_sizes = nullptr;
 
     // kernel dimensions
     int blocks, threads_per_block, warps_per_block;
@@ -578,8 +587,6 @@ int main(int argc, char** argv) {
         * Buffers allocated on (and local to) each level:
         * - d_groups
         * - d_ungroups, d_ungroups_offsets
-        * - d_pins_per_partitions, d_inbound_pins_per_partitions
-        * - d_partitions_inbound_sizes
         * - all event buffers for constraint checks
         * Buffers constructed anew before (and passed as args to) each level:
         * - d_hedges, d_hedges_offsets
@@ -594,6 +601,8 @@ int main(int argc, char** argv) {
         * - d_ranks
         * - d_neighbors, d_neighbors_offsets
         * - d_partitions_sizes
+        * - d_pins_per_partitions
+        * - d_partitions_inbound_sizes
         * Untouched buffers:
         * - d_hedge_weights
         *
@@ -783,6 +792,8 @@ int main(int argc, char** argv) {
             d_partitions_sizes = d_groups_sizes; // partitions_sizes[idx] -> how many nodes (by size) are in the partition
 
             // NOTE: the inbound counters per partition are just the transposed of pins per partition! No need to compute them separately!
+            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, num_hedges * new_num_nodes * sizeof(uint32_t))); // hedge * num_partitions + partition -> count of pins of "hedge" in that "partition"
+            CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, new_num_nodes * sizeof(uint32_t))); // partition -> distinct inbound hedges count for "partition"
 
             // base case, reached the target number of partitions
             if (new_num_nodes <= max_parts) {
@@ -1066,15 +1077,8 @@ int main(int argc, char** argv) {
         std::cout << "Refining level " << level_idx << ", remaining nodes=" << curr_num_nodes << "number of partitions=" << num_partitions << "\n";
 
         // prepare this level's pins per partition
-        // TODO: can't we spare somehow the extra memory and store both as one?
-        uint32_t *d_pins_per_partitions = nullptr, *d_inbound_pins_per_partitions = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, num_hedges * num_partitions * sizeof(uint32_t))); // hedge * num_partitions + partition -> count of pins of "hedge" in that "partition"
         CUDA_CHECK(cudaMemset(d_pins_per_partitions, 0x00, num_hedges * num_partitions * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&d_inbound_pins_per_partitions, num_hedges * num_partitions * sizeof(uint32_t))); // hedge * num_partitions + partition -> count of inbound pins of "hedge" in that "partition"
-        CUDA_CHECK(cudaMemset(d_inbound_pins_per_partitions, 0x00, num_hedges * num_partitions * sizeof(uint32_t)));
         // while computing pins per partition also compute the distinct inbound counts per partition (number of pins with a count > 0)
-        uint32_t *d_partitions_inbound_sizes = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, num_partitions * sizeof(uint32_t)));
         CUDA_CHECK(cudaMemset(d_partitions_inbound_sizes, 0x00, num_partitions * sizeof(uint32_t)));
         
         // TODO: if you are struggling for memory, store both pins per partition in a compact for
@@ -1082,10 +1086,11 @@ int main(int argc, char** argv) {
         //       => map from edges of nodes to hedges of partitions, then histogram for each hedge in // (by key)
 
         // launch configuration - pins per partition kernel
-        // TODO: do we really need to recompute pins per partition, or can we update them in-place?
-        // PITFALL: we don't know which node of a group was with which hedge...
-        // SOLUTION: we could update pins-per-partition as we uncoarsen hedges in-place, if we do that with (multi)function bits!
+        // TODO: could update this in-place instead of recomputing it each time by going over 'touching' for moved nodes when applying the refinement!
+        // HARDER: if we change pins per partition to represent only destination (inbound) pins after we computed gains, also need to revert it to represent all pins...
         // => If we do this, uncomment "pins_per_partitions" in "fm_refinement_apply_kernel"
+        // TODO: maybe it would be faster to build pins per partition with 'touching', by going one block per partition, 256 threads digesting touching hedge with
+        //       an hash-map in shared memory, then dumped to global with one streak of atomics?
         threads_per_block = 256;
         num_threads_needed = num_hedges; // 1 thread per hedge
         blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
@@ -1100,28 +1105,8 @@ int main(int argc, char** argv) {
             d_partitions,
             num_hedges,
             num_partitions,
-            d_pins_per_partitions
-        );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        // launch configuration - inbound pins per partition kernel
-        threads_per_block = 256;
-        num_threads_needed = curr_num_nodes; // 1 thread per node
-        blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-        bytes_per_thread = 0; //TODO
-        shared_bytes = threads_per_block * bytes_per_thread;
-        // launch - inbound pins per partition kernel
-        std::cout << "Running inbound pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        // NOTE: inbound-only version of the above used for constraints checks...
-        inbound_pins_per_partition_kernel<<<blocks, threads_per_block, shared_bytes>>>(
-            d_touching,
-            d_touching_offsets,
-            d_inbound_count,
-            d_partitions,
-            curr_num_nodes,
-            num_partitions,
-            d_inbound_pins_per_partitions,
-            d_partitions_inbound_sizes
+            d_pins_per_partitions,
+            d_partitions_inbound_sizes // as of here, this will be incorrect (also including outbounds)
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -1271,6 +1256,29 @@ int main(int argc, char** argv) {
         // compute, as of each event, the cumulative number of partitions that are invalid by summing the count of those made/unmade invalid at each event
         thrust::inclusive_scan(t_valid_moves, t_valid_moves + curr_num_nodes, t_valid_moves);
         // ======================================
+        // preparatory step: update pins per partition into inbound (only) pins partition
+        // simultaneously, also correct the calculation for partitions_inbound_sizes by removing outbounds
+        // launch configuration - inbound pins per partition kernel
+        threads_per_block = 256;
+        num_threads_needed = curr_num_nodes; // 1 thread per node
+        blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+        bytes_per_thread = 0; //TODO
+        shared_bytes = threads_per_block * bytes_per_thread;
+        // launch - inbound pins per partition kernel
+        std::cout << "Running inbound pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        // NOTE: inbound-only version of the above used for constraints checks...
+        inbound_pins_per_partition_kernel<<<blocks, threads_per_block, shared_bytes>>>(
+            d_touching,
+            d_touching_offsets,
+            d_inbound_count,
+            d_partitions,
+            curr_num_nodes,
+            num_partitions,
+            d_pins_per_partitions, // from now it represents inbound sets only
+            d_partitions_inbound_sizes
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
         // ======================================
         // extra step: compute moves validity by inbound set cardinality (same HP as the kernel above: all previous higher-gain moves will be applied)
         // explode each move into two events for every inbound hedge of the moved node, one decrementing and one incrementing the hedge's
@@ -1332,7 +1340,7 @@ int main(int argc, char** argv) {
         // launch - count inbound events kernel
         std::cout << "Running count inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         count_inbound_size_events_kernel<<<blocks, threads_per_block>>>(
-            d_inbound_pins_per_partitions,
+            d_pins_per_partitions,
             d_inbound_count_events_partition,
             d_inbound_count_events_index,
             d_inbound_count_events_hedge,
@@ -1363,7 +1371,7 @@ int main(int argc, char** argv) {
         // launch - build inbound events kernel
         std::cout << "Running build inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         build_inbound_size_events_kernel<<<blocks, threads_per_block>>>(
-            d_inbound_pins_per_partitions,
+            d_pins_per_partitions,
             d_inbound_count_events_partition,
             d_inbound_count_events_index,
             d_inbound_count_events_hedge,
@@ -1460,9 +1468,6 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaFree(d_ranks));
         CUDA_CHECK(cudaFree(d_valid_moves));
         CUDA_CHECK(cudaFree(d_inbound_valid_moves));
-        CUDA_CHECK(cudaFree(d_pins_per_partitions));
-        CUDA_CHECK(cudaFree(d_inbound_pins_per_partitions));
-        CUDA_CHECK(cudaFree(d_partitions_inbound_sizes));
         
         return std::make_tuple(num_partitions, d_partitions);
     };
@@ -1532,6 +1537,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_nodes_sizes));
     CUDA_CHECK(cudaFree(d_partitions));
     CUDA_CHECK(cudaFree(d_partitions_sizes));
+    CUDA_CHECK(cudaFree(d_pins_per_partitions));
+    CUDA_CHECK(cudaFree(d_partitions_inbound_sizes));
 
     // final sync
     CUDA_CHECK(cudaGetLastError());

@@ -553,9 +553,8 @@ void apply_coarsening_hedges_count(
     *
     * TODO, upgrade options:
     * - instead of three kernels to count distinct nodes, scan offsets, and scatter distinct nodes, can't we do all in one?
-    * - for now we just do atomics towards global memory, because nodes are too many for shared memory, eventually:
-    *   => use the shared memory hash-map to keep a "first-come-first-served" set of counters in shared memory,
-    *     and reditect additional entries to global counters, then atomically increment global memory
+    * - one hedge per warp or block, use the shared memory hash-map to keep a "first-come-first-served" set of counters in shared memory,
+    *   and reditect additional entries to atomically incremented global counters (issue: musre ensure the src is preserved!!)
     */
 
     const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
@@ -594,8 +593,13 @@ void apply_coarsening_hedges_scatter(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_hedges) return;
 
-    // Idea: second part of "apply_coarsening_hedges_count" -> scatter
-    // NOTE: must ensure the source remains the first node in each coarse hedge
+    /* Idea: second part of "apply_coarsening_hedges_count" -> scatter
+    * NOTE: must ensure the source remains the first node in each coarse hedge
+    *
+    * Important: this currently deletes self-cycles -> between src and dst, it keeps the SRC when deduplicating!
+    * => therefore, this is the opposite of coarsening 'touching', where 'touching' preserves the inbound set and
+    *    deduplicates the outbound, hedges preserve the notion of outbound! The two are complementary!
+    */
 
     const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
@@ -607,7 +611,7 @@ void apply_coarsening_hedges_scatter(
     uint32_t pins[MAX_DEDUPE_BUFFER_SIZE];
     lm_init(pins, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
 
-    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
+    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) { // first pin is the src, always preserved
         const uint32_t pin = groups[*curr]; // read and map pin to its new id
         bool not_seen = lm_hashset_insert(pins, MAX_DEDUPE_BUFFER_SIZE, pin);
         if (not_seen) {
@@ -885,16 +889,24 @@ void pins_per_partition_kernel(
     const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
     const uint32_t num_hedges,
     const uint32_t num_partitions,
-    uint32_t* __restrict__ pins_per_partitions // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
+    uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
+    uint32_t* __restrict__ partitions_inbound_sizes // partitions_inbound_sizes[part] -> number of inbound_pins_per_partitions for 'part' that are not zero => will be incorrect as of here (also including outbounds)
 ) {
     // STYLE: one hedge per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_hedges) return;
 
     /*
-    * TODO Upgrade:
+    * TODO upgrade:
     * - one hedge per warp -> go over the hedge in // in the warp
     * - shared memory histogram per hyperedge
+    */
+
+    /*
+    * TODO alternative upgrade:
+    * - one node per warp -> go over touching in // in the warp
+    * - shared memory histogram per partition
+    * => take the code from 'inbound_pins_per_partition_kernel' as of commit 'f803463'
     */
 
     const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
@@ -903,12 +915,13 @@ void pins_per_partition_kernel(
 
     for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
         const uint32_t part = partitions[*curr];
-        atomicAdd(&my_pins_per_partitions[part], 1);
+        const uint32_t prev = atomicAdd(&my_pins_per_partitions[part], 1);
+        if (prev == 0) atomicAdd(&partitions_inbound_sizes[part], 1);
     }
 }
 
-// for each node in each partition, count how many of times each hedge is seen in its inbound set
-// SEQUENTIAL COMPLEXITY: n*h
+// for each node in each partition, count how many of times each hedge is seen in its inbound set (actually, the count is already there, just get rid of outbounds!)
+// SEQUENTIAL COMPLEXITY: n*h (h -> outbound only)
 // PARALLEL OVER: n
 __global__
 void inbound_pins_per_partition_kernel(
@@ -925,20 +938,14 @@ void inbound_pins_per_partition_kernel(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_nodes) return;
 
-    /*
-    * TODO (VERY IMPORTANT) Upgrade:
-    * - one node per warp -> go over touching in // in the warp
-    * - shared memory histogram per partition
-    */
-
-    const uint32_t *my_inbound = touching + touching_offsets[tid];
-    const uint32_t *not_my_inbound = my_inbound + inbound_count[tid];
+    const uint32_t *my_outbound = touching + touching_offsets[tid] + inbound_count[tid];
+    const uint32_t *not_my_outbound = touching + touching_offsets[tid + 1];
     const uint32_t my_part = partitions[tid];
 
-    for (const uint32_t* curr = my_inbound; curr < not_my_inbound; curr++) {
+    for (const uint32_t* curr = my_outbound; curr < not_my_outbound; curr++) {
         const uint32_t hedge = *curr;
-        const uint32_t prev = atomicAdd(&inbound_pins_per_partitions[hedge * num_partitions + my_part], 1);
-        if (prev == 0) atomicAdd(&partitions_inbound_sizes[my_part], 1);
+        const uint32_t prev = atomicSub(&inbound_pins_per_partitions[hedge * num_partitions + my_part], 1);
+        if (prev == 1) atomicSub(&partitions_inbound_sizes[my_part], 1);
     }
 }
 
