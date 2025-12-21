@@ -67,7 +67,6 @@ extern __global__ void grouping_kernel(
     const uint32_t* scores,
     const uint32_t* nodes_sizes,
     const uint32_t num_nodes,
-    const uint32_t num_repeats,
     slot* group_slots,
     uint32_t* groups
 );
@@ -634,7 +633,7 @@ int main(int argc, char** argv) {
         num_warps_needed = curr_num_nodes ; // 1 warp per node
         blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
         // compute shared memory per block (bytes)
-        bytes_per_warp = 2 * HIST_SIZE * sizeof(uint32_t);
+        bytes_per_warp = (HIST_SIZE + HIST_SPARE_SIZE) * sizeof(hashmap_entry);
         shared_bytes = warps_per_block * bytes_per_warp;
         // launch - candidates kernel
         std::cout << "Running candidates kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
@@ -711,15 +710,9 @@ int main(int argc, char** argv) {
         blocks_per_SM = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_SM, grouping_kernel, threads_per_block, shared_bytes);
         max_blocks = blocks_per_SM * props.multiProcessorCount;
-        uint32_t num_repeats = 1;
         if (blocks > max_blocks) {
-            num_repeats = (blocks + max_blocks - 1) / max_blocks;
-            std::cout << "NOTE: grouping kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
-            blocks = (blocks + num_repeats - 1) / num_repeats;
-            if (num_repeats > MAX_REPEATS) {
-                std::cout << "ABORTING: grouping kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_REPEATS << " !!\n";
-                abort();
-            }
+            std::cout << "ABORTING: grouping kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << " !\n";
+            abort();
         }
         // launch - grouping kernel
         std::cout << "Running grouping kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
@@ -728,7 +721,6 @@ int main(int argc, char** argv) {
             (void*)&d_u_scores,
             (void*)&d_nodes_sizes,
             (void*)&curr_num_nodes,
-            (void*)&num_repeats,
             (void*)&d_slots,
             (void*)&d_groups
         };
@@ -736,6 +728,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
+        
         // order groups kernel (parallel label compression)
         // TODO: custom kernel for this?
         // as of now "d_groups" contains the new non-zero-based group id for every node

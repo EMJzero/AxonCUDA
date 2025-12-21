@@ -63,6 +63,7 @@ __forceinline__ __device__ T warpReduceSumLN0(T val) {
 // USED BY: candidates kernel
 
 #define HIST_SIZE 512u // must be a multiple of WARP_SIZE (for the histogram max reduction)
+#define HIST_SPARE_SIZE 32u // additional histogram space to reduce hash collisions, must also be a multiple of WARP_SIZE
 #define MAX_CANDIDATES 4u // => how many candidates are proposed for a node (ranked by score)
 
 #define DETERMINISTIC_SCORE_NOISE 64u // => adds a +[0, DETERMINISTIC_SCORE_NOISE - 1]/FIXED_POINT_SCALE symmetric noise while calculating pairing scores; set to 0 to disable; keep it a power of 2 otherwise
@@ -102,7 +103,6 @@ __device__ __forceinline__ uint32_t deterministic_noise(uint32_t a, uint32_t b) 
 
 #define MAX_GROUP_SIZE 1u // => MAX_GROUP_SIZE - 1 slots per node; 2 means pairs
 #define PATH_SIZE 192u // initial slots for nodes to see while traversing the pairs tree, TODO: automatically extend if needed (costly...)
-#define MAX_REPEATS 4u // maximum number of nodes a single thread can handle, must be less than 32 (due to using one-hot anti-repeat encoding)
 
 typedef struct __align__(8) {
     uint32_t id; // lower 32 bits (Nvidia GPUs are little-endian)
@@ -291,8 +291,7 @@ __device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* table, const ui
     for (int probe = 0; probe < size; ++probe) {
         int slot = (idx + probe) % size;
         uint32_t* key_ptr = &table[slot].key;
-        // TODO: the CAS is slow, not needed when this is used inside a warp only!
-        uint32_t old_key  = atomicCAS(key_ptr, HASH_EMPTY, key);
+        uint32_t old_key = atomicCAS(key_ptr, HASH_EMPTY, key);
         if (old_key == HASH_EMPTY) { // insert new value
             table[slot].value = value;
             return true;
@@ -307,6 +306,26 @@ __device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* table, const ui
     return false;
 }
 
+__device__ __forceinline__ bool sm_hashmap_unsafe_insert(hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t value) {
+    uint32_t h = hash_uint32(key);
+    int idx = h % size;
+    for (int probe = 0; probe < size; ++probe) {
+        int slot = (idx + probe) % size;
+        uint32_t old_key = table[slot].key;
+        if (old_key == HASH_EMPTY) { // insert new value
+            table[slot] = { key, value };
+            return true;
+        }
+        if (old_key == key) { // update existing value
+            table[slot].value = value;
+            return false;
+        }
+        // else: collision, keep probing
+    }
+    assert(false && "SM hash-map full!");
+    return false; 
+}
+
 __device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t* out_value) {
     uint32_t h = hash_uint32(key);
     int idx = h % size;
@@ -315,6 +334,24 @@ __device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* table, co
         uint32_t cur_key = table[slot].key;
         if (cur_key == key) {
             *out_value = table[slot].value;
+            return true;
+        }
+        if (cur_key == HASH_EMPTY)
+            return false;
+        // else: collision, keep probing
+    }
+    // table full: considered a not-found
+    return false; 
+}
+
+__device__ __forceinline__ bool sm_hashmap_increment(hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t inc) {
+    uint32_t h = hash_uint32(key);
+    int idx = h % size;
+    for (int probe = 0; probe < size; ++probe) {
+        int slot = (idx + probe) % size;
+        uint32_t cur_key = table[slot].key;
+        if (cur_key == key) {
+            table[slot].value += inc;
             return true;
         }
         if (cur_key == HASH_EMPTY)

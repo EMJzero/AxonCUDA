@@ -194,9 +194,8 @@ void candidates_kernel(
     const uint32_t* my_neighbors = neighbors + neighbors_offsets[warp_id];
     const uint32_t* not_my_neighbors = neighbors + neighbors_offsets[warp_id + 1];
     uint32_t neighbors_count = neighbors_offsets[warp_id + 1] - neighbors_offsets[warp_id];
-    extern __shared__ uint32_t histogram[];
-    uint32_t* histogram_node = histogram + 2 * HIST_SIZE * (threadIdx.x / WARP_SIZE);
-    uint32_t* histogram_score = histogram + 2 * HIST_SIZE * (threadIdx.x / WARP_SIZE) + HIST_SIZE;
+    extern __shared__ hashmap_entry sm_histogram[];
+    hashmap_entry* histogram = sm_histogram + (HIST_SIZE + HIST_SPARE_SIZE) * (threadIdx.x / WARP_SIZE);
 
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
@@ -213,8 +212,7 @@ void candidates_kernel(
 
     // handle HIST_SIZE neighbors at a time
     for (; my_neighbors < not_my_neighbors; my_neighbors += HIST_SIZE) {
-        wm_init<uint32_t>(histogram_node, HIST_SIZE, UINT32_MAX);
-        wm_init<uint32_t>(histogram_score, HIST_SIZE, 0u);
+        wm_init<hashmap_entry>(histogram, HIST_SIZE + HIST_SPARE_SIZE, {HASH_EMPTY, 0u});
         __syncwarp();
 
         // load the first HIST_SIZE neighbors and setup per-thread local histograms
@@ -242,16 +240,11 @@ void candidates_kernel(
                 for (neighbor_inbound += lane_id; neighbor_inbound < not_neighbor_inbound; neighbor_inbound += WARP_SIZE)
                     new_inbound_count += binary_search<uint32_t>(my_touching, my_inbound_count, *neighbor_inbound) == UINT32_MAX ? 1 : 0; // binary search only among the inbounds part of my_touching
                 new_inbound_count = warpReduceSumLN0<uint32_t>(new_inbound_count) + my_inbound_count;
-                if (lane_id == 0 && new_inbound_count <= max_inbound_per_part) histogram_node[nb + broadcast_lane] = neighbor;
+                if (lane_id == 0 && new_inbound_count <= max_inbound_per_part) sm_hashmap_insert(histogram, HIST_SIZE + HIST_SPARE_SIZE, neighbor, 0u);
             }
         }
-        // warp sync after filling histograms
-        __syncwarp();
-
-        // sort the histogram to then rely on binary search
-        wm_bitonic_sort<uint32_t, HIST_SIZE>(histogram_node);
-
-        // TODO: shared memory caching of hyperedges!!
+        // warp sync after filling histograms => no need if we don't do anything dangerous in between!
+        //__syncwarp();
 
         // TODO: add this back when and if you start filling back up invalid nodes before going to the next histogram...
         // if no neighbor passed constraints checks (histogram is all UINT32_MAXs), exit the loop early
@@ -277,9 +270,17 @@ void candidates_kernel(
                 uint32_t pin = UINT32_MAX - 1;
                 if (my_hedge < not_my_hedge) pin = *my_hedge;
                 // update local histogram
-                const uint32_t hist_idx = binary_search<uint32_t>(histogram_node, HIST_SIZE, pin);
-                // TODO: this atomic is not needed => all threads in the warp advance in sync and there are not duplicates in hedges, no two threads will ever write the same bin!
-                if (hist_idx != UINT32_MAX) atomicAdd(&histogram_score[hist_idx], my_hedge_weight);
+                // NOTE: no update atomic needed => all threads in the warp advance in sync and there are not duplicates in hedges, no two threads will ever write the same bin!
+                sm_hashmap_increment(histogram, HIST_SIZE + HIST_SPARE_SIZE , pin, my_hedge_weight);
+                // DEBUG: do we have all neighbors?
+                /*bool ok = false;
+                for (const uint32_t *nb = neighbors + neighbors_offsets[warp_id]; nb < not_my_neighbors; nb++) {
+                    if (pin == *nb || pin == UINT32_MAX - 1 || pin == warp_id) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if (!ok) printf("Missing some neighbors (node %d, neighbor %d)!\n", warp_id, pin);*/
             }
         }
         // warp sync after the atomics
@@ -295,12 +296,12 @@ void candidates_kernel(
         
         // reduce max in histogram between threads (each thread grabs a different bin)
         // tie-breaker: lower id node wins; invariant: partial neighbors order
-        for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
+        for (uint32_t nb = lane_id; nb < HIST_SIZE + HIST_SPARE_SIZE; nb += WARP_SIZE) {
             // get the best MAX_CANDIDATES candidates out of the histogram
-            uint32_t curr_neighbor = histogram_node[nb];
+            uint32_t curr_neighbor = histogram[nb].key;
             uint32_t curr_score;
             if (curr_neighbor != UINT32_MAX)
-                curr_score = histogram_score[nb] + deterministic_noise(curr_neighbor, warp_id); // NOTE: adding a little bit of symmetric deterministic noise
+                curr_score = histogram[nb].value + deterministic_noise(curr_neighbor, warp_id); // NOTE: adding a little bit of symmetric deterministic noise
             else
                 curr_score = 0u;
             for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
@@ -345,16 +346,22 @@ void grouping_kernel(
     const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be grouped with pairs[idx]
     const uint32_t* __restrict__ nodes_sizes,
     const uint32_t num_nodes,
-    const uint32_t num_repeats,
     slot* __restrict__ group_slots, // initialized with -1 on the id
     uint32_t* __restrict__ groups // uninitialized, final group id of each node (non-zero based for now)
 ) {
     // SETUP FOR GLOBAL SYNC
     cg::grid_group grid = cg::this_grid();
 
-    // STYLE: 'num_repeats' node per thread!
+    // STYLE: one node per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t tcount = gridDim.x * blockDim.x;
+    if (tid >= num_nodes) {
+        for (uint32_t i = 0; i < 2*MAX_CANDIDATES; i++)
+            grid.sync();
+        return;
+    }
+
+    int32_t path_length = 0;
+    uint32_t path[PATH_SIZE];
 
     /*
     * Logic: a walk up (and down) the tree for grouping!
@@ -429,149 +436,105 @@ void grouping_kernel(
     *
     * Note: cycles should still be impossible if I lock previous pairs! Otherwise, looking at all "second pairs" would allow for cycles longer than 2!
     * Note: the global synch means that if a thread returns, the others are deadlocked? Check this! Otherwise just rerurn after the downward path
-    *
-    * Necessity, this is a cooperative kernel, it must be fully instantiated, even if it means each thread must handle multiple nodes:
-    * - multiple nodes per thread (passed as an argument)
-    * - compute the ceiling of how many nodes each simultaneously loaded thread would need to handle, from that infer back the exact number of threads,
-    *   and run them, each thread repeats the upward and downward walk once for every node it was assigned
-    * - the effective PATH_SIZE available to nodes is thus reduced by the number of nodes per thread, but luckly at the beginning, when there are many nodes,
-    *   paths are also at their shortest...
     */
 
-    int32_t path_length[MAX_REPEATS];
-    uint32_t path[PATH_SIZE];
-    const uint32_t actual_path_size = PATH_SIZE / num_repeats;
-    uint32_t completed_repeats = 0u;
-
-    for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
-        const uint32_t curr_tid = tid + repeat * tcount;
-        // initialize yourself to a one-node group, unless someone already claimed you
-        if (curr_tid < num_nodes) atomicCAS(&reinterpret_cast<unsigned long long*>(group_slots)[curr_tid*MAX_GROUP_SIZE], pack_slot(0u, UINT32_MAX), pack_slot(0u, curr_tid));
-    }
+    // initialize yourself to a one-node group, unless someone already claimed you
+    atomicCAS(&reinterpret_cast<unsigned long long*>(group_slots)[tid*MAX_GROUP_SIZE], pack_slot(0u, UINT32_MAX), pack_slot(0u, tid));
 
     for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
-        // repeat for every node that you need to handle
-        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
-            const uint32_t curr_tid = tid + repeat * tcount;
+        // if you formed a pair, stop
+        if (group_slots[tid*MAX_GROUP_SIZE].score == UINT32_MAX) {
+            grid.sync();
+            grid.sync();
+            continue;
+        }
 
-            // if you are not a valid node
-            if (curr_tid >= num_nodes) break;
-            // if you formed a pair, stop
-            if (completed_repeats & (1u << repeat)) continue;
-            if (group_slots[curr_tid*MAX_GROUP_SIZE].score == UINT32_MAX) {
-                completed_repeats |= (1u << repeat);
-                continue;
-            }
-
-            uint32_t* curr_path = path + actual_path_size * repeat;
-            int32_t curr_path_length = 0;
-
-            uint32_t current = curr_tid; // current node in the tree of pairs
-            uint32_t target = pairs[curr_tid * MAX_CANDIDATES + i]; // target node of "current"
-            uint32_t score = scores[curr_tid * MAX_CANDIDATES + i]; // score with which "current" points to "target"
-
-            // go up the tree
-            bool outcome = false;
-            if (target != UINT32_MAX) {
-                outcome = true;
-                uint32_t target_target = pairs[target * MAX_CANDIDATES + i]; // target node of "target"
-                while (current != target_target) {
-                    // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
-                    outcome = atomic_max_on_slot(group_slots, target*MAX_GROUP_SIZE, current, score);
-                    // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
-                    // NOTE: if the atomic already sees the value you were about to write (strict), you CANNOT stop, you must know what happens to your target before taking the final decision on your path
-                    // => with the second note being a <cannot>, we can't guarantee that exactly one thread will go up any piece of path, but we still don't need atomics in the downward walk, as every thread takes the same decisions regardless
-                    if (!outcome) break;
-                    // DEBUG: prevent cycles longer than 2!
-                    /*bool die = false;
-                    for (uint32_t j = 0; j < curr_path_length; j++) {
-                        if (curr_path[j] == target) {
-                            die = true;
-                            printf("Broke cycle between %d -> %d!\n", current, target);
-                            break;
-                        }
+        uint32_t current = tid; // current node in the tree of pairs
+        uint32_t target = pairs[tid * MAX_CANDIDATES + i]; // target node of "current"
+        uint32_t score = scores[tid * MAX_CANDIDATES + i]; // score with which "current" points to "target"
+        
+        // go up the tree
+        bool outcome = false;
+        if (target != UINT32_MAX) {
+            outcome = true;
+            uint32_t target_target = pairs[target * MAX_CANDIDATES + i]; // target node of "target"
+            while (current != target_target) {
+                // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
+                outcome = atomic_max_on_slot(group_slots, target*MAX_GROUP_SIZE, current, score);
+                // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
+                // NOTE: if the atomic already sees the value you were about to write (strict), you CANNOT stop, you must know what happens to your target before taking the final decision on your path
+                // => with the second note being a <cannot>, we can't guarantee that exactly one thread will go up any piece of path, but we still don't need atomics in the downward walk, as every thread takes the same decisions regardless
+                if (!outcome) break;
+                // DEBUG: prevent cycles longer than 2!
+                /*bool die = false;
+                for (uint32_t j = 0; j < path_length; j++) {
+                    if (path[j] == target) {
+                        die = true;
+                        printf("Broke cycle between %d -> %d!\n", current, target);
+                        break;
                     }
-                    if (die) break;*/
-                    assert(curr_path_length < actual_path_size);
-                    curr_path[curr_path_length++] = target;
-                    current = target;
-                    target = target_target;
-                    if (target == UINT32_MAX) break; // alternative root: a node with no target
-                    target_target = pairs[target_target * MAX_CANDIDATES + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
-                    score = scores[current * MAX_CANDIDATES + i];
                 }
+                if (die) break;*/
+                assert(path_length < PATH_SIZE);
+                path[path_length++] = target;
+                current = target;
+                target = target_target;
+                if (target == UINT32_MAX) break; // alternative root: a node with no target
+                target_target = pairs[target_target * MAX_CANDIDATES + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
+                score = scores[current * MAX_CANDIDATES + i];
             }
-            // handle "root(s)" as a pair of nodes pointing to each other
-            // NOTE: forceful writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
-            // NOTE: prevent locked groups from forming a 2-cycle after the next pairing candidates are considered
-            if (outcome && target != UINT32_MAX && group_slots[target*MAX_GROUP_SIZE].score != UINT32_MAX) {
-                const uint32_t lowest_id = min(current, target);
-                set_slot(group_slots, current*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
-                set_slot(group_slots, target*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
-            }
-
-            path_length[repeat] = curr_path_length;
+        }
+        // handle "root(s)" as a pair of nodes pointing to each other
+        // NOTE: forceful writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
+        // NOTE: prevent locked groups from forming a 2-cycle after the next pairing candidates are considered
+        if (outcome && target != UINT32_MAX && group_slots[target*MAX_GROUP_SIZE].score != UINT32_MAX) {
+            const uint32_t lowest_id = min(current, target);
+            set_slot(group_slots, current*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
+            set_slot(group_slots, target*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
         }
 
         // global synch
         grid.sync();
 
-        // repeat for every node that you need to handle
-        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
-            const uint32_t curr_tid = tid + repeat * tcount;
-
-            // if you are not a valid node
-            if (curr_tid >= num_nodes) break;
-            // if you formed a pair, stop
-            if (completed_repeats & (1u << repeat)) continue;
-
-            uint32_t* curr_path = path + actual_path_size * repeat;
-            int32_t curr_path_length = path_length[repeat];
-            path_length[repeat] = 0;
-
-            // go down the tree
-            // it the root had no target, path[path_length - 1] is the root, if the root was a mutual-poiting pair, path[path_length - 1] is the first encountered node of the pair
-            uint32_t current, target;
-            for (curr_path_length = curr_path_length - 2; curr_path_length >= 0; curr_path_length--) {
-                // NOTE: on the first iteration, coming from the upward walk, "current" is the last node that got its slot updated
-                target = curr_path[curr_path_length + 1]; // this is "who current would have liked to be with", the node one step back up the ladder towards root
-                current = curr_path[curr_path_length];
-                if (group_slots[target*MAX_GROUP_SIZE].id == current) {
-                    // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine
-                    group_slots[current*MAX_GROUP_SIZE].id = current;
-                    // NOTE: lock groups by setting scores to the maximum
-                    group_slots[current*MAX_GROUP_SIZE].score = UINT32_MAX;
-                    group_slots[target*MAX_GROUP_SIZE].score = UINT32_MAX;
-                    // NOTE: after a successful link the next node down the path has already lost its target, so we might as well skip it
-                    curr_path_length--;
-                }
+        // go down the tree
+        // it the root had no target, path[path_length - 1] is the root, if the root was a mutual-poiting pair, path[path_length - 1] is the first encountered node of the pair
+        for (path_length = path_length - 2; path_length >= 0; path_length--) {
+            // NOTE: on the first iteration, coming from the upward walk, "current" is the last node that got its slot updated
+            target = path[path_length + 1]; // this is "who current would have liked to be with", the node one step back up the ladder towards root
+            current = path[path_length];
+            if (group_slots[target*MAX_GROUP_SIZE].id == current) {
+                // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine
+                group_slots[current*MAX_GROUP_SIZE].id = current;
+                // NOTE: lock groups by setting scores to the maximum
+                group_slots[current*MAX_GROUP_SIZE].score = UINT32_MAX;
+                group_slots[target*MAX_GROUP_SIZE].score = UINT32_MAX;
+                // NOTE: after a successful link the next node down the path has already lost its target, so we might as well skip it
+                path_length--;
             }
-            // the path did not include the "curr_tid" node, handle it here iff you did not happen to group path[0] with path[1] during the last iteration above (leading to path_length == -2)
-            if (curr_path_length == -1) {
-                target = curr_path[0];
-                current = curr_tid;
-                if (group_slots[target*MAX_GROUP_SIZE].id == current) {
-                    group_slots[current*MAX_GROUP_SIZE].id = current;
-                    // lock groups by setting scores to the maximum
-                    group_slots[current*MAX_GROUP_SIZE].score = UINT32_MAX;
-                    group_slots[target*MAX_GROUP_SIZE].score = UINT32_MAX;
-                }
+        }
+        // the path did not include the "tid" node, handle it here iff you did not happen to group path[0] with path[1] during the last iteration above (leading to path_length == -2)
+        if (path_length == -1) {
+            target = path[0];
+            current = tid;
+            if (group_slots[target*MAX_GROUP_SIZE].id == current) {
+                group_slots[current*MAX_GROUP_SIZE].id = current;
+                 // lock groups by setting scores to the maximum
+                group_slots[current*MAX_GROUP_SIZE].score = UINT32_MAX;
+                group_slots[target*MAX_GROUP_SIZE].score = UINT32_MAX;
             }
         }
         
         // global synch
         grid.sync();
+
+        path_length = 0;
     }
 
     // write inside "groups" the minimum id among each node's slots, used to identify its group, eventually, zero-base those ids
-    for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
-        const uint32_t curr_tid = tid + repeat * tcount;
-        if (curr_tid >= num_nodes) break;
-        uint32_t min_id = UINT32_MAX;
-        for (uint32_t i = 0; i < MAX_GROUP_SIZE; i++)
-            min_id = min(group_slots[curr_tid*MAX_GROUP_SIZE + i].id, min_id);
-        groups[curr_tid] = min_id;
-    }
+    uint32_t min_id = UINT32_MAX;
+    for (uint32_t i = 0; i < MAX_GROUP_SIZE; i++)
+        min_id = min(group_slots[tid*MAX_GROUP_SIZE + i].id, min_id);
+    groups[tid] = min_id;
 }
 
 // count how many distinct new pins are in each hedge
