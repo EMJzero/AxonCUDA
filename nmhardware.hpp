@@ -788,5 +788,4 @@ namespace hwmodel {
         metrics.connections_locality = connectionsLocality(part_snn, placement);
         return metrics;
     }
-
 }

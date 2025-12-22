@@ -110,6 +110,14 @@ void candidates_kernel(
     * This kernel must give a symmetry invariant, if one node sees a candidate with score "s", then that candidate must also see this node as an option with score "s"!
     */
 
+    /*
+    * Idea, dramatic coarsening speedup:
+    * - we need to keep connections symmetric -> ids-based and permutation-invariant "deterministic_noise"!
+    * - during pairs construction, nudge up or down the hedge’s weight based on a very fast hash of the two node ids involved (order of the node ids must not matter)
+    * 
+    * TODO: simpler/faster hash, e.g. we could sum the node ids and pick the last 4 bits, adding those to the fixed point weight?
+    */
+
     const uint32_t* my_neighbors = neighbors + neighbors_offsets[warp_id];
     const uint32_t* not_my_neighbors = neighbors + neighbors_offsets[warp_id + 1];
     uint32_t neighbors_count = neighbors_offsets[warp_id + 1] - neighbors_offsets[warp_id];
@@ -132,43 +140,35 @@ void candidates_kernel(
 
     // handle HIST_SIZE neighbors at a time
     for (; my_neighbors < not_my_neighbors; my_neighbors += HIST_SIZE) {
-        wrp_init<uint32_t>(histogram_node, HIST_SIZE, UINT32_MAX);
-        wrp_init<uint32_t>(histogram_score, HIST_SIZE, 0u);
-        __syncwarp();
-
-        // load the first HIST_SIZE neighbors and setup per-thread local histograms
-        // each thread reads and prepares a neighbor, then broadcasts it to complete the check of its inbound set size
-        for (uint32_t nb = 0; nb < HIST_SIZE; nb += WARP_SIZE) {
-            uint32_t my_neighbor = UINT32_MAX;
-            uint32_t my_neighbor_touching_offsets;
-            uint32_t my_neighbor_inbound_count;
-            if (nb + lane_id < neighbors_count) {
-                my_neighbor = my_neighbors[nb + lane_id];
-                // omit incompatible neighbors due to size constraints
-                if (my_size + nodes_sizes[my_neighbor] > max_nodes_per_part) my_neighbor = UINT32_MAX;
-                else {
-                    my_neighbor_touching_offsets = touching_offsets[my_neighbor];
-                    my_neighbor_inbound_count = inbound_count[my_neighbor];
-                }
-            }
-            // TODO: maybe if you have an invalid node, sample another one to fill its place in the histogram?
-            for (uint32_t broadcast_lane = 0; broadcast_lane < WARP_SIZE; broadcast_lane++) { // TODO: add to the condition "&& nb + broadcast_lane < neighbors_count"
-                const uint32_t neighbor = __shfl_sync(0xFFFFFFFF, my_neighbor, broadcast_lane);
-                if (neighbor == UINT32_MAX) continue; // skip incompatible neighbors due to size constraints
-                const uint32_t* neighbor_inbound = touching + __shfl_sync(0xFFFFFFFF, my_neighbor_touching_offsets, broadcast_lane);
-                const uint32_t* not_neighbor_inbound = neighbor_inbound + __shfl_sync(0xFFFFFFFF, my_neighbor_inbound_count, broadcast_lane);
-                uint32_t new_inbound_count = 0u; // skip incompatible neighbors due to inbound constraints
-                for (neighbor_inbound += lane_id; neighbor_inbound < not_neighbor_inbound; neighbor_inbound += WARP_SIZE)
-                    new_inbound_count += binary_search<uint32_t>(my_touching, my_inbound_count, *neighbor_inbound) == UINT32_MAX ? 1 : 0; // binary search only among the inbounds part of my_touching
-                new_inbound_count = warpReduceSumLN0<uint32_t>(new_inbound_count) + my_inbound_count;
-                if (lane_id == 0 && new_inbound_count <= max_inbound_per_part) histogram_node[nb + broadcast_lane] = neighbor;
-            }
+        // load the first HIST_SIZE neighbors and setup per-thread local histograms, each thread reads and prepares a neighbor
+        // TODO: maybe if you have an invalid node, sample another one to fill its place in the histogram?
+        for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
+            uint32_t curr_neighbor = UINT32_MAX;
+            if (nb < neighbors_count) {
+                curr_neighbor = my_neighbors[nb];
+                 // skip incompatible neighbors due to size constraints
+                if (my_size + nodes_sizes[curr_neighbor] <= max_nodes_per_part)
+                    histogram_node[nb] = curr_neighbor;
+                else
+                    histogram_node[nb] = UINT32_MAX;
+            } else
+                histogram_node[nb] = UINT32_MAX;
         }
         // warp sync after filling histograms
         __syncwarp();
 
-        // sort the histogram to then rely on binary search
-        wm_bitonic_sort<uint32_t, HIST_SIZE>(histogram_node);
+        // sort the histogram by node-id to then rely on binary search
+        wrp_bitonic_sort<uint32_t, HIST_SIZE>(histogram_node);
+        __syncwarp();
+
+        // add a little bit of symmetric deterministic noise
+        for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
+            uint32_t curr_neighbor = histogram_node[nb];
+            if (curr_neighbor != UINT32_MAX)
+                histogram_score[nb] = deterministic_noise(curr_neighbor, warp_id);
+            else
+                histogram_score[nb] = 0u;
+        }
 
         // TODO: shared memory caching of hyperedges!!
 
@@ -204,45 +204,50 @@ void candidates_kernel(
         // warp sync after the atomics
         __syncwarp();
 
-        /*
-        * Idea, dramatic coarsening speedup:
-        * - we need to keep connections symmetric -> ids-based and permutation-invariant "deterministic_noise"!
-        * - during pairs construction, nudge up or down the hedge’s weight based on a very fast hash of the two node ids involved (order of the node ids must not matter)
-        * 
-        * TODO: simpler/faster hash, e.g. we could sum the node ids and pick the last 4 bits, adding those to the fixed point weight?
-        */
-        
-        // reduce max in histogram between threads (each thread grabs a different bin)
-        // tie-breaker: lower id node wins; invariant: partial neighbors order
-        for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
+        // sort the histogram by lowest score first (empty bins have score = 0), highest id first as a tiebreaker
+        wrp_bitonic_sort_by_key<uint32_t, uint32_t, HIST_SIZE>(histogram_score, histogram_node);
+        __syncwarp();
+
+        // updated global maximum(s), checking inbound constraints before doing it (this delays the such an expensive constrain check as much as possible)
+        for (int32_t candidate = HIST_SIZE - 1; candidate >= 0; candidate--) {
+            uint32_t curr_neighbor;
+            if (lane_id == 0)
+                curr_neighbor = histogram_node[candidate];
+            curr_neighbor = __shfl_sync(0xFFFFFFFF, curr_neighbor, 0);
+            if (curr_neighbor == UINT32_MAX) break;
+            uint32_t neighbor_touching_offsets, neighbor_inbound_count, curr_score;
+            if (lane_id == 0) {
+                curr_score = histogram_score[candidate];
+                neighbor_touching_offsets = touching_offsets[curr_neighbor];
+                neighbor_inbound_count = inbound_count[curr_neighbor];
+            }
+            curr_score = __shfl_sync(0xFFFFFFFF, curr_score, 0);
+            if (curr_score < best_score[MAX_CANDIDATES - 1]) break;
+
+            // skip incompatible neighbors due to inbound constraints
+            const uint32_t* neighbor_inbound = touching + __shfl_sync(0xFFFFFFFF, neighbor_touching_offsets, 0);
+            const uint32_t* not_neighbor_inbound = neighbor_inbound + __shfl_sync(0xFFFFFFFF, neighbor_inbound_count, 0);
+            uint32_t new_inbound_count = 0u;
+            for (neighbor_inbound += lane_id; neighbor_inbound < not_neighbor_inbound; neighbor_inbound += WARP_SIZE)
+                new_inbound_count += binary_search<uint32_t>(my_touching, my_inbound_count, *neighbor_inbound) == UINT32_MAX ? 1 : 0; // binary search only among the inbounds part of my_touching
+            new_inbound_count = warpReduceSum<uint32_t>(new_inbound_count) + my_inbound_count;
+            if (new_inbound_count > max_inbound_per_part) continue;
+
             // get the best MAX_CANDIDATES candidates out of the histogram
-            uint32_t curr_neighbor = histogram_node[nb];
-            uint32_t curr_score;
-            if (curr_neighbor != UINT32_MAX)
-                curr_score = histogram_score[nb] + deterministic_noise(curr_neighbor, warp_id); // NOTE: adding a little bit of symmetric deterministic noise
-            else
-                curr_score = 0u;
             for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
-                bin max = warpReduceMax(curr_score, curr_neighbor);
-                // TODO: only "lane_id = 0" actually needs to do all of this...
-                for (uint32_t j = 0; j < MAX_CANDIDATES; j++) {
-                    if (max.score > best_score[j] || max.score == best_score[j] && max.node < best_neighbor[j]) {
-                        for (uint32_t t = MAX_CANDIDATES - 1; t > j; t--) {
-                            best_score[t] = best_score[t - 1];
-                            best_neighbor[t] = best_neighbor[t - 1];
-                        }
-                        best_score[j] = max.score;
-                        best_neighbor[j] = max.node;
-                        break;
+                // tie-breaker: lower id node wins; invariant: partial neighbors order
+                if (curr_score > best_score[i] || curr_score == best_score[i] && curr_neighbor < best_neighbor[i]) {
+                    for (uint32_t j = MAX_CANDIDATES - 1; j > i; j--) {
+                        best_score[j] = best_score[j - 1];
+                        best_neighbor[j] = best_neighbor[j - 1];
                     }
-                }
-                if (curr_neighbor == max.node) {
-                    curr_neighbor = UINT32_MAX;
-                    curr_score = 0;
+                    best_score[i] = curr_score;
+                    best_neighbor[i] = curr_neighbor;
+                    break;
                 }
             }
         }
-
+        
         neighbors_count -= HIST_SIZE;
     }
 

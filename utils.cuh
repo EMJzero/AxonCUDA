@@ -12,7 +12,7 @@
 // initialize memory for a block of threads: one consecutive chunk per warp
 // => the memory can be shared memory or global alike, so long as each location is exclusive to a block
 template <typename T>
-__device__ __forceinline__ void blk_init(T* sm, const uint32_t size, const T val) {
+__device__ __forceinline__ void blk_init(T* __restrict__ sm, const uint32_t size, const T val) {
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane_id = threadIdx.x & (WARP_SIZE - 1);
     const int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
@@ -23,7 +23,7 @@ __device__ __forceinline__ void blk_init(T* sm, const uint32_t size, const T val
 // initialize per-warp memory: for shared memory dedicated to a single warp
 // => the memory can be shared memory or global alike, so long as each location is exclusive to a warp
 template <typename T>
-__device__ __forceinline__ void wrp_init(T* sm, const uint32_t size, const T val) {
+__device__ __forceinline__ void wrp_init(T* __restrict__ sm, const uint32_t size, const T val) {
     const int lane_id = threadIdx.x & (WARP_SIZE - 1);
     for (int i = lane_id; i < size; i += WARP_SIZE)
         sm[i] = val;
@@ -32,7 +32,7 @@ __device__ __forceinline__ void wrp_init(T* sm, const uint32_t size, const T val
 // initialize per-thread memory
 // => the memory can be local memory or global alike, so long as each location is exclusive to a thread
 template <typename T>
-__device__ __forceinline__ void thr_init(T* lm, const uint32_t size, const T val) {
+__device__ __forceinline__ void thr_init(T* __restrict__ lm, const uint32_t size, const T val) {
     for (int i = 0; i < size; i++)
         lm[i] = val;
 }
@@ -123,7 +123,7 @@ __device__ __forceinline__ void unpack_slot(unsigned long long v, uint32_t &scor
 }
 
 // 64bit atomic store to a slot
-__device__ __forceinline__ void set_slot(slot* s, uint32_t idx, uint32_t new_node, uint32_t new_score) {
+__device__ __forceinline__ void set_slot(slot* __restrict__ s, uint32_t idx, uint32_t new_node, uint32_t new_score) {
     unsigned long long* s64 = reinterpret_cast<unsigned long long*>(s);
     unsigned long long new_val = pack_slot(new_score, new_node);
     //s64[idx] = new_val; // => needs to be atomic because 64bit stores are not by default...
@@ -134,7 +134,7 @@ __device__ __forceinline__ void set_slot(slot* s, uint32_t idx, uint32_t new_nod
 }
 
 // 64bit atomic max on a slot, returns true iff the slot's content is the new node and score (even if they already were)
-__device__ __forceinline__ bool atomic_max_on_slot(slot* s, uint32_t idx, uint32_t new_node, uint32_t new_score) {
+__device__ __forceinline__ bool atomic_max_on_slot(slot* __restrict__ s, uint32_t idx, uint32_t new_node, uint32_t new_score) {
     unsigned long long* s64 = reinterpret_cast<unsigned long long*>(s);
     unsigned long long new_val = pack_slot(new_score, new_node);
     unsigned long long read_val = atomicMax(&s64[idx], new_val);
@@ -142,7 +142,7 @@ __device__ __forceinline__ bool atomic_max_on_slot(slot* s, uint32_t idx, uint32
 }
 
 // 64bit atomic max on a slot, returns true iff the slot's content was changed from something else to the new node and score
-__device__ __forceinline__ bool atomic_max_on_slot_strict(slot* s, uint32_t idx, uint32_t new_node, uint32_t new_score) {
+__device__ __forceinline__ bool atomic_max_on_slot_strict(slot* __restrict__ s, uint32_t idx, uint32_t new_node, uint32_t new_score) {
     unsigned long long* s64 = reinterpret_cast<unsigned long long*>(s) + idx;
     unsigned long long new_val = pack_slot(new_score, new_node);
     while (true) {
@@ -154,7 +154,7 @@ __device__ __forceinline__ bool atomic_max_on_slot_strict(slot* s, uint32_t idx,
 }
 
 // same as 'atomic_max_on_slot' but provides the previous slot's content via 'ret'
-__device__ __forceinline__ bool atomic_max_on_slot_ret(slot* s, uint32_t idx, uint32_t new_node, uint32_t new_score, slot &ret) {
+__device__ __forceinline__ bool atomic_max_on_slot_ret(slot* __restrict__ s, uint32_t idx, uint32_t new_node, uint32_t new_score, slot &ret) {
     unsigned long long* s64 = reinterpret_cast<unsigned long long*>(s);
     unsigned long long new_val = pack_slot(new_score, new_node);
     unsigned long long read_val = atomicMax(&s64[idx], new_val);
@@ -224,7 +224,7 @@ __device__ __forceinline__ uint32_t hash_uint32_linear(uint32_t x) {
 // => shared among threads, needs atomics
 
 // insert a value into a shared-memory hash-set, returns "true" if the value was not in the set before
-__device__ __forceinline__ bool sm_hashset_insert(uint32_t* table, const uint32_t size, const uint32_t value) {
+__device__ __forceinline__ bool sm_hashset_insert(uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
     const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -244,7 +244,7 @@ __device__ __forceinline__ bool sm_hashset_insert(uint32_t* table, const uint32_
 
 // tries to insert a value into a shared-memory hash-set, returns "true" if the value was not in the set before OR if the set is full
 // => this admits false negatives! It never goes and checks the whole hash-set, so the value could have already been there but not be seen!
-__device__ __forceinline__ bool sm_hashset_try_insert(uint32_t* table, const uint32_t size, const uint32_t value) {
+__device__ __forceinline__ bool sm_hashset_try_insert(uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
     const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < MAX_HASH_PROBE_LENGTH && probe < size; ++probe) {
@@ -263,7 +263,7 @@ __device__ __forceinline__ bool sm_hashset_try_insert(uint32_t* table, const uin
 }
 
 // lookup a value into a shared-memory hash-set, returns "true" if the value was found
-__device__ __forceinline__ bool sm_hashset_contains(const uint32_t* table, const uint32_t size, const uint32_t value) {
+__device__ __forceinline__ bool sm_hashset_contains(const uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
     const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -283,7 +283,7 @@ __device__ __forceinline__ bool sm_hashset_contains(const uint32_t* table, const
 // LOCAL MEMORY VERSION
 // => private to each thread, does not need atomics
 
-__device__ __forceinline__ bool lm_hashset_insert(uint32_t* table, const uint32_t size, const uint32_t value) {
+__device__ __forceinline__ bool lm_hashset_insert(uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
     const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -301,7 +301,7 @@ __device__ __forceinline__ bool lm_hashset_insert(uint32_t* table, const uint32_
     return false;
 }
 
-__device__ __forceinline__ bool lm_hashset_contains(const uint32_t* table, const uint32_t size, const uint32_t value) {
+__device__ __forceinline__ bool lm_hashset_contains(const uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
     const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -321,7 +321,7 @@ __device__ __forceinline__ bool lm_hashset_contains(const uint32_t* table, const
 // => shared among threads, needs atomics
 // => assumed to store indices or other uniformly-spread content, therefore it uses 'hash_uint32_linear'
 
-__device__ __forceinline__ bool gm_hashset_insert(uint32_t* table, uint32_t size, uint32_t value) {
+__device__ __forceinline__ bool gm_hashset_insert(uint32_t* __restrict__ table, uint32_t size, uint32_t value) {
     const uint32_t h = hash_uint32_linear(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -338,7 +338,7 @@ __device__ __forceinline__ bool gm_hashset_insert(uint32_t* table, uint32_t size
     return false;
 }
 
-__device__ __forceinline__ bool gm_hashset_contains(const uint32_t* table, uint32_t size, uint32_t value) {
+__device__ __forceinline__ bool gm_hashset_contains(const uint32_t* __restrict__ table, uint32_t size, uint32_t value) {
     const uint32_t h = hash_uint32_linear(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -366,7 +366,7 @@ typedef struct {
     uint32_t value;
 } hashmap_entry;
 
-__device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t value) {
+__device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* __restrict__ table, const uint32_t size, uint32_t key, uint32_t value) {
     const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -389,7 +389,7 @@ __device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* table, const ui
     return false;
 }
 
-__device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t* out_value) {
+__device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* __restrict__ table, const uint32_t size, uint32_t key, uint32_t* out_value) {
     const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -411,7 +411,7 @@ __device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* table, co
 // LOCAL MEMORY VERSION
 // => private to each thread, does not need atomics
 
-__device__ __forceinline__ bool lm_hashmap_insert(hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t value) {
+__device__ __forceinline__ bool lm_hashmap_insert(hashmap_entry* __restrict__ table, const uint32_t size, uint32_t key, uint32_t value) {
     const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -432,7 +432,7 @@ __device__ __forceinline__ bool lm_hashmap_insert(hashmap_entry* table, const ui
     return false;
 }
 
-__device__ __forceinline__ bool lm_hashmap_lookup(const hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t* out_value) {
+__device__ __forceinline__ bool lm_hashmap_lookup(const hashmap_entry* __restrict__ table, const uint32_t size, uint32_t key, uint32_t* out_value) {
     const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -461,7 +461,7 @@ __device__ __forceinline__ int ilog2(int x) {
 }
 
 // insertion-sort fallback (32 elements or less)
-__device__ __forceinline__ void insertion_sort(uint32_t* a, int lo, int hi) {
+__device__ __forceinline__ void insertion_sort(uint32_t* __restrict__ a, int lo, int hi) {
     for (int i = lo + 1; i <= hi; i++) {
         uint32_t key = a[i];
         int j = i - 1;
@@ -473,7 +473,7 @@ __device__ __forceinline__ void insertion_sort(uint32_t* a, int lo, int hi) {
     }
 }
 
-__device__ __forceinline__ void heapify(uint32_t* a, int n, int i) {
+__device__ __forceinline__ void heapify(uint32_t* __restrict__ a, int n, int i) {
     while (true) {
         int l = (i << 1) + 1;
         int r = l + 1;
@@ -490,7 +490,7 @@ __device__ __forceinline__ void heapify(uint32_t* a, int n, int i) {
 }
 
 // heapsort fallback
-__device__ __forceinline__ void heapsort(uint32_t* a, int n) {
+__device__ __forceinline__ void heapsort(uint32_t* __restrict__ a, int n) {
     for (int i = (n >> 1) - 1; i >= 0; i--)
         heapify(a, n, i);
 
@@ -501,7 +501,7 @@ __device__ __forceinline__ void heapsort(uint32_t* a, int n) {
 }
 
 // sequential sort in one thread: entry point
-__device__ __forceinline__ void introsort(uint32_t* a, int n) {
+__device__ __forceinline__ void introsort(uint32_t* __restrict__ a, int n) {
     if (n <= 32) {
         insertion_sort(a, 0, n - 1);
         return;
@@ -566,38 +566,120 @@ __device__ __forceinline__ void introsort(uint32_t* a, int n) {
     }
 }
 
-// bitonic sort within a single warp over a portion of shared memory
+// bitonic sort (ascending) within a single warp over a portion of shared memory
 // IMPORTANT: 'N' must be a multiple of 'WARP_SIZE' !!
 template <typename T, uint32_t N>
-__device__ __forceinline__ void wm_bitonic_sort(T* sm) {
-    static_assert(N % WARP_SIZE == 0);
-    constexpr uint32_t STRIDE = WARP_SIZE;
-    constexpr uint32_t BLOCKS = N / WARP_SIZE;
-    const uint32_t lane = threadIdx.x & (WARP_SIZE - 1);
+__device__ __forceinline__ void wrp_bitonic_sort(T* __restrict__ sm) {
+    static_assert((N & (N - 1)) == 0, "N must be power-of-two");
+    static_assert(N % WARP_SIZE == 0, "N must be multiple of 32");
+    constexpr uint32_t B = N / WARP_SIZE;
+    const uint32_t lane  = threadIdx.x & 31;
+    const unsigned mask  = 0xFFFFFFFFu;
+    T x[B];
     #pragma unroll
-    for (uint32_t k = 2; k <= N; k <<= 1) {
+    for (uint32_t b = 0; b < B; ++b)
+        x[b] = sm[lane + b * WARP_SIZE];
+    #pragma unroll
+    for (uint32_t size = 2; size <= N; size <<= 1) {
         #pragma unroll
-        for (uint32_t j = k >> 1; j > 0; j >>= 1) {
-            #pragma unroll
-            for (uint32_t b = 0; b < BLOCKS; ++b) {
-                uint32_t i = lane + b * STRIDE;
-                uint32_t ixj = i ^ j;
-                if (ixj > i) {
-                    bool ascending = ((i & k) == 0);
-                    T a = sm[i];
-                    T bval = sm[ixj];
-                    if ((a > bval) == ascending) {
-                        sm[i] = bval;
-                        sm[ixj] = a;
+        for (uint32_t step = size >> 1; step; step >>= 1) {
+            if (step < WARP_SIZE) {
+                #pragma unroll
+                for (uint32_t b = 0; b < B; ++b) {
+                    const uint32_t i = lane + b * WARP_SIZE;
+                    const bool asc = ((i & size) == 0);
+                    const bool low = ((lane & step) == 0);
+                    const T y = __shfl_xor_sync(mask, x[b], step);
+                    const bool take = asc ? (low ? (y < x[b]) : (y > x[b])) : (low ? (y > x[b]) : (y < x[b]));
+                    if (take) x[b] = y;
+                }
+            } else {
+                const uint32_t sb = step >> 5; // step / 32
+                #pragma unroll
+                for (uint32_t b = 0; b < B; ++b) {
+                    const uint32_t b2 = b ^ sb;
+                    if (b2 > b) {
+                        const uint32_t i = lane + b * WARP_SIZE;
+                        const bool asc = ((i & size) == 0);
+                        T a = x[b], c = x[b2];
+                        const bool s = asc ? (a > c) : (a < c);
+                        if (s) { x[b] = c; x[b2] = a; }
                     }
                 }
             }
-            __syncwarp();
         }
     }
+    #pragma unroll
+    for (uint32_t b = 0; b < B; ++b)
+        sm[lane + b * WARP_SIZE] = x[b];
 }
 
+// same as the bitonic sort (ascending), but carries 'vals' along with 'keys' that get sorted
+// tie-breaker: in case of identical key, the highest value comes first
+// IMPORTANT: 'N' must be a multiple of 'WARP_SIZE' !!
+template <typename K, typename V, uint32_t N>
+__device__ __forceinline__ void wrp_bitonic_sort_by_key(K* __restrict__ keys, V* __restrict__ vals) {
+    static_assert((N & (N - 1)) == 0, "N must be power-of-two");
+    static_assert(N % WARP_SIZE == 0, "N must be multiple of 32");
+    constexpr uint32_t B = N / WARP_SIZE;
+    const uint32_t lane  = threadIdx.x & 31;
+    const unsigned mask  = 0xFFFFFFFFu;
+    K k[B];
+    V v[B];
+    #pragma unroll
+    for (uint32_t b = 0; b < B; ++b) {
+        const uint32_t i = lane + b * WARP_SIZE;
+        k[b] = keys[i];
+        v[b] = vals[i];
+    }
+    #pragma unroll
+    for (uint32_t size = 2; size <= N; size <<= 1) {
+        #pragma unroll
+        for (uint32_t step = size >> 1; step; step >>= 1) {
+            if (step < WARP_SIZE) {
+                #pragma unroll
+                for (uint32_t b = 0; b < B; ++b) {
+                    const uint32_t i = lane + b * WARP_SIZE;
+                    const bool asc = ((i & size) == 0);
+                    const bool low = ((lane & step) == 0);
+                    const K ok = __shfl_xor_sync(mask, k[b], step);
+                    const V ov = __shfl_xor_sync(mask, v[b], step);
+                    const bool less = (ok < k[b]) || ((ok == k[b]) && (ov > v[b])); // lower key or same key and higher val
+                    const bool greater = (ok > k[b]) || ((ok == k[b]) && (ov < v[b])); // higher key or same key and lower val
+                    const bool take = asc ? (low ? less : greater) : (low ? greater : less);
+                    if (take) {
+                        k[b] = ok;
+                        v[b] = ov;
+                    }
+                }
+            } else {
+                const uint32_t sb = step >> 5;
+                #pragma unroll
+                for (uint32_t b = 0; b < B; ++b) {
+                    const uint32_t b2 = b ^ sb;
+                    if (b2 > b) {
+                        const uint32_t i = lane + b * WARP_SIZE;
+                        const bool asc = ((i & size) == 0);
+                        K ka = k[b], kb = k[b2];
+                        V va = v[b], vb = v[b2];
+                        const bool swap = asc ? (ka > kb || (ka == kb && va < vb)) : (ka < kb || (ka == kb && va > vb)); // same tiebreak as above
+                        if (swap) {
+                            k[b] = kb; v[b] = vb;
+                            k[b2] = ka; v[b2] = va;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
+    #pragma unroll
+    for (uint32_t b = 0; b < B; ++b) {
+        const uint32_t i = lane + b * WARP_SIZE;
+        keys[i] = k[b];
+        vals[i] = v[b];
+    }
+}
 
 // binary search, returns the index of 'value' in 'a' or UINT32_MAX if it is not found
 template <typename T>

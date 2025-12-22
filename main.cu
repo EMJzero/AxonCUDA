@@ -359,6 +359,21 @@ int main(int argc, char** argv) {
         cfg_loihi_large.latency_per_routing = 2.1;
         cfg_loihi_large.latency_per_wire = 5.3;
     HardwareModel loihi_large(cfg_loihi_large);
+
+    HardwareModelConfig cfg_loihi_jin_84;
+        cfg_loihi_jin_84.name = "Loihi Jin 84";
+        cfg_loihi_jin_84.neurons_per_core = 4096;
+        cfg_loihi_jin_84.synapses_per_core = 1024*64;
+        cfg_loihi_jin_84.cores_per_chip_x = 84;
+        cfg_loihi_jin_84.cores_per_chip_y = 84;
+        cfg_loihi_jin_84.chips_per_system_x = 1;
+        cfg_loihi_jin_84.chips_per_system_y = 1;
+        cfg_loihi_jin_84.energy_per_routing = 1.0;
+        cfg_loihi_jin_84.energy_per_wire = 0.1;
+        cfg_loihi_jin_84.latency_per_routing = 1.0;
+        cfg_loihi_jin_84.latency_per_wire = 0.01;
+    HardwareModel loihi_jin_84(cfg_loihi_jin_84);
+
     HardwareModelConfig cfg_truenorth;
         cfg_truenorth.name = "TrueNorth";
         cfg_truenorth.neurons_per_core = 256;
@@ -372,6 +387,7 @@ int main(int argc, char** argv) {
         cfg_truenorth.latency_per_routing = 2.1; // unknown (this is from Loihi)
         cfg_truenorth.latency_per_wire = 5.3; // unknown (this is from Loihi)
     HardwareModel truenorth(cfg_truenorth);
+
     // set the hardware model
     HardwareModel hw = loihi_large;
 
@@ -803,10 +819,13 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, new_num_nodes * sizeof(uint32_t))); // partition -> distinct inbound hedges count for "partition"
 
             // base case, reached the target number of partitions
-            if (new_num_nodes <= max_parts) {
+            if (new_num_nodes <= target_parts) {
+                std::cout << "Minimal initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
+            } else if (new_num_nodes <= max_parts) {
                 std::cout << "Initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
+                std::cout << "WARNING: the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ")...\n";
             } else { // base case, failure to coarsen further
-                std::cout << "FAILED TO COARSEN FURTHER at level " << level_idx << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << new_num_nodes << "\n";
+                std::cout << "FAILED TO COARSEN FURTHER at level " << level_idx << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << new_num_nodes << " max allowed partitions=" << max_parts << "\n";
                 std::cout << "WARNING: falling back to returning current groups as individual partitions...\n";
             }
 
@@ -1550,6 +1569,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     auto time_end = std::chrono::high_resolution_clock::now();
+    std::cout << "Stopping timer...\n";
 
     // === CUDA STUFF ENDS HERE ===
     // ============================

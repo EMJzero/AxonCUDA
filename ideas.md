@@ -244,6 +244,17 @@ Plan:
 - lane 0 reads hedge offset and weight, broadcasting it with a shuffle
 - binary search for the histogram bin
 
+
+Faster candidates kernel:
+IDEA: postpone inbound size checks after computing scores!
+- accept all neighbors into the histogram (except those with size limits)
+- after picking the maximum among neighbors, make the whole warp compute its inbound size and check the constraints, repeating the maximum sampling if it fails
+
+=> as of now, picking the maximum is already done with the whole warp, as is the inbound size check, so the two are compatible. This way, filling the histogram can be fully warp-parallel!
+=> moreover, if you find enough valid candidates before checking every neighbor, you do fewer inbound size checks!
+
+This could be slightly worse if you find a way to compress the histogram (fill in the empty spots left by invalid options).
+
 ---
 
 Solution for deduping neighbors:
@@ -282,3 +293,23 @@ Better:
 - make SM and GM two hash sets (no hash function, use node id directly)
 - dumping SM into GM is the same as having the whole block start doing bulk inserts in to the GM hash set
 => at this point just go with the other method, spilling SM on the fly
+
+Idea:
+Could try to correlate the touching set size and avg. hedge size to the neighborhood size, this way each node can be allocated a neighborhood size just based on its touching set size (already available)!
+
+Possibility:
+Go back to the count+scatter kernel for neighborhoods. Give a bit of GM to each block during the count to back-up the SM hash-set. Here use GM as hash-sets!
+The scatter do it as it was before, but build a hash-set again in GM. Only that this time the GM is sized appropriately. After every negative check in shared memory, check if the value was already in GM just like before!
+=> Nah, this would be just as tough, since you would still need to give "max_neighbors" initial GM size (a little less, if you remove the SM size from it and just count) to each node/block!
+
+True solutions:
+1) do this a few nodes at a time, allocate at most 1/4 max VRAM of oversized neighbors and divide the nodes in evently-sized groups that can fit in such amount of VRAM.
+ISSUE: you can't resize memory allocations, you need to allocate double the amounts of neighbors by the end just to copy every deduped neighbors piece into the final, unified one array!
+2) don't dedupe all at once! Like the old version, dedupe in SM only, but after SM is full, count every node not in it as a new distinct. Do the count+scatter as normal.
+   Since now, after the first round, you will still have duplicates, repeat the process exactly as before, but rather than building the neighbors sets, just re-read those you created before.
+   Naturally, you will construct sets such that the elements that hit SM will be first, and you know those already have no duplicates. So in the subsequent rounds you can sort the first
+   "round*size_of_SM" elements of the previous set and use a binary search on them even before putting elements in SM for the current round. This way the size of SM is not anymore a limit,
+   rather you are guaranteed to dedupe "size_of_SM" elements per round!
+   Continue the process until you don't exceed SM's size anymore, aka you deduped everything.
+ISSUE: none, really, except if SM is too small to significantly reduce the size of the first array. If that happens, you could allocate a bit (user-controllable) of GM to help SM during every round!
+       Maximum memory violated? Allocate more GM! Otherwise, allocate as little as needed and rely on SM!
