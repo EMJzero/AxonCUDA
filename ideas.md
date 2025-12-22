@@ -243,3 +243,42 @@ Plan:
 
 - lane 0 reads hedge offset and weight, broadcasting it with a shuffle
 - binary search for the histogram bin
+
+---
+
+Solution for deduping neighbors:
+
+- host, pick 8 nodes at random, compute their maximum neighborhoods size, use double that as our reference "neighborhood_size"
+- instantiate the neighbors array with neighborhood_size slots per node, each neighborhood_size section will be threated as a global hash-table
+- the new neighbors kernel just does one pass, no need to first count and then write
+- check if a node is in the SM hash-set (a cache, essentially), if so, skip it
+- if a node is not in the SM hash-set, insert it in the global hash-table (if it is already in it, just skip it)
+
+- finish off with a thrust map to change hash-table bins into uint32s and a pack to remove empty spaces and compute the neighbors_offsets
+
+Maybe: make the SM hash-set a bloom filter that allows false negatives, but not positives (the opposite of the normal bloom filter)
+
+How to use hash-sets:
+- SM stays an hash-set until full
+- after it becomes full, finish the current warp-level work and SORT it
+- from the point the SM hash-set is sorted, access it with a binary search with key being the hash
+  => this saves the cost of a full scan when the element is missing
+=> experiment to do: try not using an hash function in SM too, relying on the node ids directly as the hash and key at the same time (no hash collision risk)
+- treat GM as an hash-set without hash, using node ids directly (or an invertible hash function, but that woudl be a waste of compute)
+- before the SM was full, write to GM only when a new value is added to SM
+- after SM is full, try writing to GM whenever a value is not in SM and dedupe in GM
+
+Alternative deduping idea:
+- in both SM and GM use node ids as keys
+- before doing its 32 reads, each warp increases the SM distinct count by 32, and decrements it afterwards by the number of duplicates it found (unless the increment brought distinct to less than 32 away from full, if this happens don’t undo it and just commit to the sync)
+- this way, the distinct count can be used as a reliable, pessimistic, estimate of how full SM is
+- whenever a warp needs to start and sees < 32 SM spaces it goes wait on a block sync
+- after the sync, all threads in the block cooperate to sort SM
+- threads then proceed to do a merge-sort in-place with on-the-fly deduplication of SM into GM (that is also kept sorted) (tough, but remember that SM’s size will be <= than GM, but this may still require out-of-place merging…)
+- then empty SM and continue
+- if GM is full, assert error
+Possible issue: if the SM hash-set fill up too fast, you waste more time dumping SM into GM, than anything else...
+Better:
+- make SM and GM two hash sets (no hash function, use node id directly)
+- dumping SM into GM is the same as having the whole block start doing bulk inserts in to the GM hash set
+=> at this point just go with the other method, spilling SM on the fly

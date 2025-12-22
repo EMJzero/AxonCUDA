@@ -27,22 +27,13 @@
 #define VERBOSE true
 #define VERBOSE_LENGTH 20
 
-extern __global__ void neighborhoods_count_kernel(
+extern __global__ void neighborhoods_dedupe_kernel(
     const uint32_t* hedges,
     const uint32_t* hedges_offsets,
     const uint32_t* touching,
     const uint32_t* touching_offsets,
     const uint32_t num_nodes,
-    uint32_t* neighbors_offsets
-);
-
-extern __global__ void neighborhoods_scatter_kernel(
-    const uint32_t* hedges,
-    const uint32_t* hedges_offsets,
-    const uint32_t* touching,
-    const uint32_t* touching_offsets,
-    const uint32_t num_nodes,
-    const uint32_t* neighbors_offsets,
+    const size_t max_neighbors,
     uint32_t* neighbors
 );
 
@@ -336,7 +327,7 @@ int main(int argc, char** argv) {
         try {
             std::cout << "Loading hypergraph from: " << load_path << " ...\n";
             if (!std::filesystem::is_regular_file(load_path)) throw std::runtime_error("The provided path is not a file.");
-            std::cout << "Hypergraph file size: " << (std::filesystem::file_size(load_path) >> 20) << " MB\n";
+            std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
             hg = HyperGraph::load(load_path);
             loaded = true;
         } catch (const std::exception& e) {
@@ -506,46 +497,56 @@ int main(int argc, char** argv) {
     thrust::device_ptr<uint32_t> t_touching_offsets(d_touching_offsets);
     // each initial node has one outbound hyperedge -> init. inbound counts to the number of touching - 1
     thrust::transform(t_touching_offsets + 1, t_touching_offsets + 1 + num_nodes, t_touching_offsets, t_inbound_count, [] __device__ (int next, int curr) { return next - curr - 1; });
-    
+
     // copy constants to device
     CUDA_CHECK(cudaMemcpyToSymbol(max_nodes_per_part, &h_max_nodes_per_part, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpyToSymbol(max_inbound_per_part, &h_max_inbound_per_part, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
 
+    // wrap up memory duties with a sync
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
     // prepare neighborhoods
+    // start with an oversized allocation for each node where to deduplicate, then pack and build offsets
     // NOTE: the host-side version was "hg.buildNeighborhoods()", this is the CUDA version!
-    // TODO: this computes (deduplicates) the neighborhoods twice, first to have their size, then to actually write them. We could do better by caching in global memory the already-deduped per-block arrays...
-    CUDA_CHECK(cudaMalloc(&d_neighbors_offsets, (num_nodes + 1) * sizeof(uint32_t))); // node -> neighbors set start idx in d_neighbors
-    CUDA_CHECK(cudaMemset(d_neighbors_offsets, 0x00, (num_nodes + 1) * sizeof(uint32_t))); // gotta initialize it because some nodes might have zero touching hedges
+    uint32_t *d_oversized_neighbors = nullptr;
+    size_t max_neighbors = (size_t)(1.2 * (float)hg.sampleMaxNeighborhoodSize(240)); // TODO: is 240 enough here?
+    if (num_nodes * max_neighbors * sizeof(uint32_t) > (1ull << 32))
+        std::cout << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_nodes * max_neighbors * sizeof(uint32_t)) / (1 << 30) << "GB for oversized neighbors ...\n";
+    CUDA_CHECK(cudaMalloc(&d_oversized_neighbors, num_nodes * max_neighbors * sizeof(uint32_t))); // non-contigous neighborhood sets array (has unused slots)
+    thrust::device_ptr<uint32_t> t_oversized_neighbors(d_oversized_neighbors);
+    // launch configuration - neighborhoods kernel
     blocks = num_nodes;
     threads_per_block = 256; // 256/32 -> 8 warps per block
     std::cout << "Running neighborhoods kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-    // count each node's neighbors
-    neighborhoods_count_kernel<<<blocks, threads_per_block>>>(
+    // launch - neighborhoods kernel
+    neighborhoods_dedupe_kernel<<<blocks, threads_per_block>>>(
         d_hedges,
         d_hedges_offsets,
         d_touching,
         d_touching_offsets,
         num_nodes,
-        d_neighbors_offsets
-    );
-    // compute final offsets
-    thrust::device_ptr<uint32_t> t_neigh_offsets(d_neighbors_offsets);
-    thrust::exclusive_scan(t_neigh_offsets, t_neigh_offsets + (num_nodes + 1), t_neigh_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
-    uint32_t total_neighbors;
-    CUDA_CHECK(cudaMemcpy(&total_neighbors, d_neighbors_offsets + num_nodes, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMalloc(&d_neighbors, total_neighbors * sizeof(uint32_t))); // contigous neighborhood sets array
-    // write neighbors in at their correct offset
-    neighborhoods_scatter_kernel<<<blocks, threads_per_block>>>(
-        d_hedges,
-        d_hedges_offsets,
-        d_touching,
-        d_touching_offsets,
-        num_nodes,
-        d_neighbors_offsets,
-        d_neighbors
+        max_neighbors,
+        d_oversized_neighbors
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+    auto valid_neighbors = thrust::make_transform_iterator(t_oversized_neighbors, [] __host__ __device__ (uint32_t x) { return static_cast<uint32_t>(x != HASH_EMPTY); });
+    thrust::device_vector<uint32_t> t_position_neighbors(num_nodes * max_neighbors);
+    thrust::exclusive_scan(valid_neighbors, valid_neighbors + num_nodes * max_neighbors, t_position_neighbors.begin()); // in-place scan for pack offsets
+    uint32_t total_neighbors = t_position_neighbors[num_nodes * max_neighbors - 1] + (t_oversized_neighbors[num_nodes * max_neighbors - 1] != HASH_EMPTY); // automagic copy device->host
+    CUDA_CHECK(cudaMalloc(&d_neighbors, total_neighbors * sizeof(uint32_t))); // contigous neighborhood sets array
+    CUDA_CHECK(cudaMalloc(&d_neighbors_offsets, (num_nodes + 1) * sizeof(uint32_t))); // node -> neighbors set start idx in d_neighbors
+    thrust::device_ptr<uint32_t> t_neighbors(d_neighbors);
+    thrust::device_ptr<uint32_t> t_neighbors_offsets(d_neighbors_offsets);
+    thrust::scatter_if(t_oversized_neighbors, t_oversized_neighbors + num_nodes * max_neighbors, t_position_neighbors.begin(), valid_neighbors, t_neighbors); // pack
+    auto front_neighbors_iterator = thrust::make_transform_iterator(thrust::make_counting_iterator<uint32_t>(0), [=] __host__ __device__ (uint32_t i) { return i / max_neighbors; });
+    auto back_neighbors_iterator = front_neighbors_iterator + num_nodes * max_neighbors + 1;
+    thrust::reduce_by_key(front_neighbors_iterator, back_neighbors_iterator, valid_neighbors, thrust::make_discard_iterator(), t_neighbors_offsets); // compute per-node neighbor counts
+    thrust::exclusive_scan(t_neighbors_offsets, t_neighbors_offsets + num_nodes + 1, t_neighbors_offsets);
+    CUDA_CHECK(cudaFree(d_oversized_neighbors));
+    thrust::device_vector<uint32_t>().swap(t_position_neighbors);
+
 
     // returns the number of partitions and the pointer to the final partitions device buffer
     std::function<std::tuple<uint32_t, uint32_t*>(const uint32_t, const uint32_t, uint32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t, uint32_t*, uint32_t*)> coarsen_refine_uncoarsen = [&](
@@ -1474,6 +1475,7 @@ int main(int argc, char** argv) {
         
         return std::make_tuple(num_partitions, d_partitions);
     };
+
 
     // START: the multi-level recursive refinement routine, down we go!
     auto [num_partitions, d_partitions] = coarsen_refine_uncoarsen(

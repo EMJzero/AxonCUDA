@@ -317,6 +317,35 @@ namespace hgraph {
             neighborhoods_built_ = true;
         }
 
+        // gives the maximum neighborhood size found by sampling 'sample_size' equi-spaced nodes
+        uint32_t sampleMaxNeighborhoodSize(uint32_t sample_size) {
+            uint32_t max_size = 0;
+
+            for (uint32_t n = 0; n < node_count_; n += node_count_ / sample_size) {
+
+                std::set<uint32_t> neigh; // distinct neighbors
+
+                for (uint32_t idx : outbound_[n]) {
+                    const HyperEdge& he = hedges_[idx];
+                    for (uint32_t i = 1; i < he.length(); i++) {
+                        neigh.insert(hedges_flat_[he.offset() + i]);
+                    }
+                }
+
+                for (uint32_t idx : inbound_[n]) {
+                    const HyperEdge& he = hedges_[idx];
+                    neigh.insert(he.source());
+                    for (uint32_t i = 1; i < he.length(); i++) {
+                        neigh.insert(hedges_flat_[he.offset() + i]);
+                    }
+                }
+
+                max_size = std::max(max_size, (uint32_t)neigh.size());
+                neigh.erase(n);
+            }
+            return max_size;
+        }
+
         // return a view (pointer + size) of a node's neighborhood
         std::pair<const uint32_t*, size_t> getNeighborhood(Node n) const {
             if (!neighborhoods_built_)

@@ -12,89 +12,17 @@ __constant__ uint32_t max_inbound_per_part;
 
 // REMEMBER: "const" means the data pointed to is not modified, not the pointer itself!
 
-// count the number of distinct neighbors of each node (to then perform a scan and find offsets where to write the neighborhoods)
+// compute the distinct neighbors of each node (again) and write them in a global hash-set
 // SEQUENTIAL COMPLEXITY: n*h*d
 // PARALLEL OVER: n
 __global__
-void neighborhoods_count_kernel(
+void neighborhoods_dedupe_kernel(
     const uint32_t* __restrict__ hedges,
     const uint32_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ touching,
     const uint32_t* __restrict__ touching_offsets,
     const uint32_t num_nodes,
-    uint32_t* __restrict__ neighbors_offsets // here filled as counters of "how many neighbors per node" -> then do a prefix sum for the offsets
-) {
-    /*
-    * Idea: BIN pattern of count->scan->scatter
-    */
-
-    // STYLE: one node per block, one touching hedge per warp, distinct neighbors in shared memory!
-    const uint32_t node_id = blockIdx.x;
-    if (node_id >= num_nodes) return;
-
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // local per block - coincides with the touching hedge to handle
-    const uint32_t warp_id = threadIdx.x / WARP_SIZE;
-    const uint32_t warps_per_block = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-
-    const uint32_t* my_touching = touching + touching_offsets[node_id];
-    //const uint32_t* not_my_touching = touching + touching_offsets[node_id + 1];
-    const uint32_t my_touching_count = touching_offsets[node_id + 1] - touching_offsets[node_id];
-    
-    // hash-set for deduplication
-    __shared__ uint32_t dedupe[SM_MAX_DEDUPE_BUFFER_SIZE];
-    __shared__ uint32_t seen_distinct_total;
-    uint32_t seen_distinct = 0;
-    
-    // initialize shared memory
-    sm_init<uint32_t>(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-    if (threadIdx.x == 0)
-        seen_distinct_total = 0;
-    __syncthreads();
-    
-    // can return only after helping initializing shared memory
-    if (warp_id >= my_touching_count) return;
-    
-    // TOOD: could optimize by iterating directly on pointers
-    for (uint32_t touching_hedge_idx = warp_id; touching_hedge_idx < my_touching_count; touching_hedge_idx += warps_per_block) { // the block loops over touching hedges
-        if (touching_hedge_idx < my_touching_count) {
-            const uint32_t my_hedge_idx = my_touching[touching_hedge_idx];
-            const uint32_t* my_hedge = hedges + hedges_offsets[my_hedge_idx];
-            //const uint32_t* not_my_hedge = hedges + hedges_offsets[my_hedge_idx + 1];
-            const uint32_t my_hedge_size = hedges_offsets[my_hedge_idx + 1] - hedges_offsets[my_hedge_idx];
-            for (uint32_t node_idx = lane_id; node_idx < my_hedge_size; node_idx += WARP_SIZE) { // the warp loops over hedge pins
-                if (node_idx < my_hedge_size) {
-                    uint32_t neighbor = my_hedge[node_idx];
-                    if (neighbor != node_id && sm_hashset_insert(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, neighbor))
-                        seen_distinct++;
-                }
-            }
-        }
-    }
-
-    // reduce distinct counts per-warp
-    seen_distinct = warpReduceSum<uint32_t>(seen_distinct);
-
-    // accumulate counts per-block
-    if (lane_id == 0)
-        atomicAdd(&seen_distinct_total, seen_distinct);
-    __syncthreads();
-
-    if (threadIdx.x == 0)
-        neighbors_offsets[node_id] = seen_distinct_total;
-}
-
-// compute the distinct neighbors of each node (again) and write them at the pre-computed offsets in global memory
-// SEQUENTIAL COMPLEXITY: n*h*d
-// PARALLEL OVER: n
-__global__
-void neighborhoods_scatter_kernel(
-    const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
-    const uint32_t num_nodes,
-    const uint32_t* __restrict__ neighbors_offsets,
+    const size_t max_neighbors,
     uint32_t* __restrict__ neighbors
 ) {
     // STYLE: one node per block, one touching hedge per warp, distinct neighbors in shared memory!
@@ -110,16 +38,14 @@ void neighborhoods_scatter_kernel(
     //const uint32_t* not_my_touching = touching + touching_offsets[node_id + 1];
     const uint32_t my_touching_count = touching_offsets[node_id + 1] - touching_offsets[node_id];
 
-    uint32_t* my_neighbors = neighbors + neighbors_offsets[node_id];
+    uint32_t* my_neighbors = neighbors + node_id * max_neighbors;
 
-    // hash-set for deduplication
+    // hash-set for deduplication (allows false-negatives, back it up with true deduplication in global memory)
     __shared__ uint32_t dedupe[SM_MAX_DEDUPE_BUFFER_SIZE];
-    __shared__ uint32_t seen_distinct_total;
     
     // initialize shared memory
-    sm_init<uint32_t>(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-    if (threadIdx.x == 0)
-        seen_distinct_total = 0;
+    blk_init<uint32_t>(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    blk_init<uint32_t>(my_neighbors, max_neighbors, HASH_EMPTY);
     __syncthreads();
 
     // can return only after helping initializing shared memory
@@ -135,21 +61,14 @@ void neighborhoods_scatter_kernel(
             for (uint32_t node_idx = lane_id; node_idx < my_hedge_size; node_idx += WARP_SIZE) { // the warp loops over hedge pins
                 if (node_idx < my_hedge_size) {
                     uint32_t neighbor = my_hedge[node_idx];
-                    if (neighbor != node_id && sm_hashset_insert(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, neighbor)) {
-                        uint32_t offset = atomicAdd(&seen_distinct_total, 1); // returns the value as it was before the increment (reserving that idx)
-                        my_neighbors[offset] = neighbor;
+                    if (neighbor != node_id && sm_hashset_try_insert(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, neighbor)) {
+                        gm_hashset_insert(my_neighbors, max_neighbors, neighbor); // triggers an assert if 'max_neighbors' is exceeded
                     }
                 }
             }
         }
     }
-
-    // TODO: could remove this, but for now keep it, just to make sure the hash-set is deterministic
-    __syncthreads();
-    if (threadIdx.x == 0)
-        assert(neighbors_offsets[node_id + 1] - neighbors_offsets[node_id] == seen_distinct_total);
 }
-
 
 // find the best neighbor for each node to stay with (edge-coarsening)
 // SEQUENTIAL COMPLEXITY: n*h*d + n*(# neighbors)*h
@@ -207,14 +126,14 @@ void candidates_kernel(
     // all threads in the warp should agree on those...
     // TODO: only keep these in lane 0!
     uint32_t best_score[MAX_CANDIDATES];
-    lm_init<uint32_t>(best_score, MAX_CANDIDATES, 0);
+    thr_init<uint32_t>(best_score, MAX_CANDIDATES, 0);
     uint32_t best_neighbor[MAX_CANDIDATES];
-    lm_init<uint32_t>(best_neighbor, MAX_CANDIDATES, UINT32_MAX);
+    thr_init<uint32_t>(best_neighbor, MAX_CANDIDATES, UINT32_MAX);
 
     // handle HIST_SIZE neighbors at a time
     for (; my_neighbors < not_my_neighbors; my_neighbors += HIST_SIZE) {
-        wm_init<uint32_t>(histogram_node, HIST_SIZE, UINT32_MAX);
-        wm_init<uint32_t>(histogram_score, HIST_SIZE, 0u);
+        wrp_init<uint32_t>(histogram_node, HIST_SIZE, UINT32_MAX);
+        wrp_init<uint32_t>(histogram_score, HIST_SIZE, 0u);
         __syncwarp();
 
         // load the first HIST_SIZE neighbors and setup per-thread local histograms
@@ -607,7 +526,7 @@ void apply_coarsening_hedges_count(
     // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
     uint32_t pins[MAX_DEDUPE_BUFFER_SIZE];
     // TODO: maybe "memset(pins, 0xFF, sizeof(pins))" is faster?
-    lm_init<uint32_t>(pins, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    thr_init<uint32_t>(pins, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
 
     for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
         const uint32_t pin = groups[*curr]; // read and map pin to its new id
@@ -653,7 +572,7 @@ void apply_coarsening_hedges_scatter(
     uint32_t distinct = 0;
     // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
     uint32_t pins[MAX_DEDUPE_BUFFER_SIZE];
-    lm_init<uint32_t>(pins, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    thr_init<uint32_t>(pins, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
 
     for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) { // first pin is the src, always preserved
         const uint32_t pin = groups[*curr]; // read and map pin to its new id
@@ -708,7 +627,7 @@ void apply_coarsening_neighbors_count(
     uint32_t distinct = 0;
     // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
     uint32_t new_neighbors[MAX_LARGE_DEDUPE_BUFFER_SIZE];
-    lm_init<uint32_t>(new_neighbors, MAX_LARGE_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    thr_init<uint32_t>(new_neighbors, MAX_LARGE_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
 
     // for every original node in the group, go over its touching set
     for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
@@ -757,7 +676,7 @@ void apply_coarsening_neighbors_scatter(
     uint32_t distinct = 0;
     // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
     uint32_t new_neighbors[MAX_LARGE_DEDUPE_BUFFER_SIZE];
-    lm_init<uint32_t>(new_neighbors, MAX_LARGE_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    thr_init<uint32_t>(new_neighbors, MAX_LARGE_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
 
     // for every original node in the group, go over its touching set
     for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
@@ -813,7 +732,7 @@ void apply_coarsening_touching_count(
     // TODO: initialize shared memory
     // in utils.cuh : #define SM_MAX_HASHMAP_SIZE 4096u ?
     //__shared__ hashmap_entry hashmap[SM_MAX_HASHMAP_SIZE];
-    //sm_init<uint32_t>(hashmap, SM_MAX_HASHMAP_SIZE*2, HASH_EMPTY);
+    //blk_init<uint32_t>(hashmap, SM_MAX_HASHMAP_SIZE*2, HASH_EMPTY);
 
     for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
         const uint32_t pin = *curr; // already a group id
@@ -867,7 +786,7 @@ void apply_coarsening_touching_scatter(
     uint32_t distinct = 0u;
     // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
     uint32_t new_touching[MAX_DEDUPE_BUFFER_SIZE];
-    lm_init<uint32_t>(new_touching, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    thr_init<uint32_t>(new_touching, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
 
     // for every original node in the group, go over its inbound set
     for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {

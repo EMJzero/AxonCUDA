@@ -9,27 +9,30 @@
 // TODO: determine this at runtime w.r.t. the mean and variance of the spike frequency!
 #define FIXED_POINT_SCALE 262144u // used to convert scores to fixed point
 
-// initialize shared memory: one consecutive chunk per warp
+// initialize memory for a block of threads: one consecutive chunk per warp
+// => the memory can be shared memory or global alike, so long as each location is exclusive to a block
 template <typename T>
-__device__ __forceinline__ void sm_init(T* sm, const uint32_t size, const T val) {
+__device__ __forceinline__ void blk_init(T* sm, const uint32_t size, const T val) {
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane_id = threadIdx.x & (WARP_SIZE - 1);
-    const int num_warps = blockDim.x / WARP_SIZE;
+    const int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
     for (int i = warp_id * WARP_SIZE + lane_id; i < size; i += num_warps * WARP_SIZE)
         sm[i] = val;
 }
 
-// initialize per-warp shared memory: for shared memory dedicated to a single warp
+// initialize per-warp memory: for shared memory dedicated to a single warp
+// => the memory can be shared memory or global alike, so long as each location is exclusive to a warp
 template <typename T>
-__device__ __forceinline__ void wm_init(T* sm, const uint32_t size, const T val) {
+__device__ __forceinline__ void wrp_init(T* sm, const uint32_t size, const T val) {
     const int lane_id = threadIdx.x & (WARP_SIZE - 1);
     for (int i = lane_id; i < size; i += WARP_SIZE)
         sm[i] = val;
 }
 
-// initialize local memory
+// initialize per-thread memory
+// => the memory can be local memory or global alike, so long as each location is exclusive to a thread
 template <typename T>
-__device__ __forceinline__ void lm_init(T* lm, const uint32_t size, const T val) {
+__device__ __forceinline__ void thr_init(T* lm, const uint32_t size, const T val) {
     for (int i = 0; i < size; i++)
         lm[i] = val;
 }
@@ -190,6 +193,7 @@ struct masked_value_functor {
 // TODO: replace all "%" operations in those helpers!!!!
 
 #define HASH_EMPTY 0xFFFFFFFFu
+#define MAX_HASH_PROBE_LENGTH 16
 
 // simple 32-bit hash, should be good enough for a small shared-memory hash-set
 __device__ __forceinline__ uint32_t hash_uint32(uint32_t x) {
@@ -203,14 +207,29 @@ __device__ __forceinline__ uint32_t hash_uint32(uint32_t x) {
     return x;
 }
 
+// fairly cheaper hash, still acceptable for a large, partly empty hash-set
+__device__ __forceinline__ uint32_t hash_uint32_mad(uint32_t x) {
+    x ^= x >> 15;
+    x = x * 0x2C1B3C6Du + 0x297A2D39u;
+    x ^= x >> 12;
+    return x;
+}
+
+// stupidly fash hash, only good to uniformly spread out buckets of contigous ids, indexes, or counters
+__device__ __forceinline__ uint32_t hash_uint32_linear(uint32_t x) {
+    return x * 0x9E3779B9u;
+}
+
 // SHARED MEMORY VERSION
+// => shared among threads, needs atomics
 
 // insert a value into a shared-memory hash-set, returns "true" if the value was not in the set before
 __device__ __forceinline__ bool sm_hashset_insert(uint32_t* table, const uint32_t size, const uint32_t value) {
-    uint32_t h = hash_uint32(value);
+    const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
-        int slot_idx = (idx + probe) % size;
+        int slot_idx = idx + probe;
+        if (slot_idx >= size) slot_idx -= size; // TODO: maybe "slot_idx -= size * (slot_idx >= size)" is faster?
         uint32_t* slot = &table[slot_idx];
         uint32_t old = atomicCAS(slot, HASH_EMPTY, value);
         if (old == HASH_EMPTY)
@@ -223,12 +242,33 @@ __device__ __forceinline__ bool sm_hashset_insert(uint32_t* table, const uint32_
     return false; // unreachable, but keeps compiler happy
 }
 
+// tries to insert a value into a shared-memory hash-set, returns "true" if the value was not in the set before OR if the set is full
+// => this admits false negatives! It never goes and checks the whole hash-set, so the value could have already been there but not be seen!
+__device__ __forceinline__ bool sm_hashset_try_insert(uint32_t* table, const uint32_t size, const uint32_t value) {
+    const uint32_t h = hash_uint32(value);
+    int idx = h % size;
+    for (int probe = 0; probe < MAX_HASH_PROBE_LENGTH && probe < size; ++probe) {
+        int slot_idx = idx + probe;
+        if (slot_idx >= size) slot_idx -= size;
+        uint32_t* slot = &table[slot_idx];
+        uint32_t old = atomicCAS(slot, HASH_EMPTY, value);
+        if (old == HASH_EMPTY)
+            return true; // new value
+        if (old == value)
+            return false; // value already present
+        // else: collision with a different value, keep probing
+    }
+    // could not find a spot nor the element, give up
+    return true;
+}
+
 // lookup a value into a shared-memory hash-set, returns "true" if the value was found
 __device__ __forceinline__ bool sm_hashset_contains(const uint32_t* table, const uint32_t size, const uint32_t value) {
-    uint32_t h = hash_uint32(value);
+    const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
-        int slot_idx = (idx + probe) % size;
+        int slot_idx = idx + probe;
+        if (slot_idx >= size) slot_idx -= size;
         uint32_t cur = table[slot_idx];
         if (cur == value)
             return true;
@@ -241,12 +281,14 @@ __device__ __forceinline__ bool sm_hashset_contains(const uint32_t* table, const
 }
 
 // LOCAL MEMORY VERSION
+// => private to each thread, does not need atomics
 
 __device__ __forceinline__ bool lm_hashset_insert(uint32_t* table, const uint32_t size, const uint32_t value) {
-    uint32_t h = hash_uint32(value);
+    const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
-        int slot_idx = (idx + probe) % size;
+        int slot_idx = idx + probe;
+        if (slot_idx >= size) slot_idx -= size;
         uint32_t cur = table[slot_idx];
         if (cur == HASH_EMPTY) {
             table[slot_idx] = value;
@@ -260,10 +302,48 @@ __device__ __forceinline__ bool lm_hashset_insert(uint32_t* table, const uint32_
 }
 
 __device__ __forceinline__ bool lm_hashset_contains(const uint32_t* table, const uint32_t size, const uint32_t value) {
-    uint32_t h = hash_uint32(value);
+    const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
-        int slot_idx = (idx + probe) % size;
+        int slot_idx = idx + probe;
+        if (slot_idx >= size) slot_idx -= size;
+        uint32_t cur = table[slot_idx];
+        if (cur == value)
+            return true;
+        if (cur == HASH_EMPTY)
+            return false;
+    }
+    return false;
+}
+
+
+// GLOBAL MEMORY VERSION
+// => shared among threads, needs atomics
+// => assumed to store indices or other uniformly-spread content, therefore it uses 'hash_uint32_linear'
+
+__device__ __forceinline__ bool gm_hashset_insert(uint32_t* table, uint32_t size, uint32_t value) {
+    const uint32_t h = hash_uint32_linear(value);
+    int idx = h % size;
+    for (int probe = 0; probe < size; ++probe) {
+        int slot_idx = idx + probe;
+        if (slot_idx >= size) slot_idx -= size;
+        uint32_t* slot = &table[slot_idx];
+        uint32_t old = atomicCAS(slot, HASH_EMPTY, value);
+        if (old == HASH_EMPTY)
+            return true;
+        if (old == value)
+            return false;
+    }
+    assert(false && "GM hash-set full!");
+    return false;
+}
+
+__device__ __forceinline__ bool gm_hashset_contains(const uint32_t* table, uint32_t size, uint32_t value) {
+    const uint32_t h = hash_uint32_linear(value);
+    int idx = h % size;
+    for (int probe = 0; probe < size; ++probe) {
+        int slot_idx = idx + probe;
+        if (slot_idx >= size) slot_idx -= size;
         uint32_t cur = table[slot_idx];
         if (cur == value)
             return true;
@@ -276,9 +356,10 @@ __device__ __forceinline__ bool lm_hashset_contains(const uint32_t* table, const
 
 //  HASH-MAP
 
-// NOTE: this reuses defines and hash function from the hash-set above
+// NOTE: this reuses defines and hash functions from the hash-set above
 
 // SHARED MEMORY VERSION
+// => shared among threads, needs atomics
 
 typedef struct {
     uint32_t key;
@@ -286,10 +367,11 @@ typedef struct {
 } hashmap_entry;
 
 __device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t value) {
-    uint32_t h = hash_uint32(key);
+    const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
-        int slot = (idx + probe) % size;
+        int slot = idx + probe;
+        if (slot >= size) slot -= size;
         uint32_t* key_ptr = &table[slot].key;
         // TODO: the CAS is slow, not needed when this is used inside a warp only!
         uint32_t old_key  = atomicCAS(key_ptr, HASH_EMPTY, key);
@@ -308,10 +390,11 @@ __device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* table, const ui
 }
 
 __device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t* out_value) {
-    uint32_t h = hash_uint32(key);
+    const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
-        int slot = (idx + probe) % size;
+        int slot = idx + probe;
+        if (slot >= size) slot -= size;
         uint32_t cur_key = table[slot].key;
         if (cur_key == key) {
             *out_value = table[slot].value;
@@ -326,12 +409,14 @@ __device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* table, co
 }
 
 // LOCAL MEMORY VERSION
+// => private to each thread, does not need atomics
 
 __device__ __forceinline__ bool lm_hashmap_insert(hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t value) {
-    uint32_t h = hash_uint32(key);
+    const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
-        int slot = (idx + probe) % size;
+        int slot = idx + probe;
+        if (slot >= size) slot -= size;
         uint32_t cur_key = table[slot].key;
         if (cur_key == HASH_EMPTY) {
             table[slot].key   = key;
@@ -348,10 +433,11 @@ __device__ __forceinline__ bool lm_hashmap_insert(hashmap_entry* table, const ui
 }
 
 __device__ __forceinline__ bool lm_hashmap_lookup(const hashmap_entry* table, const uint32_t size, uint32_t key, uint32_t* out_value) {
-    uint32_t h = hash_uint32(key);
+    const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
-        int slot = (idx + probe) % size;
+        int slot = idx + probe;
+        if (slot >= size) slot -= size;
         uint32_t cur_key = table[slot].key;
         if (cur_key == key) {
             *out_value = table[slot].value;
