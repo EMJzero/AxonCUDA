@@ -355,6 +355,55 @@ namespace hwmodel {
         PlacementMetrics getAllMetrics(
             const HyperGraph& part_snn,
             const std::vector<hwgeom::Coord2D>& placement) const;
+
+        // predefined harwdare models
+        static HardwareModel createLoihiLarge() {
+            HardwareModelConfig cfg_loihi_large;
+            cfg_loihi_large.name = "Loihi Large";
+            cfg_loihi_large.neurons_per_core = 1024;
+            cfg_loihi_large.synapses_per_core = 4096;
+            cfg_loihi_large.cores_per_chip_x = 64;
+            cfg_loihi_large.cores_per_chip_y = 64;
+            cfg_loihi_large.chips_per_system_x = 1;
+            cfg_loihi_large.chips_per_system_y = 1;
+            cfg_loihi_large.energy_per_routing = 1.7;
+            cfg_loihi_large.energy_per_wire = 3.5;
+            cfg_loihi_large.latency_per_routing = 2.1;
+            cfg_loihi_large.latency_per_wire = 5.3;
+            return HardwareModel(cfg_loihi_large);
+        };
+
+        static HardwareModel createLoihiJin84() {
+            HardwareModelConfig cfg_loihi_jin_84;
+            cfg_loihi_jin_84.name = "Loihi Jin 84";
+            cfg_loihi_jin_84.neurons_per_core = 4096;
+            cfg_loihi_jin_84.synapses_per_core = 1024*64;
+            cfg_loihi_jin_84.cores_per_chip_x = 84;
+            cfg_loihi_jin_84.cores_per_chip_y = 84;
+            cfg_loihi_jin_84.chips_per_system_x = 1;
+            cfg_loihi_jin_84.chips_per_system_y = 1;
+            cfg_loihi_jin_84.energy_per_routing = 1.0;
+            cfg_loihi_jin_84.energy_per_wire = 0.1;
+            cfg_loihi_jin_84.latency_per_routing = 1.0;
+            cfg_loihi_jin_84.latency_per_wire = 0.01;
+            return HardwareModel(cfg_loihi_jin_84);
+        };
+
+        static HardwareModel createTrueNorth() {
+            HardwareModelConfig cfg_truenorth;
+            cfg_truenorth.name = "TrueNorth";
+            cfg_truenorth.neurons_per_core = 256;
+            cfg_truenorth.synapses_per_core = 256;
+            cfg_truenorth.cores_per_chip_x = 64;
+            cfg_truenorth.cores_per_chip_y = 64;
+            cfg_truenorth.chips_per_system_x = 1;
+            cfg_truenorth.chips_per_system_y = 1;
+            cfg_truenorth.energy_per_routing = 1.7; // unknown (this is from Loihi)
+            cfg_truenorth.energy_per_wire = 3.5; // unknown (this is from Loihi)
+            cfg_truenorth.latency_per_routing = 2.1; // unknown (this is from Loihi)
+            cfg_truenorth.latency_per_wire = 5.3; // unknown (this is from Loihi)
+            return HardwareModel(cfg_truenorth);
+        };
     };
 
     std::vector<uint32_t> partitionSequential(const HyperGraph& hg, uint32_t N, uint32_t M, uint32_t K) {

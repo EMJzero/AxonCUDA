@@ -255,6 +255,8 @@ IDEA: postpone inbound size checks after computing scores!
 
 This could be slightly worse if you find a way to compress the histogram (fill in the empty spots left by invalid options).
 
+Note: runtime is not deterministic because neighbors are not sorted, so the number of time the costly constraint check on the inbound set, during the candidates kernel, runs depends on which histogram chunk each neighbor is in!
+
 ---
 
 Solution for deduping neighbors:
@@ -313,3 +315,17 @@ ISSUE: you can't resize memory allocations, you need to allocate double the amou
    Continue the process until you don't exceed SM's size anymore, aka you deduped everything.
 ISSUE: none, really, except if SM is too small to significantly reduce the size of the first array. If that happens, you could allocate a bit (user-controllable) of GM to help SM during every round!
        Maximum memory violated? Allocate more GM! Otherwise, allocate as little as needed and rely on SM!
+
+Final solution:
+- count+scatter kernels, one node per block
+- build the deduplicated neighborhood in the SM hash-set until you are about to insert in SM an element past its capacity, then stop and write the SM size as offset, also set a global flag per-node to signal that you didn't finish, plus write 1 to an identical flag shared among nodes (aka has anyone still not finished?)
+=> before inserting an element in SM, run a binary search to see if its already in GM (GM starts empty tho)
+- allocate in GM the size requested by each node and run the scatter that does exactly the same as the above kernel, but at last sorts SM's content and writes it to the new GM
+- repeat until you have no block that wants to continue
+||
+Only true solution for neighbors:
+- counting kernel, using 1.2x the maximum measured neighborhood size minus the SM hash table size in global memory
+- since you are only counting, no need to put in GM what alreay went in SM
+- now we need perfect deduplication in SM, but we can still put a cap on the probe length to avoid going over the whole table, IFF we set the same probe length both during insertion and query, because this way you know that there is no way a value can be further than "max probe length" from where the hash points, so no point in checking
+- after you have the count, instantiate the right amount of memory and scatter, using SM again for early deduplication, now backing its content on GM, and GM used again as an hash-set (for this, you can reuse the current implementation of the dedupe kernel)
+=> no need anymore for the costly (in terms of memory) thrust pipeline

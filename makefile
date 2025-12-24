@@ -35,23 +35,29 @@ $(TARGET): $(OBJS)
 # ==========================================
 # Argument extraction (for run and profile)
 # ==========================================
-RUN_ARG     := $(word 2, $(MAKECMDGOALS))
-PROFILE_ARG := $(word 2, $(MAKECMDGOALS))
+RUN_ARG_1     := $(word 2, $(MAKECMDGOALS))
+RUN_ARG_2     := $(word 3, $(MAKECMDGOALS))
+PROFILE_ARG_1 := $(word 2, $(MAKECMDGOALS))
+PROFILE_ARG_2 := $(word 3, $(MAKECMDGOALS))
 
 # Dummy rule to avoid "No rule to make target 'filename'"
-$(RUN_ARG) $(PROFILE_ARG):
+$(RUN_ARG1) $(RUN_ARG2) $(PROFILE_ARG1) $(PROFILE_ARG2):
 	@:
 
 # ==========================================
 # Commands
 # ==========================================
 # Run:
+#   make run
 #   make run <input_file>
+#   make run <input_file> <config_name>
 run: $(TARGET)
-	@if [ -z "$(RUN_ARG)" ]; then \
+	@if [ -z "$(RUN_ARG_1)" ]; then \
 		./$(TARGET); \
+	elif [ -z "$(RUN_ARG_2)" ]; then \
+		./$(TARGET) -r $(RUN_ARG_1); \
 	else \
-		./$(TARGET) -r $(RUN_ARG); \
+		./$(TARGET) -r $(RUN_ARG_1) -c $(RUN_ARG_2); \
 	fi
 
 #   make run8k
@@ -60,17 +66,23 @@ run8k: $(TARGET)
 
 # Profile:
 #   make profile <input_file>
+#   make profile <input_file> <config_name>
 profile: $(TARGET)
-	@if [ -z "$(PROFILE_ARG)" ]; then \
-		echo "Usage: make profile <input_file>"; \
+	@if [ -z "$(PROFILE_ARG_1)" ]; then \
+		echo "Usage: make profile <input_file> [cache_string]"; \
 		exit 1; \
+	elif [ -z "$(PROFILE_ARG_2)" ]; then \
+		nsys profile --stats=true --force-overwrite=true \
+			--output=$(TARGET)_profile \
+			./$(TARGET) -r $(PROFILE_ARG_1); \
+	else \
+		nsys profile --stats=true --force-overwrite=true \
+			--output=$(TARGET)_profile \
+			./$(TARGET) -r $(PROFILE_ARG_1) -c $(PROFILE_ARG_2); \
 	fi
-	nsys profile --stats=true --force-overwrite=true \
-		--output=$(TARGET)_profile \
-		./$(TARGET) -r $(PROFILE_ARG)
 
 # ==========================================
 clean:
 	rm -f $(TARGET) *.o *.qdrep *.nsys-rep *.sqlite
 
-.PHONY: all run profile clean
+.PHONY: all run run8k profile clean

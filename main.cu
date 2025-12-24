@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <filesystem>
 
 #include </home/mronzani/cuda/include/cuda_runtime.h>
@@ -291,7 +292,8 @@ void printHelp() {
         "  prog -h\n\n"
         "Options:\n"
         "  -r <file>   Reload hypergraph from file\n"
-        "  -s <file>   Save loaded hypergraph to file\n"
+        "  -s <file>   Save partitioned hypergraph to file\n"
+        "  -c <name>   Constraints set to use (valid ones: truenorth, loihi64, loihi84 - default is loihi64)\n"
         "  -h          Show this help\n";
 }
 
@@ -303,6 +305,7 @@ int main(int argc, char** argv) {
 
     std::string load_path;
     std::string save_path;
+    std::string constraints;
 
     // CLI handling
     for (int i = 1; i < argc; ++i) {
@@ -315,6 +318,10 @@ int main(int argc, char** argv) {
         else if (arg == "-s") {
             if (i + 1 >= argc) { std::cerr << "Error: -s requires a file path\n"; return 1; }
             save_path = argv[++i];
+        }
+        else if (arg == "-c") {
+            if (i + 1 >= argc) { std::cerr << "Error: -c requires a config name\n"; return 1; }
+            constraints = argv[++i];
         }
         else { std::cerr << "Unknown option: " << arg << "\n"; return 1; }
     }
@@ -346,50 +353,20 @@ int main(int argc, char** argv) {
     }
 
     // setup the hardware model
-    HardwareModelConfig cfg_loihi_large;
-        cfg_loihi_large.name = "Loihi Large";
-        cfg_loihi_large.neurons_per_core = 1024;
-        cfg_loihi_large.synapses_per_core = 4096;
-        cfg_loihi_large.cores_per_chip_x = 64;
-        cfg_loihi_large.cores_per_chip_y = 64;
-        cfg_loihi_large.chips_per_system_x = 1;
-        cfg_loihi_large.chips_per_system_y = 1;
-        cfg_loihi_large.energy_per_routing = 1.7;
-        cfg_loihi_large.energy_per_wire = 3.5;
-        cfg_loihi_large.latency_per_routing = 2.1;
-        cfg_loihi_large.latency_per_wire = 5.3;
-    HardwareModel loihi_large(cfg_loihi_large);
-
-    HardwareModelConfig cfg_loihi_jin_84;
-        cfg_loihi_jin_84.name = "Loihi Jin 84";
-        cfg_loihi_jin_84.neurons_per_core = 4096;
-        cfg_loihi_jin_84.synapses_per_core = 1024*64;
-        cfg_loihi_jin_84.cores_per_chip_x = 84;
-        cfg_loihi_jin_84.cores_per_chip_y = 84;
-        cfg_loihi_jin_84.chips_per_system_x = 1;
-        cfg_loihi_jin_84.chips_per_system_y = 1;
-        cfg_loihi_jin_84.energy_per_routing = 1.0;
-        cfg_loihi_jin_84.energy_per_wire = 0.1;
-        cfg_loihi_jin_84.latency_per_routing = 1.0;
-        cfg_loihi_jin_84.latency_per_wire = 0.01;
-    HardwareModel loihi_jin_84(cfg_loihi_jin_84);
-
-    HardwareModelConfig cfg_truenorth;
-        cfg_truenorth.name = "TrueNorth";
-        cfg_truenorth.neurons_per_core = 256;
-        cfg_truenorth.synapses_per_core = 256;
-        cfg_truenorth.cores_per_chip_x = 64;
-        cfg_truenorth.cores_per_chip_y = 64;
-        cfg_truenorth.chips_per_system_x = 1;
-        cfg_truenorth.chips_per_system_y = 1;
-        cfg_truenorth.energy_per_routing = 1.7; // unknown (this is from Loihi)
-        cfg_truenorth.energy_per_wire = 3.5; // unknown (this is from Loihi)
-        cfg_truenorth.latency_per_routing = 2.1; // unknown (this is from Loihi)
-        cfg_truenorth.latency_per_wire = 5.3; // unknown (this is from Loihi)
-    HardwareModel truenorth(cfg_truenorth);
-
-    // set the hardware model
-    HardwareModel hw = loihi_large;
+    std::optional<HardwareModel> hw_tmp;
+    std::unordered_map<std::string, HardwareModel (*)()> configurations {
+        { "loihi64", HardwareModel::createLoihiLarge },
+        { "loihi84", HardwareModel::createLoihiJin84 },
+        { "truenorth", HardwareModel::createTrueNorth }
+    };
+    auto hw_it = configurations.find(constraints);
+    if (hw_it == configurations.end()) {
+        std::cerr << "WARNING, no constraints provided (-c), using loihi64 !!\n";
+        hw_tmp = HardwareModel::createLoihiLarge();
+    } else {
+        hw_tmp = hw_it->second();
+    }
+    HardwareModel &hw = *hw_tmp;
 
     std::cout << "Using hardware model \"" << hw.name() << "\":\n";
     std::cout << "  Neurons per core:  " << hw.neuronsPerCore() << "\n";
@@ -1100,7 +1077,7 @@ int main(int argc, char** argv) {
         #endif
         // =============================
 
-        std::cout << "Refining level " << level_idx << ", remaining nodes=" << curr_num_nodes << "number of partitions=" << num_partitions << "\n";
+        std::cout << "Refining level " << level_idx << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << num_partitions << "\n";
 
         // prepare this level's pins per partition
         CUDA_CHECK(cudaMemset(d_pins_per_partitions, 0x00, num_hedges * num_partitions * sizeof(uint32_t)));
@@ -1596,9 +1573,6 @@ int main(int argc, char** argv) {
         std::cout << "  Total pins:  " << partitioned_hg.hedgesFlat().size() << "\n";
         std::cout << "  Total Spike Frequency: " << partitioned_hg.totalSpikeFrequency() << "\n";
         std::cout << "  Synaptic reuse:        " << std::fixed << std::setprecision(3) << synaptic_reuse.ar_mean << " ar. mean, " << synaptic_reuse.geo_mean << " geo. mean\n";
-    } else {
-        std::cerr << "WARNING, invalid partitining !!\n";
-    }
 
     // save hypergraph
     if (!save_path.empty()) {
@@ -1608,12 +1582,15 @@ int main(int argc, char** argv) {
         }
         try {
             // TODO: apply the partitioning before saving!
-            hg.save(save_path);
-            std::cout << "Saved to " << save_path << "\n";
+                partitioned_hg.save(save_path);
+                std::cout << "Partitioned hypergraph saved to " << save_path << "\n";
         } catch (const std::exception& e) {
             std::cerr << "Error saving file: " << e.what() << "\n";
             return 1;
         }
+        }
+    } else {
+        std::cerr << "WARNING, invalid partitining !!\n";
     }
 
     return 0;
