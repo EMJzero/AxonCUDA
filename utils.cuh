@@ -61,6 +61,7 @@ __forceinline__ __device__ T warpReduceSumLN0(T val) {
 // USED BY: neighborhoods kernel
 
 #define SM_MAX_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
+#define GM_MIN_DEDUPE_BUFFER_SIZE 256u
 
 
 // USED BY: candidates kernel
@@ -193,7 +194,7 @@ struct masked_value_functor {
 // TODO: replace all "%" operations in those helpers!!!!
 
 #define HASH_EMPTY 0xFFFFFFFFu
-#define MAX_HASH_PROBE_LENGTH 16
+#define MAX_HASH_PROBE_LENGTH 32u
 
 // simple 32-bit hash, should be good enough for a small shared-memory hash-set
 __device__ __forceinline__ uint32_t hash_uint32(uint32_t x) {
@@ -242,9 +243,10 @@ __device__ __forceinline__ bool sm_hashset_insert(uint32_t* __restrict__ table, 
     return false; // unreachable, but keeps compiler happy
 }
 
-// tries to insert a value into a shared-memory hash-set, returns "true" if the value was not in the set before OR if the set is full
+// tries to insert a value into a shared-memory hash-set, returns "true (1)" if the value was not in the set before OR "true (2)" if the set is full,
+// returns instead "false (0)" if the element is already in the hash-set
 // => this admits false negatives! It never goes and checks the whole hash-set, so the value could have already been there but not be seen!
-__device__ __forceinline__ bool sm_hashset_try_insert(uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
+__device__ __forceinline__ uint8_t sm_hashset_try_insert(uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
     const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < MAX_HASH_PROBE_LENGTH && probe < size; ++probe) {
@@ -253,13 +255,13 @@ __device__ __forceinline__ bool sm_hashset_try_insert(uint32_t* __restrict__ tab
         uint32_t* slot = &table[slot_idx];
         uint32_t old = atomicCAS(slot, HASH_EMPTY, value);
         if (old == HASH_EMPTY)
-            return true; // new value
+            return 1; // "true (1)": new value
         if (old == value)
-            return false; // value already present
+            return false; // "false(0)": value already present
         // else: collision with a different value, keep probing
     }
-    // could not find a spot nor the element, give up
-    return true;
+    // "true (2)": could not find a spot nor the element, give up
+    return 2;
 }
 
 // lookup a value into a shared-memory hash-set, returns "true" if the value was found

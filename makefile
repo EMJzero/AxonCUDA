@@ -26,10 +26,10 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(NVCC) $(LINKFLAGS) -o $@ $^
 
-%.o: %.cpp hgraph.hpp
+%.o: %.cpp hgraph.hpp nmhardware.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-%.o: %.cu hgraph.hpp utils.cuh
+%.o: %.cu hgraph.hpp nmhardware.hpp utils.cuh
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 # ==========================================
