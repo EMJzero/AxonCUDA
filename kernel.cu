@@ -12,22 +12,25 @@ __constant__ uint32_t max_inbound_per_part;
 
 // REMEMBER: "const" means the data pointed to is not modified, not the pointer itself!
 
+// TODO: upgrade to "uint64_t" to handle >4M nodes, >4M touching per node, >4M pins per hedge, >4M neighbors per node!
+
 // compute the distinct neighbors count of each node, aided by a global hash-set
 // SEQUENTIAL COMPLEXITY: n*h*d
 // PARALLEL OVER: n
 __global__
 void neighborhoods_count_kernel(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const uint32_t num_nodes,
-    const size_t max_neighbors,
+    const dim_t max_neighbors,
     uint32_t* __restrict__ neighbors,
-    uint32_t* __restrict__ neighbors_offsets // here filled as counters of "how many neighbors per node" -> then do a prefix sum for the offsets
+    dim_t* __restrict__ neighbors_offsets // here filled as counters of "how many neighbors per node" -> then do a prefix sum for the offsets
 ) {
     // STYLE: one node per block, one touching hedge per warp, distinct neighbors in shared memory!
     const uint32_t node_id = blockIdx.x;
+    // NOTE: the whole block returns, no need to sync
     if (node_id >= num_nodes) return;
 
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
@@ -37,9 +40,10 @@ void neighborhoods_count_kernel(
 
     const uint32_t* my_touching = touching + touching_offsets[node_id];
     //const uint32_t* not_my_touching = touching + touching_offsets[node_id + 1];
-    const uint32_t my_touching_count = touching_offsets[node_id + 1] - touching_offsets[node_id];
+    const uint32_t my_touching_count = (uint32_t)(touching_offsets[node_id + 1] - touching_offsets[node_id]);
 
     // no touching hedges, return immediately
+    // NOTE: the whole block returns, no need to sync
     if (my_touching_count == 0) {
         if (threadIdx.x == 0)
             neighbors_offsets[node_id] = 0;
@@ -50,6 +54,7 @@ void neighborhoods_count_kernel(
 
     // hash-set for deduplication (allows false-negatives, back it up with true deduplication in global memory)
     __shared__ uint32_t dedupe[SM_MAX_DEDUPE_BUFFER_SIZE];
+    // HP: each node has less than UINT32_MAX neighbors
     __shared__ uint32_t seen_distinct_total;
     uint32_t seen_distinct = 0;
     
@@ -69,7 +74,7 @@ void neighborhoods_count_kernel(
             const uint32_t my_hedge_idx = my_touching[touching_hedge_idx];
             const uint32_t* my_hedge = hedges + hedges_offsets[my_hedge_idx];
             //const uint32_t* not_my_hedge = hedges + hedges_offsets[my_hedge_idx + 1];
-            const uint32_t my_hedge_size = hedges_offsets[my_hedge_idx + 1] - hedges_offsets[my_hedge_idx];
+            const uint32_t my_hedge_size = (uint32_t)(hedges_offsets[my_hedge_idx + 1] - hedges_offsets[my_hedge_idx]);
             for (uint32_t node_idx = lane_id; node_idx < my_hedge_size; node_idx += WARP_SIZE) { // the warp loops over hedge pins
                 if (node_idx < my_hedge_size) {
                     uint32_t neighbor = my_hedge[node_idx];
@@ -95,7 +100,7 @@ void neighborhoods_count_kernel(
     __syncthreads();
 
     if (threadIdx.x == 0)
-        neighbors_offsets[node_id] = seen_distinct_total;
+        neighbors_offsets[node_id] = (dim_t)seen_distinct_total;
 }
 
 // compute the distinct neighbors of each node (again) and write them at the pre-computed offsets in global memory (handled as a hash-set)
@@ -104,11 +109,11 @@ void neighborhoods_count_kernel(
 __global__
 void neighborhoods_scatter_kernel(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const uint32_t num_nodes,
-    const uint32_t* __restrict__ neighbors_offsets,
+    const dim_t* __restrict__ neighbors_offsets,
     uint32_t* __restrict__ neighbors
 ) {
     // STYLE: one node per block, one touching hedge per warp, distinct neighbors in shared memory!
@@ -122,10 +127,10 @@ void neighborhoods_scatter_kernel(
 
     const uint32_t* my_touching = touching + touching_offsets[node_id];
     //const uint32_t* not_my_touching = touching + touching_offsets[node_id + 1];
-    const uint32_t my_touching_count = touching_offsets[node_id + 1] - touching_offsets[node_id];
+    const uint32_t my_touching_count = (uint32_t)(touching_offsets[node_id + 1] - touching_offsets[node_id]);
 
     uint32_t* my_neighbors = neighbors + neighbors_offsets[node_id];
-    const uint32_t my_neighbors_count = neighbors_offsets[node_id + 1] - neighbors_offsets[node_id];
+    const uint32_t my_neighbors_count = (uint32_t)(neighbors_offsets[node_id + 1] - neighbors_offsets[node_id]);
 
     // hash-set for deduplication
     __shared__ uint32_t dedupe[SM_MAX_DEDUPE_BUFFER_SIZE];
@@ -144,7 +149,7 @@ void neighborhoods_scatter_kernel(
             const uint32_t my_hedge_idx = my_touching[touching_hedge_idx];
             const uint32_t* my_hedge = hedges + hedges_offsets[my_hedge_idx];
             //const uint32_t* not_my_hedge = hedges + hedges_offsets[my_hedge_idx + 1];
-            const uint32_t my_hedge_size = hedges_offsets[my_hedge_idx + 1] - hedges_offsets[my_hedge_idx];
+            const uint32_t my_hedge_size = (uint32_t)(hedges_offsets[my_hedge_idx + 1] - hedges_offsets[my_hedge_idx]);
             for (uint32_t node_idx = lane_id; node_idx < my_hedge_size; node_idx += WARP_SIZE) { // the warp loops over hedge pins
                 if (node_idx < my_hedge_size) {
                     uint32_t neighbor = my_hedge[node_idx];
@@ -163,11 +168,11 @@ void neighborhoods_scatter_kernel(
 __global__
 void candidates_kernel(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ neighbors,
-    const uint32_t* __restrict__ neighbors_offsets,
+    const dim_t* __restrict__ neighbors_offsets,
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const uint32_t* __restrict__ inbound_count,
     const float* __restrict__ hedge_weights,
     const uint32_t* __restrict__ nodes_sizes,
@@ -206,7 +211,7 @@ void candidates_kernel(
 
     const uint32_t* my_neighbors = neighbors + neighbors_offsets[warp_id];
     const uint32_t* not_my_neighbors = neighbors + neighbors_offsets[warp_id + 1];
-    uint32_t neighbors_count = neighbors_offsets[warp_id + 1] - neighbors_offsets[warp_id];
+    uint32_t neighbors_count = (uint32_t)(neighbors_offsets[warp_id + 1] - neighbors_offsets[warp_id]);
     extern __shared__ uint32_t histogram[];
     uint32_t* histogram_node = histogram + 2 * HIST_SIZE * (threadIdx.x / WARP_SIZE);
     uint32_t* histogram_score = histogram + 2 * HIST_SIZE * (threadIdx.x / WARP_SIZE) + HIST_SIZE;
@@ -266,8 +271,7 @@ void candidates_kernel(
         // iterate over touching hyperedges
         // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
         for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-            uint32_t my_hedge_offset;
-            uint32_t not_my_hedge_offset;
+            dim_t my_hedge_offset, not_my_hedge_offset;
             uint32_t my_hedge_weight;
             if (lane_id == 0) {
                 const uint32_t actual_hedge_idx = *hedge_idx;
@@ -303,7 +307,8 @@ void candidates_kernel(
                 curr_neighbor = histogram_node[candidate];
             curr_neighbor = __shfl_sync(0xFFFFFFFF, curr_neighbor, 0);
             if (curr_neighbor == UINT32_MAX) break;
-            uint32_t neighbor_touching_offsets, neighbor_inbound_count, curr_score;
+            uint32_t curr_score, neighbor_inbound_count;
+            dim_t neighbor_touching_offsets;
             if (lane_id == 0) {
                 curr_score = histogram_score[candidate];
                 neighbor_touching_offsets = touching_offsets[curr_neighbor];
@@ -592,10 +597,10 @@ void grouping_kernel(
 __global__
 void apply_coarsening_hedges_count(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t num_hedges,
     const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
-    uint32_t* __restrict__ coarse_hedges_offsets // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
+    dim_t* __restrict__ coarse_hedges_offsets // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
 ) {
     // STYLE: one hedge per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -613,7 +618,7 @@ void apply_coarsening_hedges_count(
     *   and reditect additional entries to atomically incremented global counters (issue: musre ensure the src is preserved!!)
     */
 
-    const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
+    const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
     uint32_t distinct = 0;
     // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
@@ -630,7 +635,7 @@ void apply_coarsening_hedges_count(
     }
 
     // leave the first entry to be 0 (offset of the first hedge)
-    coarse_hedges_offsets[tid + 1] = distinct;
+    coarse_hedges_offsets[tid + 1] = (dim_t)distinct;
 }
 
 // write the new distinct pins of hedges
@@ -639,10 +644,10 @@ void apply_coarsening_hedges_count(
 __global__
 void apply_coarsening_hedges_scatter(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t num_hedges,
     const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
-    const uint32_t* __restrict__ coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
+    const dim_t* __restrict__ coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
     uint32_t* __restrict__ coarse_hedges
 ) {
     // STYLE: one hedge per thread!
@@ -657,10 +662,10 @@ void apply_coarsening_hedges_scatter(
     *    deduplicates the outbound, hedges preserve the notion of outbound! The two are complementary!
     */
 
-    const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
+    const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
-    const uint32_t coarse_hedge_start_idx = coarse_hedges_offsets[tid];
-    const uint32_t coarse_hedge_size = coarse_hedges_offsets[tid + 1] - coarse_hedges_offsets[tid];
+    const dim_t coarse_hedge_start_idx = coarse_hedges_offsets[tid];
+    const uint32_t coarse_hedge_size = (uint32_t)(coarse_hedges_offsets[tid + 1] - coarse_hedges_offsets[tid]);
     uint32_t *coarse_hedge_start = coarse_hedges + coarse_hedge_start_idx;
     uint32_t distinct = 0;
     // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
@@ -684,12 +689,12 @@ void apply_coarsening_hedges_scatter(
 __global__
 void apply_coarsening_neighbors_count(
     const uint32_t* __restrict__ neighbors,
-    const uint32_t* __restrict__ neighbors_offsets,
+    const dim_t* __restrict__ neighbors_offsets,
     const uint32_t* __restrict__ groups, // groups[node id] -> node's group id
     const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const uint32_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
+    const dim_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
     const uint32_t num_groups,
-    uint32_t* __restrict__ coarse_neighbors_offsets // group id -> count of distinct neighbors
+    dim_t* __restrict__ coarse_neighbors_offsets // group id -> count of distinct neighbors
 ) {
     // STYLE: one group (new node) per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -715,7 +720,7 @@ void apply_coarsening_neighbors_count(
     * - use the one-block per group or one-warp per group method and move the hash set in SM, also then have warps read neighbors in //
     */
 
-    const uint32_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
+    const dim_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
     const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
     uint32_t distinct = 0;
     // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
@@ -738,7 +743,7 @@ void apply_coarsening_neighbors_count(
     }
 
     // leave the first entry to be 0 (offset of the first set)
-    coarse_neighbors_offsets[tid + 1] = distinct;
+    coarse_neighbors_offsets[tid + 1] = (dim_t)distinct;
 }
 
 // write distinct neighbors
@@ -747,12 +752,12 @@ void apply_coarsening_neighbors_count(
 __global__
 void apply_coarsening_neighbors_scatter(
     const uint32_t* __restrict__ neighbors,
-    const uint32_t* __restrict__ neighbors_offsets,
+    const dim_t* __restrict__ neighbors_offsets,
     const uint32_t* __restrict__ groups, // groups[node id] -> node's group id
     const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const uint32_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
+    const dim_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
     const uint32_t num_groups,
-    const uint32_t* __restrict__ coarse_neighbors_offsets, // group id -> count of distinct neighbors
+    const dim_t* __restrict__ coarse_neighbors_offsets, // group id -> count of distinct neighbors
     uint32_t* __restrict__ coarse_neighbors
 ) {
     // STYLE: one group (new node) per thread!
@@ -761,10 +766,10 @@ void apply_coarsening_neighbors_scatter(
 
     // Idea: second part of "apply_coarsening_neighbors_count" -> scatter
 
-    const uint32_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
+    const dim_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
     const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
-    const uint32_t coarse_neighbors_start_idx = coarse_neighbors_offsets[tid];
-    const uint32_t coarse_neighbors_size = coarse_neighbors_offsets[tid + 1] - coarse_neighbors_offsets[tid];
+    const dim_t coarse_neighbors_start_idx = coarse_neighbors_offsets[tid];
+    const uint32_t coarse_neighbors_size = (uint32_t)(coarse_neighbors_offsets[tid + 1] - coarse_neighbors_offsets[tid]);
     uint32_t *coarse_neighbors_start = coarse_neighbors + coarse_neighbors_start_idx;
     uint32_t distinct = 0;
     // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
@@ -796,9 +801,9 @@ void apply_coarsening_neighbors_scatter(
 __global__
 void apply_coarsening_touching_count(
     const uint32_t* __restrict__ hedges, // already coarsened as of here, thus contain group ids!
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t num_hedges,
-    uint32_t* __restrict__ coarse_touching_offsets // here filled as counters of "how many hedges per node" -> then do a prefix sum for the offsets
+    dim_t* __restrict__ coarse_touching_offsets // here filled as counters of "how many hedges per node" -> then do a prefix sum for the offsets
 ) {
     // STYLE: one hedge per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -819,7 +824,7 @@ void apply_coarsening_touching_count(
     *     and reditect additional entries to global counters, then atomically increment global memory
     */
 
-    const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
+    const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
 
     // TODO: initialize shared memory
@@ -839,12 +844,12 @@ void apply_coarsening_touching_count(
 __global__
 void apply_coarsening_touching_scatter(
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const uint32_t* __restrict__ inbound_count,
     const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const uint32_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
+    const dim_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
     const uint32_t num_groups,
-    const uint32_t* __restrict__ coarse_touching_offsets, // group id -> count of distinct touching hedges
+    const dim_t* __restrict__ coarse_touching_offsets, // group id -> count of distinct touching hedges
     uint32_t* __restrict__ coarse_touching,
     uint32_t* __restrict__ coarse_inbound_count
 ) {
@@ -871,10 +876,10 @@ void apply_coarsening_touching_scatter(
     *            only for the first occurrence, that is, the inbound one!
     */
 
-    const uint32_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
+    const dim_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
     const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
-    const uint32_t coarse_touching_start_idx = coarse_touching_offsets[tid];
-    const uint32_t coarse_touching_size = coarse_touching_offsets[tid + 1] - coarse_touching_offsets[tid];
+    const dim_t coarse_touching_start_idx = coarse_touching_offsets[tid];
+    const uint32_t coarse_touching_size = (uint32_t)(coarse_touching_offsets[tid + 1] - coarse_touching_offsets[tid]);
     uint32_t *coarse_touching_start = coarse_touching + coarse_touching_start_idx;
     uint32_t distinct = 0u;
     // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
@@ -902,7 +907,7 @@ void apply_coarsening_touching_scatter(
     for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
         const uint32_t node = *ungroup;
         const uint32_t* my_outbound = touching + touching_offsets[node] + inbound_count[node];
-        const uint32_t my_outbound_count = touching_offsets[node + 1] - touching_offsets[node] - inbound_count[node];
+        const uint32_t my_outbound_count = (uint32_t)(touching_offsets[node + 1] - touching_offsets[node]) - inbound_count[node];
         for (uint32_t i = 0; i < my_outbound_count; i++) {
             const uint32_t hedge_idx = my_outbound[i];
             bool not_seen = lm_hashset_insert(new_touching, MAX_DEDUPE_BUFFER_SIZE, hedge_idx);
@@ -945,7 +950,7 @@ void apply_uncoarsening_partitions(
 __global__
 void pins_per_partition_kernel(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
     const uint32_t num_hedges,
     const uint32_t num_partitions,
@@ -969,7 +974,7 @@ void pins_per_partition_kernel(
     * => take the code from 'inbound_pins_per_partition_kernel' as of commit 'f803463'
     */
 
-    const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
+    const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
     uint32_t *my_pins_per_partitions = pins_per_partitions + tid * num_partitions;
 
@@ -986,7 +991,7 @@ void pins_per_partition_kernel(
 __global__
 void inbound_pins_per_partition_kernel(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
     const uint32_t num_hedges,
     const uint32_t num_partitions,
@@ -997,7 +1002,7 @@ void inbound_pins_per_partition_kernel(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_hedges) return;
 
-    const uint32_t hedge_start_idx = hedges_offsets[tid];
+    const dim_t hedge_start_idx = hedges_offsets[tid];
     const uint32_t hedge_src = hedges[hedge_start_idx];
     const uint32_t src_part = partitions[hedge_src];
     uint32_t *my_inbound_pins_per_partitions = inbound_pins_per_partitions + tid * num_partitions;
@@ -1013,7 +1018,7 @@ void inbound_pins_per_partition_kernel(
 __global__
 void fm_refinement_gains_kernel(
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const float* __restrict__ hedge_weights,
     const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
     const uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
@@ -1142,9 +1147,9 @@ void fm_refinement_gains_kernel(
 __global__
 void fm_refinement_cascade_kernel(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const float* hedge_weights,
     // CHOOSE: either rank nodes by their score and pass "move_ranks" or pass "scores" and sort on the fly, with the node id as a tie-breaker
     // CHOICE: sorted scores and move_ranks, because we need to keep scores in their current (sorted) order even after updating them
@@ -1253,7 +1258,7 @@ void fm_refinement_cascade_kernel(
 __global__
 void fm_refinement_apply_kernel(
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
     const uint32_t* __restrict__ move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
     const uint32_t* __restrict__ nodes_sizes,
@@ -1388,7 +1393,7 @@ void build_hedge_events_kernel(
     const uint32_t* __restrict__ ranks,
     const uint32_t* __restrict__ partitions,
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const uint32_t* __restrict__ inbound_count,
     const uint32_t num_nodes,
     uint32_t* __restrict__ ev_partition, // init. to UINT32_MAX (to spot invalid ones later)

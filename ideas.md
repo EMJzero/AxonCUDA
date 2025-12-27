@@ -329,3 +329,63 @@ Only true solution for neighbors:
 - now we need perfect deduplication in SM, but we can still put a cap on the probe length to avoid going over the whole table, IFF we set the same probe length both during insertion and query, because this way you know that there is no way a value can be further than "max probe length" from where the hash points, so no point in checking
 - after you have the count, instantiate the right amount of memory and scatter, using SM again for early deduplication, now backing its content on GM, and GM used again as an hash-set (for this, you can reuse the current implementation of the dedupe kernel)
 => no need anymore for the costly (in terms of memory) thrust pipeline
+
+---
+
+OLD IDEA:
+Every node can generate at most TWO gain-increasing moves, going either up or down and either left or right.
+Therefore 'moves' just encodes +1/-1/0 for X first, then +1/-1/0 for Y, while 'gains' encodes their respective gain.
+Gains are first computed in isolation, sorted, then each move's gain is updated assuming all moves before it being applied, for this 'moves' remain untouched (can't switch "direction"). Then the longest subsequence of gain-improving moves is applied.
+Repeat until convergence.
+
+In-isolation gain computation:
+- 1-st kernel computes the force in all 4 directions for each node
+  => iterate, for each node, on its touching hedges, and on each node in each hedge, for each node updating all 4 forces
+- 2-nd kernel computes ONE positive tension per node, the highest gain one, that becomes the node's candidate move (use again MAX_CANDIDATES, renamed MAX_MOVES, to enable up to 4 moves, if tension is positive)
+- only one move must involve any node, this means that after the second kernel we need an upward and a downward tree walk, exactly like 
+for partitioning, that lets each find or not another with which to exchange
+  => little variation on the upward-downward walk: specialize it for pairs, make it so that at the end the slots of nodes in a pair point one to the other, and slots of unaffected nodes contain UINT32_MAX
+    => upward: make my target point to me
+    => downward: point back to my target, if he still points to me
+  => use UINT32_MAX - 1,2,3,4 to flag nodes that wanted to move to an empty cell dx,sx,up,down, keep them as roots if no-one else bet their gain while going to the empty cell
+
+In-sequence gain updates:
+- create one event per pair/swap
+- rank pairs/swaps by gain, assign a rank to each node, giving both nodes in each pair the same rank
+  - purpose of the rank: see if something else is scheduled to happen before me or not
+- now we know that each node will attempt to move at most once
+- one thread for each event (one per pair) goes and re-computes both involved forces and the tension assuming all previous events (by rank) happen
+  => again, iterate, for each node, on its touching hedges, and on each node in each hedge, for each node updating all 4 forces using the node's new position IFF the node had a lower rank
+- apply all moves up to the highest-ranked one with the highest updated cumulative gain
+
+About how to encode events:
+- to know, given a node, where it went, you can just use "slots" as it was after the upward-downward walks
+- each node needs to be given a rank by the gain of its move, with both nodes in a swap having the same rank
+  => the lowest-id node in the pair is the anchor for the event, the other node is found by just following the slot of the anchor
+  => first, custom kernel to reduce how many individual swaps there are and give an offset ... nah
+=> as soon as the pairing (upward-downward walk) kernel locks a pair, the lower-id node set to 1 a flag in an array of zeros, one per node. Then you exclusive scan the flags and another stupid kernel writes “ev_score” and “ev_lower_node” for each lower-id node in a pair. Finally, by using scores and the lower nodes, via which you can find the whole pair back, you can find the longest subsequence by computing ranks!
+=> no need to rank events explicitly. Sort “ev_score” and “ev_lower_node”, then one thread per event goes for each event and writes to the lower id node and going up to the higher id one to write the rank, the rank being equal to the event’s position, that is the kernel’s thread id!
+
+Criteria:
+- move: element chooses what to do on its own, and can do it by itself (pending validity)
+ => just check validity and apply the highest-gain subsequence
+- swap/pair: multiple elements need to agree to partake in the same collective update, each element can be part of different collectives and need to agree on which is their chosen one (highest score one available), validity constraint are at the level of the collective
+ => upward-downward tree walk algorithm
+
+ Bonus: no need for the inverse-map coordinates->node! Nevermind, computing tension needs it...
+
+ Wild idea: we could look for minimizing circuits of length > 2 !
+
+---
+
+Memory solution:
+- overwrite neighbors in-place
+- keep an array “neighbors_count” and:
+  - stop using offsets[n+1]-offsets[n] to get neighbors count, use the new array
+  - never iterate over neighbors via pointer increments directly
+- upgrade the neighbors coarsening kernel to do one node per warp:
+  - warps can write in place, since because of deduplication you will always be writing at or before where you read, assuming you sync the warp between reads and writes
+  - warp-wise exclusive scan of a 0/1 flag variable (true iff the neighbor is new) to get the offset where the thread writes, also do a reduce of the flags such that each thread can use the total count of written neighbors to advance the pointer where to write the next iteration
+  - for deduplication, use SM, divided among 4 warps (like in the initial neighbors kernel) plus GM to support it OR use SM as an hash-set and if you miss just do a linear scan of the already written values PLUS a warp ballot to see if any other thread was about to write the same value (if so, only the lowest lane - first 1 in the ballot - writes)
+
+Remember: even local memory eats up global memory if you give 8k or so entries to each thread!!!!

@@ -30,10 +30,30 @@ For convenience, we discuss algorithmic complexity using the following variables
 - $n$ : number of hgraph nodes, $|V|$
 - $e$ : number of hgraph hedges, $|E|$
 - $d$ : average cardinality of each hedge, $(\sum_{(s, D) \in E} 1 + |D|) / |E|$
-- $h$ : average connections per node, $(\sum_{v \in V} |\{(s, D) \in E | v = s \vee v \in D\}|) / |V| = e \cdot d / n$
+- $h$ : average connections per node (node degree), $(\sum_{v \in V} |\{(s, D) \in E | v = s \vee v \in D\}|) / |V| = e \cdot d / n$
 - $p$ : number of achieved partitions, $|P|$
 
 # Some Terminology
 
 - *in-isolation*: gain calculated for a move applied by itself
 - *in-sequence*: gain for a move calculated assuming all higher-gain moves already applied
+
+# Working HyperGraphs
+
+| **hypergraph** | **hardware** | **status** |
+| --- | --- | --- |
+| 8k-model | loihi64 | <code style="color : lime">ok</code> |
+| 64k-model | loihi64 | <code style="color : lime">ok</code> |
+| 256k-model | loihi84 | <code style="color : lime">ok</code> |
+| 1M-model | loihi84 | <code style="color : red">ko</code> |
+| 16M-model | loihi84 | <code style="color : red">ko</code> |
+| LenNet | loihi64 | <code style="color : lime">ok</code> |
+| VGG11 | loihi84 | <code style="color : lime">ok</code> |
+| AlexNet | loihi84 | <code style="color : red">ko</code> |
+| MobileNet | loihi84 | <code style="color : red">ko</code> |
+| Allen V1 | loihi84 | <code style="color : red">ko</code> |
+| 16k-rand | loihi64 | <code style="color : red">ko</code> |
+| 64k-rand | loihi64 | <code style="color : red">ko</code> |
+| 256k-rand | loihi64 | <code style="color : red">ko</code> |
+
+> All "ko"s are out-of-memory instances...

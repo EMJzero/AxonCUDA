@@ -5,14 +5,19 @@
 
 // USED BY: everyone
 
+// absolute replacement for "size_t"
+using dim_t = unsigned long long; // aka uint64_t
+
 #define WARP_SIZE 32u
 // TODO: determine this at runtime w.r.t. the mean and variance of the spike frequency!
 #define FIXED_POINT_SCALE 262144u // used to convert scores to fixed point
 
+#define SAVE_MEMORY_UP_TO_LEVEL 2 // number of coarsening levels for which to spill non-coarse data structures to the host, set to 0 to disable the feature
+
 // initialize memory for a block of threads: one consecutive chunk per warp
 // => the memory can be shared memory or global alike, so long as each location is exclusive to a block
 template <typename T>
-__device__ __forceinline__ void blk_init(T* __restrict__ sm, const uint32_t size, const T val) {
+__device__ __forceinline__ void blk_init(T* __restrict__ sm, const dim_t size, const T val) {
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane_id = threadIdx.x & (WARP_SIZE - 1);
     const int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
@@ -23,7 +28,7 @@ __device__ __forceinline__ void blk_init(T* __restrict__ sm, const uint32_t size
 // initialize per-warp memory: for shared memory dedicated to a single warp
 // => the memory can be shared memory or global alike, so long as each location is exclusive to a warp
 template <typename T>
-__device__ __forceinline__ void wrp_init(T* __restrict__ sm, const uint32_t size, const T val) {
+__device__ __forceinline__ void wrp_init(T* __restrict__ sm, const dim_t size, const T val) {
     const int lane_id = threadIdx.x & (WARP_SIZE - 1);
     for (int i = lane_id; i < size; i += WARP_SIZE)
         sm[i] = val;
@@ -32,7 +37,7 @@ __device__ __forceinline__ void wrp_init(T* __restrict__ sm, const uint32_t size
 // initialize per-thread memory
 // => the memory can be local memory or global alike, so long as each location is exclusive to a thread
 template <typename T>
-__device__ __forceinline__ void thr_init(T* __restrict__ lm, const uint32_t size, const T val) {
+__device__ __forceinline__ void thr_init(T* __restrict__ lm, const dim_t size, const T val) {
     for (int i = 0; i < size; i++)
         lm[i] = val;
 }
@@ -225,7 +230,7 @@ __device__ __forceinline__ uint32_t hash_uint32_linear(uint32_t x) {
 // => shared among threads, needs atomics
 
 // insert a value into a shared-memory hash-set, returns "true" if the value was not in the set before
-__device__ __forceinline__ bool sm_hashset_insert(uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
+__device__ __forceinline__ bool sm_hashset_insert(uint32_t* __restrict__ table, const dim_t size, const uint32_t value) {
     const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -246,7 +251,7 @@ __device__ __forceinline__ bool sm_hashset_insert(uint32_t* __restrict__ table, 
 // tries to insert a value into a shared-memory hash-set, returns "true (1)" if the value was not in the set before OR "true (2)" if the set is full,
 // returns instead "false (0)" if the element is already in the hash-set
 // => this admits false negatives! It never goes and checks the whole hash-set, so the value could have already been there but not be seen!
-__device__ __forceinline__ uint8_t sm_hashset_try_insert(uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
+__device__ __forceinline__ uint8_t sm_hashset_try_insert(uint32_t* __restrict__ table, const dim_t size, const uint32_t value) {
     const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < MAX_HASH_PROBE_LENGTH && probe < size; ++probe) {
@@ -265,7 +270,7 @@ __device__ __forceinline__ uint8_t sm_hashset_try_insert(uint32_t* __restrict__ 
 }
 
 // lookup a value into a shared-memory hash-set, returns "true" if the value was found
-__device__ __forceinline__ bool sm_hashset_contains(const uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
+__device__ __forceinline__ bool sm_hashset_contains(const uint32_t* __restrict__ table, const dim_t size, const uint32_t value) {
     const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -285,7 +290,7 @@ __device__ __forceinline__ bool sm_hashset_contains(const uint32_t* __restrict__
 // LOCAL MEMORY VERSION
 // => private to each thread, does not need atomics
 
-__device__ __forceinline__ bool lm_hashset_insert(uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
+__device__ __forceinline__ bool lm_hashset_insert(uint32_t* __restrict__ table, const dim_t size, const uint32_t value) {
     const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -303,7 +308,7 @@ __device__ __forceinline__ bool lm_hashset_insert(uint32_t* __restrict__ table, 
     return false;
 }
 
-__device__ __forceinline__ bool lm_hashset_contains(const uint32_t* __restrict__ table, const uint32_t size, const uint32_t value) {
+__device__ __forceinline__ bool lm_hashset_contains(const uint32_t* __restrict__ table, const dim_t size, const uint32_t value) {
     const uint32_t h = hash_uint32(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -323,7 +328,7 @@ __device__ __forceinline__ bool lm_hashset_contains(const uint32_t* __restrict__
 // => shared among threads, needs atomics
 // => assumed to store indices or other uniformly-spread content, therefore it uses 'hash_uint32_linear'
 
-__device__ __forceinline__ bool gm_hashset_insert(uint32_t* __restrict__ table, uint32_t size, uint32_t value) {
+__device__ __forceinline__ bool gm_hashset_insert(uint32_t* __restrict__ table, dim_t size, uint32_t value) {
     const uint32_t h = hash_uint32_linear(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -340,7 +345,7 @@ __device__ __forceinline__ bool gm_hashset_insert(uint32_t* __restrict__ table, 
     return false;
 }
 
-__device__ __forceinline__ bool gm_hashset_contains(const uint32_t* __restrict__ table, uint32_t size, uint32_t value) {
+__device__ __forceinline__ bool gm_hashset_contains(const uint32_t* __restrict__ table, dim_t size, uint32_t value) {
     const uint32_t h = hash_uint32_linear(value);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -368,7 +373,7 @@ typedef struct {
     uint32_t value;
 } hashmap_entry;
 
-__device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* __restrict__ table, const uint32_t size, uint32_t key, uint32_t value) {
+__device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* __restrict__ table, const dim_t size, uint32_t key, uint32_t value) {
     const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -391,7 +396,7 @@ __device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* __restrict__ ta
     return false;
 }
 
-__device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* __restrict__ table, const uint32_t size, uint32_t key, uint32_t* out_value) {
+__device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* __restrict__ table, const dim_t size, uint32_t key, uint32_t* out_value) {
     const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -413,7 +418,7 @@ __device__ __forceinline__ bool sm_hashmap_lookup(const hashmap_entry* __restric
 // LOCAL MEMORY VERSION
 // => private to each thread, does not need atomics
 
-__device__ __forceinline__ bool lm_hashmap_insert(hashmap_entry* __restrict__ table, const uint32_t size, uint32_t key, uint32_t value) {
+__device__ __forceinline__ bool lm_hashmap_insert(hashmap_entry* __restrict__ table, const dim_t size, uint32_t key, uint32_t value) {
     const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -434,7 +439,7 @@ __device__ __forceinline__ bool lm_hashmap_insert(hashmap_entry* __restrict__ ta
     return false;
 }
 
-__device__ __forceinline__ bool lm_hashmap_lookup(const hashmap_entry* __restrict__ table, const uint32_t size, uint32_t key, uint32_t* out_value) {
+__device__ __forceinline__ bool lm_hashmap_lookup(const hashmap_entry* __restrict__ table, const dim_t size, uint32_t key, uint32_t* out_value) {
     const uint32_t h = hash_uint32(key);
     int idx = h % size;
     for (int probe = 0; probe < size; ++probe) {
@@ -685,7 +690,7 @@ __device__ __forceinline__ void wrp_bitonic_sort_by_key(K* __restrict__ keys, V*
 
 // binary search, returns the index of 'value' in 'a' or UINT32_MAX if it is not found
 template <typename T>
-__device__ __forceinline__ uint32_t binary_search(const T* a, uint32_t n, T value) {
+__device__ __forceinline__ uint32_t binary_search(const T* a, dim_t n, T value) {
     int lo = 0;
     int hi = n - 1;
     while (lo <= hi) {
