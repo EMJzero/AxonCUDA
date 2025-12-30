@@ -5,7 +5,7 @@
 
 // USED BY: everyone
 
-// absolute replacement for "size_t"
+// absolute replacement for "dim_t"
 using dim_t = unsigned long long; // aka uint64_t
 
 #define WARP_SIZE 32u
@@ -172,8 +172,9 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* __restrict__ s, uin
 // USED BY: coarsening routines
 
 // NOTE: these are local memory! No theoretical size limit!
-#define MAX_DEDUPE_BUFFER_SIZE 16384u //8192u // for hedges and touching sets
+#define MAX_DEDUPE_BUFFER_SIZE 16384u //8192u // for hedges
 #define MAX_LARGE_DEDUPE_BUFFER_SIZE 32768u // for neighbors
+#define MAX_SM_DEDUPE_BUFFER_SIZE 3072u // for touching
 
 
 // USED BY: fm refinement kernel
@@ -687,6 +688,9 @@ __device__ __forceinline__ void wrp_bitonic_sort_by_key(K* __restrict__ keys, V*
         vals[i] = v[b];
     }
 }
+
+// PAIN...
+// template <dim_t SM_BUFFER_SIZE> __device__ __forceinline__ void wrp_sort_gm(uint32_t* __restrict__ in, uint32_t* __restrict__ buff, dim_t size, uint32_t* __restrict__ sm) {...}
 
 // binary search, returns the index of 'value' in 'a' or UINT32_MAX if it is not found
 template <typename T>

@@ -290,7 +290,7 @@ using namespace hwmodel;
 #define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
   if (code != cudaSuccess) {
-    fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+    fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
     if (abort)
       exit(code);
   }
@@ -475,8 +475,11 @@ int main(int argc, char** argv) {
     // kernel dimensions
     int blocks, threads_per_block, warps_per_block;
     int num_threads_needed, num_warps_needed;
-    dim_t bytes_per_thread, bytes_per_warp, shared_bytes;
+    size_t bytes_per_thread, bytes_per_warp, shared_bytes;
     int blocks_per_SM, max_blocks;
+
+    // memory state
+    size_t free_bytes, total_bytes;
 
     // allocate device memory
     CUDA_CHECK(cudaMalloc(&d_hedges, hg.hedgesFlat().size() * sizeof(uint32_t))); // contigous hedges array (each hedge must be stored as src+destinations, with the src in the first position)
@@ -808,6 +811,10 @@ int main(int argc, char** argv) {
             // NOTE: just like groups, partitions need to ordered, as they be used as indices; however, partitions are few, and if one becomes
             //       empty we can just discard its index and leave a few empty spots in the data structures, it's cheaper to compress at the end
 
+            // neighbors are no longer needed after coarsening is done
+            CUDA_CHECK(cudaFree(d_neighbors));
+            CUDA_CHECK(cudaFree(d_neighbors_offsets));
+
             // prepare initial partition sizes
             // NOTE: current groups become the partitions, and so group sizes become partition sizes
             d_partitions_sizes = d_groups_sizes; // partitions_sizes[idx] -> how many nodes (by size) are in the partition
@@ -918,6 +925,16 @@ int main(int argc, char** argv) {
         thrust::inclusive_scan(t_coarse_neighbors_offsets, t_coarse_neighbors_offsets + (new_num_nodes + 1), t_coarse_neighbors_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
         dim_t new_neighbors_size = 0; // last value in the inclusive scan = full reduce = total number of neighbors among all sets
         CUDA_CHECK(cudaMemcpy(&new_neighbors_size, d_coarse_neighbors_offsets + new_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
+        // if not enough memory is available => free neighbors before constructing them anew, rebuilding neighbors froms scratch costs n*d*h
+        // otherwise => allocate new neighbors and construct them by deduplicating previous ones, costs n * # neighbors
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        bool reconstruct_neighbors_from_scratch = new_neighbors_size * sizeof(uint32_t) > free_bytes;
+        if (reconstruct_neighbors_from_scratch) {
+            // de-allocate old neighbors and rebuild them anew
+            CUDA_CHECK(cudaFree(d_neighbors));
+            CUDA_CHECK(cudaFree(d_neighbors_offsets));
+            // => defer construction to after we have the coarse hedges and touching sets
+        } else {
         CUDA_CHECK(cudaMalloc(&d_coarse_neighbors, new_neighbors_size * sizeof(uint32_t)));
         // launch configuration - coarsening kernel (neighbors - scatter)
         threads_per_block = 128;
@@ -942,6 +959,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaFree(d_neighbors_offsets));
         d_neighbors = d_coarse_neighbors;
         d_neighbors_offsets = d_coarse_neighbors_offsets;
+        }
 
         // prepare coarse hedges buffers
         uint32_t *d_coarse_hedges = nullptr;
@@ -1009,12 +1027,16 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(&new_touching_size, d_coarse_touching_offsets + new_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMalloc(&d_coarse_touching, new_touching_size * sizeof(uint32_t)));
         // launch configuration - coarsening kernel (touching - scatter)
-        threads_per_block = 128;
-        num_threads_needed = new_num_nodes; // 1 thread per group
-        blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+        threads_per_block = 128; // 128/32 -> 4 warps per block
+        warps_per_block = threads_per_block / WARP_SIZE;
+        num_warps_needed = new_num_nodes ; // 1 warp per group
+        blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+        // compute shared memory per block (bytes)
+        bytes_per_warp = MAX_SM_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
+        shared_bytes = warps_per_block * bytes_per_warp;
         // launch - coarsening kernel (touching - scatter)
         std::cout << "Running coarsening kernel (touching - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        apply_coarsening_touching_scatter<<<blocks, threads_per_block>>>(
+        apply_coarsening_touching_scatter<<<blocks, threads_per_block, shared_bytes>>>(
             d_touching,
             d_touching_offsets,
             d_inbound_count,
@@ -1048,6 +1070,30 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaFree(d_hedges_offsets));
             CUDA_CHECK(cudaFree(d_touching));
             CUDA_CHECK(cudaFree(d_touching_offsets));
+        }
+
+        // complete the deferred reconstruction of neighbors
+        if (reconstruct_neighbors_from_scratch) {
+            CUDA_CHECK(cudaMalloc(&d_coarse_neighbors, new_neighbors_size * sizeof(uint32_t)));
+            // launch configuration - neighborhoods scatter kernel
+            blocks = new_num_nodes;
+            threads_per_block = 256; // 256/32 -> 8 warps per block
+            std::cout << "Running coarsening kernel (neighbors - rebuild) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // launch - neighborhoods scatter kernel
+            // NOTE: this uses the same kernel of the original neighbors construction
+            neighborhoods_scatter_kernel<<<blocks, threads_per_block>>>(
+                d_coarse_hedges,
+                d_coarse_hedges_offsets,
+                d_coarse_touching,
+                d_coarse_touching_offsets,
+                new_num_nodes,
+                d_coarse_neighbors_offsets,
+                d_coarse_neighbors
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            d_neighbors = d_coarse_neighbors;
+            d_neighbors_offsets = d_coarse_neighbors_offsets;
         }
 
         // ======================================
@@ -1595,8 +1641,8 @@ int main(int argc, char** argv) {
     // cleanup device memory
     CUDA_CHECK(cudaFree(d_hedges));
     CUDA_CHECK(cudaFree(d_hedges_offsets));
-    CUDA_CHECK(cudaFree(d_neighbors));
-    CUDA_CHECK(cudaFree(d_neighbors_offsets));
+    //CUDA_CHECK(cudaFree(d_neighbors)); // should have already been freed at the innermost recursion level
+    //CUDA_CHECK(cudaFree(d_neighbors_offsets));
     CUDA_CHECK(cudaFree(d_touching));
     CUDA_CHECK(cudaFree(d_touching_offsets));
     CUDA_CHECK(cudaFree(d_inbound_count));

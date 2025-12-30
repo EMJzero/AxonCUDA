@@ -388,4 +388,6 @@ Memory solution:
   - warp-wise exclusive scan of a 0/1 flag variable (true iff the neighbor is new) to get the offset where the thread writes, also do a reduce of the flags such that each thread can use the total count of written neighbors to advance the pointer where to write the next iteration
   - for deduplication, use SM, divided among 4 warps (like in the initial neighbors kernel) plus GM to support it OR use SM as an hash-set and if you miss just do a linear scan of the already written values PLUS a warp ballot to see if any other thread was about to write the same value (if so, only the lowest lane - first 1 in the ballot - writes)
 
+NONONONO, this could never work! The idea that "neighbors of a node never increase" is false! Terribly false, from the moment that you aggregate nodes, increasing their united neighbors set size w.r.t. each node by itself!
+
 Remember: even local memory eats up global memory if you give 8k or so entries to each thread!!!!

@@ -12,7 +12,7 @@ __constant__ uint32_t max_inbound_per_part;
 
 // REMEMBER: "const" means the data pointed to is not modified, not the pointer itself!
 
-// TODO: upgrade to "uint64_t" to handle >4M nodes, >4M touching per node, >4M pins per hedge, >4M neighbors per node!
+// TODO: upgrade "uint_32_t"s to "uint64_t"s to handle >4M nodes, >4M touching per node, >4M pins per hedge, >4M neighbors per node!
 
 // compute the distinct neighbors count of each node, aided by a global hash-set
 // SEQUENTIAL COMPLEXITY: n*h*d
@@ -578,6 +578,8 @@ void grouping_kernel(
         
         // global synch
         grid.sync();
+
+        // TODO: anyone not yet selected (score != UINT32_MAX), set your score to 0 to enable the next pairing round, then sync again and continue!
     }
 
     // write inside "groups" the minimum id among each node's slots, used to identify its group, eventually, zero-base those ids
@@ -616,6 +618,11 @@ void apply_coarsening_hedges_count(
     * - instead of three kernels to count distinct nodes, scan offsets, and scatter distinct nodes, can't we do all in one?
     * - one hedge per warp or block, use the shared memory hash-map to keep a "first-come-first-served" set of counters in shared memory,
     *   and reditect additional entries to atomically incremented global counters (issue: musre ensure the src is preserved!!)
+    *
+    * Must ensure that:
+    * - there are no self-cycles
+    * - the same node never appears twice in the same hedge
+    *   => exploited by the coarsening of touching sets
     */
 
     const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
@@ -814,14 +821,17 @@ void apply_coarsening_touching_count(
     * - first coarsen hedge, then going over coarse hedge and counting the occurrencies of each group (new node) should be
     *   faster than just deduplicating touching hedges between nodes in the same group
     * - scan the touching counts per group (new node) to get the new offsets
-    * - OLD METHOD: repeat the above while deduplicating per-group and writing (scatter) each hedge to its offset in the new touching sets
-    * - NEW METHOD: change the way the scatter operates, assign one thread per group, the thread goes over the nodes
+    * - the scatter operates in a different way, assigning one thread per group, the thread goes over the nodes
     *   in the group via the "ungroups" and "ungroups_offsets" structures, deduplicates hedges and writes them in the touching set
-
+    *
+    * NOTE: this exploits the fact that the same pin never appears twice in the same hedge!
+    *
     * TODO, upgrade options:
     * - for now we just do atomics towards global memory, because nodes are too many for shared memory, eventually:
     *   => use the shared memory hash-map to keep a "first-come-first-served" set of counters in shared memory,
     *     and reditect additional entries to global counters, then atomically increment global memory
+    *
+    * TODO: could partially skip this counting step, because we already have the new distinct inbound count evaluated during the candidates kernel!
     */
 
     const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
@@ -841,6 +851,7 @@ void apply_coarsening_touching_count(
 // write distinct touching hedges
 // SEQUENTIAL COMPLEXITY: n*h
 // PARALLEL OVER: n
+// SHUFFLES OVER: h (touching)
 __global__
 void apply_coarsening_touching_scatter(
     const uint32_t* __restrict__ touching,
@@ -853,9 +864,11 @@ void apply_coarsening_touching_scatter(
     uint32_t* __restrict__ coarse_touching,
     uint32_t* __restrict__ coarse_inbound_count
 ) {
-    // STYLE: one group (new node) per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_groups) return;
+    // STYLE: one group (new node) per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the group to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_groups) return;
 
     /* Idea: second part of "apply_coarsening_touching_scatter" -> scatter
     * Alternative version: one thread per hedge and dedupe inside each touching set (by linearly going over it, with a CAS at the end)
@@ -865,8 +878,7 @@ void apply_coarsening_touching_scatter(
     * - inbound hedges are sorted by id
     *
     * TODO upgrade option:
-    * - one thread per node is fine with many nodes, but when nodes are few switch to one node per block!
-    * - or better, ever since the beginning, do a few nodes (down to one, eventually) per block!
+    * - one warp per node is fine with many nodes, but when nodes are few switch to one node per block!
     */
 
     /*
@@ -876,53 +888,71 @@ void apply_coarsening_touching_scatter(
     *            only for the first occurrence, that is, the inbound one!
     */
 
-    const dim_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
+    const dim_t ungroups_start_idx = ungroups_offsets[warp_id], ungroups_end_idx = ungroups_offsets[warp_id + 1];
     const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
-    const dim_t coarse_touching_start_idx = coarse_touching_offsets[tid];
-    const uint32_t coarse_touching_size = (uint32_t)(coarse_touching_offsets[tid + 1] - coarse_touching_offsets[tid]);
+    const dim_t coarse_touching_start_idx = coarse_touching_offsets[warp_id];
+    const uint32_t coarse_touching_size = (uint32_t)(coarse_touching_offsets[warp_id + 1] - coarse_touching_offsets[warp_id]);
     uint32_t *coarse_touching_start = coarse_touching + coarse_touching_start_idx;
-    uint32_t distinct = 0u;
-    // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
-    uint32_t new_touching[MAX_DEDUPE_BUFFER_SIZE];
-    thr_init<uint32_t>(new_touching, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    uint32_t new_inbound_count = 0u;
+    wrp_init<uint32_t>(coarse_touching_start, coarse_touching_size, HASH_EMPTY); // HP: HASH_EMPTY is > than any value that could be inserted
+
+    // SM deduplication hash-set
+    extern __shared__ uint32_t block_new_touching[];
+    uint32_t *new_touching = block_new_touching + MAX_SM_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
+    wrp_init<uint32_t>(new_touching, MAX_SM_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    __syncwarp();
 
     // for every original node in the group, go over its inbound set
     for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
         const uint32_t node = *ungroup;
         const uint32_t* my_inbound = touching + touching_offsets[node];
         const uint32_t my_inbound_count = inbound_count[node];
-        for (uint32_t i = 0; i < my_inbound_count; i++) {
-            const uint32_t hedge_idx = my_inbound[i];
-            bool not_seen = lm_hashset_insert(new_touching, MAX_DEDUPE_BUFFER_SIZE, hedge_idx);
-            if (not_seen) {
-                assert(distinct < coarse_touching_size);
-                coarse_touching_start[distinct] = hedge_idx;
-                distinct++;
+        for (uint32_t i = lane_id; i < my_inbound_count; i += WARP_SIZE) {
+            if (i < my_inbound_count) {
+                const uint32_t hedge_idx = my_inbound[i];
+                if (sm_hashset_try_insert(new_touching, MAX_SM_DEDUPE_BUFFER_SIZE, hedge_idx)) { // check in the SM cache
+                    if (gm_hashset_insert(coarse_touching_start, coarse_touching_size, hedge_idx)) // dedupe among inbound hedges
+                        new_inbound_count++;
+                }
             }
         }
     }
-    const uint32_t new_inbound_count = distinct;
+
+    new_inbound_count = warpReduceSum<uint32_t>(new_inbound_count);
+
+    // ensure inbound hedges are always sorted
+    // AND move empty slots to the end of the array / hash-set
+    // NOTE: the sort already synchronizes the threads in the warp
+    // NOTE: this sorting algorithm uses the existing shared memory buffer for the bitonic sort
+    //wrp_sort_gm<MAX_SM_DEDUPE_BUFFER_SIZE, FIRST_POW_2_BEFORE_MAX_SM_DEDUPE_BUFFER_SIZE>(coarse_touching_start, coarse_touching_buffer_start, coarse_touching_size, new_touching);
+    if (lane_id == 0)
+        introsort(coarse_touching_start, coarse_touching_size);
+    __syncwarp();
+
+    uint32_t *coarse_outbound_start = coarse_touching_start + new_inbound_count;
+    const uint32_t coarse_outbound_size = coarse_touching_size - new_inbound_count;
+
+    // must re-init shared memory because it was used for sorting
+    wrp_init<uint32_t>(new_touching, MAX_SM_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
 
     // for every original node in the group, go over its outbound set
     for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
         const uint32_t node = *ungroup;
         const uint32_t* my_outbound = touching + touching_offsets[node] + inbound_count[node];
         const uint32_t my_outbound_count = (uint32_t)(touching_offsets[node + 1] - touching_offsets[node]) - inbound_count[node];
-        for (uint32_t i = 0; i < my_outbound_count; i++) {
-            const uint32_t hedge_idx = my_outbound[i];
-            bool not_seen = lm_hashset_insert(new_touching, MAX_DEDUPE_BUFFER_SIZE, hedge_idx);
-            if (not_seen) {
-                assert(distinct < coarse_touching_size);
-                coarse_touching_start[distinct] = hedge_idx;
-                distinct++;
+        for (uint32_t i = lane_id; i < my_outbound_count; i += WARP_SIZE) {
+            if (i < my_outbound_count) {
+                const uint32_t hedge_idx = my_outbound[i];
+                if (sm_hashset_try_insert(new_touching, MAX_SM_DEDUPE_BUFFER_SIZE, hedge_idx)) { // check in the SM cache
+                    if(binary_search<uint32_t>(coarse_touching_start, new_inbound_count, hedge_idx) == UINT32_MAX) // check among inbound hedges
+                        gm_hashset_insert(coarse_outbound_start, coarse_outbound_size, hedge_idx); // dedupe among outbound hedges
+                }
             }
         }
     }
 
-    coarse_inbound_count[tid] = new_inbound_count;
-    
-    // ensure inbound hedges are always sorted
-    introsort(coarse_touching_start, new_inbound_count);
+    if (lane_id == 0)
+        coarse_inbound_count[warp_id] = new_inbound_count;
 }
 
 // write to each node the partition of its group
