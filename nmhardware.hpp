@@ -2,6 +2,7 @@
 #include <cmath>
 #include <vector>
 #include <cstdint>
+#include <fstream>
 #include <numeric>
 #include <iostream>
 #include <optional>
@@ -190,6 +191,24 @@ namespace hwgeom {
             }
         }
         return out;
+    }
+
+    void coords_to_file(const std::vector<Coord2D>& v, const std::string& path) {
+        std::ofstream out(path, std::ios::binary);
+        if (!out) throw std::runtime_error("Cannot open file");
+        std::size_t size = v.size();
+        out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+        out.write(reinterpret_cast<const char*>(v.data()), size * sizeof(Coord2D));
+    }
+
+    std::vector<Coord2D> coords_from_file(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) throw std::runtime_error("Cannot open file");
+        std::size_t size;
+        in.read(reinterpret_cast<char*>(&size), sizeof(size));
+        std::vector<Coord2D> v(size);
+        in.read(reinterpret_cast<char*>(v.data()), size * sizeof(Coord2D));
+        return v;
     }
 }
 
@@ -387,6 +406,22 @@ namespace hwmodel {
             cfg_loihi_jin_84.latency_per_routing = 1.0;
             cfg_loihi_jin_84.latency_per_wire = 0.01;
             return HardwareModel(cfg_loihi_jin_84);
+        };
+
+        static HardwareModel createLoihiJin1024() {
+            HardwareModelConfig cfg_loihi_jin_1024;
+            cfg_loihi_jin_1024.name = "Loihi Jin 1024";
+            cfg_loihi_jin_1024.neurons_per_core = 4096;
+            cfg_loihi_jin_1024.synapses_per_core = 1024*64;
+            cfg_loihi_jin_1024.cores_per_chip_x = 1024;
+            cfg_loihi_jin_1024.cores_per_chip_y = 1024;
+            cfg_loihi_jin_1024.chips_per_system_x = 1;
+            cfg_loihi_jin_1024.chips_per_system_y = 1;
+            cfg_loihi_jin_1024.energy_per_routing = 1.0;
+            cfg_loihi_jin_1024.energy_per_wire = 0.1;
+            cfg_loihi_jin_1024.latency_per_routing = 1.0;
+            cfg_loihi_jin_1024.latency_per_wire = 0.01;
+            return HardwareModel(cfg_loihi_jin_1024);
         };
 
         static HardwareModel createTrueNorth() {
@@ -684,8 +719,7 @@ namespace hwmodel {
             const auto& src_core = placement[src];
 
             double w = static_cast<double>(he.weight());
-            // connections() == length() - 1
-            tot_spike_frequency += w * static_cast<double>(he.length() - 1);
+            tot_spike_frequency += w * static_cast<double>(he.connections());
 
             for (auto dst : he.destinations()) {
                 const auto& dst_core = placement[dst];
