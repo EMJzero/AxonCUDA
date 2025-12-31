@@ -689,9 +689,6 @@ __device__ __forceinline__ void wrp_bitonic_sort_by_key(K* __restrict__ keys, V*
     }
 }
 
-// PAIN...
-// template <dim_t SM_BUFFER_SIZE> __device__ __forceinline__ void wrp_sort_gm(uint32_t* __restrict__ in, uint32_t* __restrict__ buff, dim_t size, uint32_t* __restrict__ sm) {...}
-
 // binary search, returns the index of 'value' in 'a' or UINT32_MAX if it is not found
 template <typename T>
 __device__ __forceinline__ uint32_t binary_search(const T* a, dim_t n, T value) {

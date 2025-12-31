@@ -848,12 +848,12 @@ void apply_coarsening_touching_count(
     }
 }
 
-// write distinct touching hedges
+// write distinct inbound touching hedges
 // SEQUENTIAL COMPLEXITY: n*h
 // PARALLEL OVER: n
 // SHUFFLES OVER: h (touching)
 __global__
-void apply_coarsening_touching_scatter(
+void apply_coarsening_touching_scatter_inbound(
     const uint32_t* __restrict__ touching,
     const dim_t* __restrict__ touching_offsets,
     const uint32_t* __restrict__ inbound_count,
@@ -870,7 +870,8 @@ void apply_coarsening_touching_scatter(
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
     if (warp_id >= num_groups) return;
 
-    /* Idea: second part of "apply_coarsening_touching_scatter" -> scatter
+    /*
+    * Idea: second part of "apply_coarsening_touching_scatter" -> scatter inbound
     * Alternative version: one thread per hedge and dedupe inside each touching set (by linearly going over it, with a CAS at the end)
     * 
     * Must ensure that:
@@ -918,22 +919,53 @@ void apply_coarsening_touching_scatter(
         }
     }
 
-    new_inbound_count = warpReduceSum<uint32_t>(new_inbound_count);
+    new_inbound_count = warpReduceSumLN0<uint32_t>(new_inbound_count);
 
-    // ensure inbound hedges are always sorted
-    // AND move empty slots to the end of the array / hash-set
-    // NOTE: the sort already synchronizes the threads in the warp
-    // NOTE: this sorting algorithm uses the existing shared memory buffer for the bitonic sort
-    //wrp_sort_gm<MAX_SM_DEDUPE_BUFFER_SIZE, FIRST_POW_2_BEFORE_MAX_SM_DEDUPE_BUFFER_SIZE>(coarse_touching_start, coarse_touching_buffer_start, coarse_touching_size, new_touching);
     if (lane_id == 0)
-        introsort(coarse_touching_start, coarse_touching_size);
-    __syncwarp();
+        coarse_inbound_count[warp_id] = new_inbound_count;
+}
 
-    uint32_t *coarse_outbound_start = coarse_touching_start + new_inbound_count;
+// write distinct outbound touching hedges
+// SEQUENTIAL COMPLEXITY: n*h
+// PARALLEL OVER: n
+// SHUFFLES OVER: h (touching)
+__global__
+void apply_coarsening_touching_scatter_outbound(
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t* __restrict__ inbound_count,
+    const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
+    const dim_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
+    const uint32_t num_groups,
+    const dim_t* __restrict__ coarse_touching_offsets, // group id -> count of distinct touching hedges
+    const uint32_t* __restrict__ coarse_inbound_count,
+    uint32_t* __restrict__ coarse_touching
+) {
+    // STYLE: one group (new node) per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the group to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_groups) return;
+
+    /* 
+    * Idea: third part of "apply_coarsening_touching_scatter" -> scatter outbound
+    *  => assumes each inbound set has been now sorted, and can be used for binary search
+    */
+
+    const dim_t ungroups_start_idx = ungroups_offsets[warp_id], ungroups_end_idx = ungroups_offsets[warp_id + 1];
+    const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
+    const dim_t coarse_touching_start_idx = coarse_touching_offsets[warp_id];
+    const uint32_t coarse_touching_size = (uint32_t)(coarse_touching_offsets[warp_id + 1] - coarse_touching_offsets[warp_id]);
+    const uint32_t new_inbound_count = coarse_inbound_count[warp_id];
     const uint32_t coarse_outbound_size = coarse_touching_size - new_inbound_count;
+    uint32_t *coarse_touching_start = coarse_touching + coarse_touching_start_idx;
+    uint32_t *coarse_outbound_start = coarse_touching_start + new_inbound_count;
 
-    // must re-init shared memory because it was used for sorting
+    // SM deduplication hash-set
+    extern __shared__ uint32_t block_new_touching[];
+    uint32_t *new_touching = block_new_touching + MAX_SM_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
     wrp_init<uint32_t>(new_touching, MAX_SM_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    __syncwarp();
 
     // for every original node in the group, go over its outbound set
     for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
@@ -950,9 +982,6 @@ void apply_coarsening_touching_scatter(
             }
         }
     }
-
-    if (lane_id == 0)
-        coarse_inbound_count[warp_id] = new_inbound_count;
 }
 
 // write to each node the partition of its group

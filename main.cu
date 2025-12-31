@@ -19,6 +19,8 @@
 #include </home/mronzani/cuda/include/thrust/iterator/discard_iterator.h>
 #include </home/mronzani/cuda/include/thrust/iterator/permutation_iterator.h>
 
+#include </home/mronzani/cuda/include/cub/cub.cuh>
+
 #include "hgraph.hpp"
 #include "nmhardware.hpp"
 #include "utils.cuh"
@@ -127,7 +129,7 @@ extern __global__ void apply_coarsening_touching_count(
     dim_t* coarse_touching_offsets
 ) ;
 
-extern __global__ void apply_coarsening_touching_scatter(
+extern __global__ void apply_coarsening_touching_scatter_inbound(
     const uint32_t* touching,
     const dim_t* touching_offsets,
     const uint32_t* inbound_count,
@@ -137,6 +139,18 @@ extern __global__ void apply_coarsening_touching_scatter(
     const dim_t* coarse_touching_offsets,
     uint32_t* coarse_touching,
     uint32_t* coarse_inbound_count
+);
+
+extern __global__ void apply_coarsening_touching_scatter_outbound(
+    const uint32_t* touching,
+    const dim_t* touching_offsets,
+    const uint32_t* inbound_count,
+    const uint32_t* ungroups,
+    const dim_t* ungroups_offsets,
+    const uint32_t num_groups,
+    const dim_t* coarse_touching_offsets,
+    const uint32_t* coarse_inbound_count,
+    uint32_t* coarse_touching
 );
 
 extern __global__ void apply_uncoarsening_partitions(
@@ -304,7 +318,7 @@ void printHelp() {
         "Options:\n"
         "  -r <file>   Reload hypergraph from file\n"
         "  -s <file>   Save partitioned hypergraph to file\n"
-        "  -c <name>   Constraints set to use (valid ones: truenorth, loihi64, loihi84 - default is loihi64)\n"
+        "  -c <name>   Constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024 - default is loihi64)\n"
         "  -h          Show this help\n";
 }
 
@@ -368,6 +382,7 @@ int main(int argc, char** argv) {
     std::unordered_map<std::string, HardwareModel (*)()> configurations {
         { "loihi64", HardwareModel::createLoihiLarge },
         { "loihi84", HardwareModel::createLoihiJin84 },
+        { "loihi1024", HardwareModel::createLoihiJin1024 },
         { "truenorth", HardwareModel::createTrueNorth }
     };
     auto hw_it = configurations.find(constraints);
@@ -1002,6 +1017,7 @@ int main(int argc, char** argv) {
 
         // prepare coarse touching buffers
         uint32_t *d_coarse_touching = nullptr;
+        uint32_t *d_coarse_touching_buffer = nullptr;
         dim_t *d_coarse_touching_offsets = nullptr;
         uint32_t *d_coarse_inbound_count = nullptr;
         CUDA_CHECK(cudaMalloc(&d_coarse_touching_offsets, (1 + new_num_nodes) * sizeof(dim_t))); // NOTE: the number nodes decreases!
@@ -1026,7 +1042,8 @@ int main(int argc, char** argv) {
         dim_t new_touching_size = 0; // last value in the inclusive scan = full reduce = total number of touching hedges among all sets
         CUDA_CHECK(cudaMemcpy(&new_touching_size, d_coarse_touching_offsets + new_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMalloc(&d_coarse_touching, new_touching_size * sizeof(uint32_t)));
-        // launch configuration - coarsening kernel (touching - scatter)
+        CUDA_CHECK(cudaMalloc(&d_coarse_touching_buffer, new_touching_size * sizeof(uint32_t)));
+        // launch configuration - coarsening kernel (touching - scatter - inbound)
         threads_per_block = 128; // 128/32 -> 4 warps per block
         warps_per_block = threads_per_block / WARP_SIZE;
         num_warps_needed = new_num_nodes ; // 1 warp per group
@@ -1034,9 +1051,9 @@ int main(int argc, char** argv) {
         // compute shared memory per block (bytes)
         bytes_per_warp = MAX_SM_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
         shared_bytes = warps_per_block * bytes_per_warp;
-        // launch - coarsening kernel (touching - scatter)
-        std::cout << "Running coarsening kernel (touching - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        apply_coarsening_touching_scatter<<<blocks, threads_per_block, shared_bytes>>>(
+        // launch - coarsening kernel (touching - scatter - inbound)
+        std::cout << "Running coarsening kernel (touching - scatter - inbound) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        apply_coarsening_touching_scatter_inbound<<<blocks, threads_per_block, shared_bytes>>>(
             d_touching,
             d_touching_offsets,
             d_inbound_count,
@@ -1049,6 +1066,37 @@ int main(int argc, char** argv) {
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
+        // sort each inbound touching set
+        cub::DoubleBuffer<uint32_t> c_coarse_touching_double_buffer(d_coarse_touching, d_coarse_touching_buffer);
+        void* c_temp_storage = nullptr;
+        size_t c_storage_bytes = 0;
+        std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_touching_size * sizeof(uint32_t)) / (1 << 30) << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_storage_bytes) / (1 << 20) << " MB of temporary storage ...\n";
+        cub::DeviceSegmentedRadixSort::SortKeys(c_temp_storage, c_storage_bytes, c_coarse_touching_double_buffer, new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
+        cudaMalloc(&c_temp_storage, c_storage_bytes);
+        cub::DeviceSegmentedRadixSort::SortKeys(c_temp_storage, c_storage_bytes, c_coarse_touching_double_buffer, new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
+        if (c_coarse_touching_double_buffer.Current() != d_coarse_touching) {
+            uint32_t* tmp = d_coarse_touching_buffer;
+            d_coarse_touching_buffer = d_coarse_touching;
+            d_coarse_touching = tmp;
+        }
+        // launch configuration - coarsening kernel (touching - scatter - outbound) - same as coarsening kernel (touching - scatter - inbound)
+        // launch - coarsening kernel (touching - scatter - outbound)
+        std::cout << "Running coarsening kernel (touching - scatter - outbound) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        apply_coarsening_touching_scatter_outbound<<<blocks, threads_per_block, shared_bytes>>>(
+            d_touching,
+            d_touching_offsets,
+            d_inbound_count,
+            d_ungroups,
+            d_ungroups_offsets,
+            new_num_nodes,
+            d_coarse_touching_offsets,
+            d_coarse_inbound_count,
+            d_coarse_touching
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(d_coarse_touching_buffer));
+        CUDA_CHECK(cudaFree(c_temp_storage));
 
         // spill non-coarse data structures to host
         std::vector<uint32_t> h_hedges;
@@ -1061,7 +1109,7 @@ int main(int argc, char** argv) {
             h_hedges_offsets.reserve(num_hedges + 1);
             h_touching.reserve(touching_size);
             h_touching_offsets.reserve(curr_num_nodes + 1);
-            std::cout << "Spilling " << std::fixed << std::setprecision(3) << (float)((h_hedges.size() + h_hedges_offsets.size() + h_touching.size() + h_touching_offsets.size()) * sizeof(uint32_t)) / (1 << 30) << " GB from device to host at level " << level_idx << " ...\n";
+            std::cout << "Spilling " << std::fixed << std::setprecision(3) << (float)((hedges_size + touching_size) * sizeof(uint32_t) + (num_hedges + 1 + curr_num_nodes + 1) * sizeof(dim_t)) / (1 << 30) << " GB from device to host at level " << level_idx << " ...\n";
             CUDA_CHECK(cudaMemcpy(h_hedges.data(), d_hedges, hedges_size * sizeof(uint32_t), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(h_hedges_offsets.data(), d_hedges_offsets, (num_hedges + 1) * sizeof(dim_t), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(h_touching.data(), d_touching, touching_size * sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -1116,7 +1164,7 @@ int main(int argc, char** argv) {
 
         // un-spill non-coarse data structures to device
         if (level_idx < SAVE_MEMORY_UP_TO_LEVEL) {
-            std::cout << "Unspilling " << std::fixed << std::setprecision(3) << (float)((h_hedges.size() + h_hedges_offsets.size() + h_touching.size() + h_touching_offsets.size()) * sizeof(uint32_t)) / (1 << 30) << " GB from host to device at level " << level_idx << " ...\n";
+            std::cout << "Unspilling " << std::fixed << std::setprecision(3) << (float)((hedges_size + touching_size) * sizeof(uint32_t) + (num_hedges + 1 + curr_num_nodes + 1) * sizeof(dim_t)) / (1 << 30) << " GB from host to device at level " << level_idx << " ...\n";
             CUDA_CHECK(cudaMalloc(&d_hedges, hedges_size * sizeof(uint32_t)));
             CUDA_CHECK(cudaMalloc(&d_hedges_offsets, (num_hedges + 1) * sizeof(dim_t)));
             CUDA_CHECK(cudaMalloc(&d_touching, touching_size * sizeof(uint32_t)));
