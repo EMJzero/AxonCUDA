@@ -49,11 +49,11 @@ For convenience, we discuss algorithmic complexity using the following variables
 | 16M-model | loihi84 | <code style="color : red">ko</code> |
 | LenNet | loihi64 | <code style="color : lime">ok</code> |
 | VGG11 | loihi84 | <code style="color : lime">ok</code> |
-| AlexNet | loihi84 | <code style="color : red">ko</code> |
+| AlexNet | loihi84 | <code style="color : lime">ok</code> |
 | MobileNet | loihi84 | <code style="color : red">ko</code> |
 | Allen V1 | loihi84 | <code style="color : red">ko</code> |
-| 16k-rand | loihi64 | <code style="color : red">ko</code> |
-| 64k-rand | loihi64 | <code style="color : red">ko</code> |
+| 16k-rand | loihi64 | <code style="color : lime">ok</code> |
+| 64k-rand | loihi64 | <code style="color : lime">ok</code> |
 | 256k-rand | loihi64 | <code style="color : red">ko</code> |
 
 > All "ko"s are out-of-memory instances...

@@ -475,10 +475,6 @@ void grouping_kernel(
             if (curr_tid >= num_nodes) break;
             // if you formed a pair, stop
             if (completed_repeats & (1u << repeat)) continue;
-            if (group_slots[curr_tid*MAX_GROUP_SIZE].score == UINT32_MAX) {
-                completed_repeats |= (1u << repeat);
-                continue;
-            }
 
             uint32_t* curr_path = path + actual_path_size * repeat;
             int32_t curr_path_length = 0;
@@ -579,7 +575,21 @@ void grouping_kernel(
         // global synch
         grid.sync();
 
-        // TODO: anyone not yet selected (score != UINT32_MAX), set your score to 0 to enable the next pairing round, then sync again and continue!
+        // anyone not yet selected (score != UINT32_MAX), set your score to 0 to enable the next pairing round, then sync again and continue
+        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+            const uint32_t curr_tid = tid + repeat * tcount;
+            if (curr_tid >= num_nodes) break;
+            // if you formed a pair, stop
+            if (completed_repeats & (1u << repeat)) continue;
+            if (group_slots[curr_tid].score == UINT32_MAX) {
+                completed_repeats |= (1u << repeat);
+                continue;
+            }
+            group_slots[curr_tid].score = 0;
+        }
+
+        // global synch
+        grid.sync();
     }
 
     // write inside "groups" the minimum id among each node's slots, used to identify its group, eventually, zero-base those ids

@@ -401,10 +401,7 @@ int main(int argc, char** argv) {
     std::cout << "  Chips along x, y:  " << hw.chipsPerSystemX() << ", " << hw.chipsPerSystemY() << " (" << hw.chipsPerSystemX() * hw.chipsPerSystemY() << " tot.)" << "\n";
     std::cout << "  Routing energy, latency: " << std::fixed << std::setprecision(3) << hw.energyPerRouting() << " pJ, " << hw.latencyPerRouting() << " ns\n";
     std::cout << "  Wire energy, latency:    " << std::fixed << std::setprecision(3) << hw.energyPerWire() << " pJ, " << hw.latencyPerWire() << " ns\n";
-
-    // ============================
-    // === CUDA STUFF GOES HERE ===
-
+    
     std::cout << "CUDA device:\n";
     
     // get device properties
@@ -419,26 +416,26 @@ int main(int argc, char** argv) {
     std::cout << "  Max. grid size: " << props.maxGridSize[0] << " x " << props.maxGridSize[1] << " x " << props.maxGridSize[2] << "\n";
     std::cout << "  Max. block size: " << props.maxThreadsDim[0] << " x " << props.maxThreadsDim[1] << " x " << props.maxThreadsDim[2] << "\n";
 
-    std::cout << "Starting timer...\n";
-    auto time_start = std::chrono::high_resolution_clock::now();
-
-    std::cout << "Setting up GPU memory...\n";
+    std::cout << "Preparing hypergraph data...\n";
 
     uint32_t num_hedges = static_cast<uint32_t>(hg.hedges().size());
     std::vector<dim_t> hedges_offsets; // hedge idx -> hedge start index in the contiguous hedges array
     hedges_offsets.reserve(num_hedges + 1);
-
+    
     // prepare hedge offsets
+    // HP: no duplicates per hedge, no self-cycles (keep the src only, but still consider the hedge among the src's inbounds)
+    hg.deduplicateHyperedges();
     for (uint32_t i = 0; i < num_hedges; ++i)
         hedges_offsets.push_back(static_cast<dim_t>(hg.hedges()[i].offset()));
     hedges_offsets.push_back(hg.hedgesFlat().size());
-
+    
     std::vector<uint32_t> touching_hedges;
     std::vector<dim_t> touching_hedges_offsets;
     touching_hedges.reserve(hg.hedgesFlat().size()); // with one outbound hedge per node, the total number of pins (e*d) is the total number of connections (n*h)
     touching_hedges_offsets.reserve(hg.nodes() + 1);
 
     // prepare touching sets
+    // HP: no duplicates in either set, eventually duplicates in outbound w.r.t. inbounds will also be lost
     for (uint32_t n = 0; n < hg.nodes(); ++n) {
         touching_hedges_offsets.push_back(touching_hedges.size());
         // NOTE: must put in inbounds first!
@@ -448,13 +445,14 @@ int main(int argc, char** argv) {
             touching_hedges.push_back(h);
     }
     touching_hedges_offsets.push_back(touching_hedges.size());
-
+    uint32_t touching_hedges_size = touching_hedges.size();
+    
     // prepare hyperedge weights
     std::vector<float> hedge_weights(num_hedges);
     for (uint32_t i = 0; i < num_hedges; ++i) {
         hedge_weights[i] = hg.hedges()[i].weight();
     }
-
+    
     // total number of distinct nodes (for output indexing)
     const uint32_t num_nodes = hg.nodes(); // nodes count used when allocating outputs
     
@@ -463,12 +461,27 @@ int main(int argc, char** argv) {
     const uint32_t h_max_inbound_per_part = hw.synapsesPerCore();
     const uint32_t max_parts = hw.coresCount(); // not needed in kernels
     const uint32_t target_parts = min(max_parts, (num_nodes + h_max_nodes_per_part - 1) / h_max_nodes_per_part);
-    /*
-    * How to check them:
-    * - max_nodes_per_part: keep a running total count of nodes-per-group, that ultimately becomes nodes-per-partition
-    * - max_inbound_per_part: use the touching count minus one for every node (use the same running nodes count used to check max_nodes_per_part)
-    */
+    
+    std::cout << "Starting timer...\n";
+    auto time_start = std::chrono::high_resolution_clock::now();
+    
+    std::cout << "Setting up GPU memory...\n";
 
+    // ============================
+    // === CUDA STUFF GOES HERE ===
+    
+    // device streams
+    cudaStream_t compute_stream = nullptr;
+    cudaStream_t transfer_stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_stream, cudaStreamNonBlocking));
+    int least_priority = 0;
+    int greatest_priority = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
+    // give higher priority access to memory bandwidth to the compute kernel
+    CUDA_CHECK(cudaStreamCreateWithPriority(&compute_stream, cudaStreamNonBlocking, greatest_priority));
+    CUDA_CHECK(cudaStreamCreateWithPriority(&transfer_stream, cudaStreamNonBlocking, least_priority));
+    
     // device pointers
     uint32_t *d_hedges = nullptr;
     dim_t *d_hedges_offsets = nullptr;
@@ -515,6 +528,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_touching, touching_hedges.data(), touching_hedges.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_touching_offsets, touching_hedges_offsets.data(), (num_nodes + 1) * sizeof(dim_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_hedge_weights, hedge_weights.data(), num_hedges * sizeof(float), cudaMemcpyHostToDevice));
+    std::vector<dim_t>().swap(hedges_offsets);
+    std::vector<uint32_t>().swap(touching_hedges);
+    std::vector<dim_t>().swap(touching_hedges_offsets);
 
     // initialize
     thrust::device_ptr<uint32_t> t_nodes_sizes(d_nodes_sizes);
@@ -533,6 +549,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // prepare neighborhoods
+    // HP: no duplicates in neighbors, no one's own self among one's neighbors
     // uses a two-step method, first just counting, then writing, to allocate exactly the amount of memory needed, since neighborhoods can explode quickly...
     uint32_t *d_oversized_neighbors = nullptr;
     dim_t max_neighbors = (dim_t)(1.2 * (float)hg.sampleMaxNeighborhoodSize(240)); // TODO: is 240 enough here?
@@ -950,30 +967,30 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaFree(d_neighbors_offsets));
             // => defer construction to after we have the coarse hedges and touching sets
         } else {
-        CUDA_CHECK(cudaMalloc(&d_coarse_neighbors, new_neighbors_size * sizeof(uint32_t)));
-        // launch configuration - coarsening kernel (neighbors - scatter)
-        threads_per_block = 128;
-        num_threads_needed = new_num_nodes; // 1 thread per group
-        blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-        // launch - coarsening kernel (neighbors - scatter)
-        std::cout << "Running coarsening kernel (neighbors - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        apply_coarsening_neighbors_scatter<<<blocks, threads_per_block>>>(
-            d_neighbors,
-            d_neighbors_offsets,
-            d_groups,
-            d_ungroups,
-            d_ungroups_offsets,
-            new_num_nodes,
-            d_coarse_neighbors_offsets,
-            d_coarse_neighbors
-        );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        // de-allocate old neighbors and replace them with coarse ones
-        CUDA_CHECK(cudaFree(d_neighbors));
-        CUDA_CHECK(cudaFree(d_neighbors_offsets));
-        d_neighbors = d_coarse_neighbors;
-        d_neighbors_offsets = d_coarse_neighbors_offsets;
+            CUDA_CHECK(cudaMalloc(&d_coarse_neighbors, new_neighbors_size * sizeof(uint32_t)));
+            // launch configuration - coarsening kernel (neighbors - scatter)
+            threads_per_block = 128;
+            num_threads_needed = new_num_nodes; // 1 thread per group
+            blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+            // launch - coarsening kernel (neighbors - scatter)
+            std::cout << "Running coarsening kernel (neighbors - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            apply_coarsening_neighbors_scatter<<<blocks, threads_per_block>>>(
+                d_neighbors,
+                d_neighbors_offsets,
+                d_groups,
+                d_ungroups,
+                d_ungroups_offsets,
+                new_num_nodes,
+                d_coarse_neighbors_offsets,
+                d_coarse_neighbors
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            // de-allocate old neighbors and replace them with coarse ones
+            CUDA_CHECK(cudaFree(d_neighbors));
+            CUDA_CHECK(cudaFree(d_neighbors_offsets));
+            d_neighbors = d_coarse_neighbors;
+            d_neighbors_offsets = d_coarse_neighbors_offsets;
         }
 
         // prepare coarse hedges buffers
@@ -1097,7 +1114,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaFree(d_coarse_touching_buffer));
         CUDA_CHECK(cudaFree(c_temp_storage));
-
+        
         // spill non-coarse data structures to host
         std::vector<uint32_t> h_hedges;
         std::vector<dim_t> h_hedges_offsets;
@@ -1143,7 +1160,7 @@ int main(int argc, char** argv) {
             d_neighbors = d_coarse_neighbors;
             d_neighbors_offsets = d_coarse_neighbors_offsets;
         }
-
+        
         // ======================================
         // recursive call, go down one more level
         auto [num_partitions, d_coarse_partitions] = coarsen_refine_uncoarsen(
@@ -1645,7 +1662,7 @@ int main(int argc, char** argv) {
         hg.hedgesFlat().size(),
         d_touching,
         d_touching_offsets,
-        touching_hedges.size(),
+        touching_hedges_size,
         d_inbound_count,
         d_nodes_sizes
     );
@@ -1708,6 +1725,9 @@ int main(int argc, char** argv) {
     // final sync
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaStreamDestroy(transfer_stream));
+    CUDA_CHECK(cudaStreamDestroy(compute_stream));
 
     auto time_end = std::chrono::high_resolution_clock::now();
     std::cout << "Stopping timer...\n";

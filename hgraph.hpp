@@ -373,6 +373,39 @@ namespace hgraph {
             return HyperGraph(node_count_, new_hedges, new_weights);
         }
 
+        // remove duplicate nodes (and self-cycles) inside each hyperedge
+        // NOTE: if a duplicate involves source + destination, the source is kept, while 'inbound_' and 'outbound_' sets are NOT updated (e.g. the hedge still shows among the source's inbounds)
+        void deduplicateHyperedges() {
+            std::vector<uint32_t> new_flat;
+            new_flat.reserve(hedges_flat_.size());
+            uint32_t new_offset = 0;
+            for (auto& he : hedges_) {
+                const uint32_t old_offset = he.offset();
+                const uint32_t old_length = he.length();
+                const uint32_t src = hedges_flat_[old_offset];
+
+                std::set<uint32_t> seen;
+                new_flat.push_back(src);
+                seen.insert(src);
+
+                for (uint32_t i = 1; i < old_length; ++i) {
+                    uint32_t v = hedges_flat_[old_offset + i];
+                    if (seen.insert(v).second)
+                        new_flat.push_back(v);
+                }
+
+                uint32_t new_length = static_cast<uint32_t>(new_flat.size() - new_offset);
+                he = HyperEdge(new_offset, new_length, he.weight(), nullptr);
+                new_offset += new_length;
+            }
+
+            hedges_flat_.swap(new_flat);
+            hedges_flat_.shrink_to_fit();
+
+            const uint32_t* base = hedges_flat_.data();
+            for (auto& he : hedges_)
+                he = HyperEdge(he.offset(), he.length(), he.weight(), base);
+        }
 
         // builds all neighborhoods (in- and outbound to each node)
         void buildNeighborhoods() {
@@ -533,4 +566,71 @@ namespace hgraph {
             return HyperGraph(nodes, hedges, weights);
         }
     };
+
+    // doc: https://course.ece.cmu.edu/~ee760/760docs/hMetisManual.pdf
+    /*static HyperGraph load_hmetis(const std::string& path) {
+        std::ifstream f(path);
+        if (!f) throw std::runtime_error("Cannot open .hgr file");
+
+        auto nextDataLine = [&]() -> std::string {
+            std::string line;
+            while (std::getline(f, line)) {
+                if (!line.empty() && line[0] != '%')
+                    return line;
+            }
+            return {};
+        };
+
+        std::string header = nextDataLine();
+        if (header.empty()) throw std::runtime_error("Empty .hgr file");
+
+        std::istringstream hs(header);
+        uint32_t E, V;
+        uint32_t fmt = 0;
+        hs >> E >> V;
+        if (!(hs >> fmt)) fmt = 0;
+
+        bool edge_weights = (fmt == 1 || fmt == 11);
+        bool node_weights = (fmt == 10 || fmt == 11);
+
+        std::vector<std::vector<uint32_t>> hedges;
+        std::vector<float> weights;
+        hedges.reserve(E);
+        weights.reserve(E);
+
+        for (uint32_t i = 0; i < E; ++i) {
+            std::string line = nextDataLine();
+            if (line.empty()) throw std::runtime_error("Unexpected end of file while reading hyperedges");
+
+            std::istringstream ls(line);
+
+            float w = 1.0f;
+            if (edge_weights)
+                ls >> w;
+            std::vector<uint32_t> nodes;
+            uint32_t v;
+            while (ls >> v) {
+                if (v == 0 || v > V) throw std::runtime_error("Invalid node encountered");
+                nodes.push_back(v - 1); // convert hMetis's 1-based to 0-based node id
+            }
+            if (nodes.size() < 2) throw std::runtime_error("Hyperedge must contain at least 2 nodes");
+            hedges.push_back(nodes);
+            weights.push_back(w);
+        }
+
+        //std::vector<uint32_t> vertex_weights;
+        if (node_weights) {
+            std::cerr << "WARNING: .hgr files with vertex weights are not supported !!\n";
+            //vertex_weights.resize(V);
+            //for (uint32_t i = 0; i < V; ++i) {
+            //    std::string line = nextDataLine();
+            //    if (line.empty())
+            //        throw std::runtime_error("Unexpected end of file while reading vertex weights");
+            //    vertex_weights[i] = static_cast<uint32_t>(std::stoul(line));
+            //}
+        }
+
+        return HyperGraph(V, hedges, weights);
+    }*/
+
 };
