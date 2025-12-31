@@ -28,7 +28,7 @@
 #define DEVICE_ID 0
 
 #define VERBOSE true
-#define VERBOSE_LENGTH 10
+#define VERBOSE_LENGTH 20
 
 extern __global__ void inverse_placement_kernel(
     const coords* placement,
@@ -267,7 +267,9 @@ int main(int argc, char** argv) {
             std::cout << "Loading hypergraph from: " << load_path << " ...\n";
             if (!std::filesystem::is_regular_file(load_path)) throw std::runtime_error("The provided path is not a file.");
             std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
-            hg = HyperGraph::load(load_path);
+            HyperGraph hg_tmp = HyperGraph::load(load_path);
+            std::cout << "Loading complete, ordering nodes ...\n";
+            hg = hg_tmp.feedForwardOrder();
             loaded = true;
         } catch (const std::exception& e) {
             std::cerr << "Error loading file: " << e.what() << "\n";
@@ -447,20 +449,7 @@ int main(int argc, char** argv) {
     // TODO: TOPOLOGICAL NODES ORDER BEFORE THIS! OR SPECTRAL LAYOUT !!
     std::vector<coords> init_placement = hilbertPlacement(num_nodes, h_max_width, h_max_height);
     CUDA_CHECK(cudaMemcpy(d_placement, init_placement.data(), num_nodes * sizeof(coords), cudaMemcpyHostToDevice));
-
-    // =============================
-    // print some temporary results
-    #if VERBOSE
-    std::cout << "Initial placement:\n";
-    for (uint32_t i = 0; i < num_nodes; ++i) {
-        if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
-            const coords place = init_placement[i];
-            std::cout << "  node " << i << " -> x=" << place.x << " y=" << place.y << "\n";
-        }
-    }
-    #endif
-    // =============================
-
+    
     std::vector<Coord2D> h_init_placement(num_nodes);
     for (uint32_t i = 0; i < num_nodes; i++) {
         h_init_placement[i] = Coord2D(
@@ -468,7 +457,7 @@ int main(int argc, char** argv) {
             init_placement[i].y
         );
     }
-
+    
     if (hw.checkPlacementValidity(hg, h_init_placement, true)) {
         auto metrics = hw.getAllMetrics(hg, h_init_placement);
         std::cout << "Initial placement metrics:\n";
@@ -484,6 +473,20 @@ int main(int argc, char** argv) {
         std::cerr << "ERROR, invalid initial placement !!\n";
         return 1;
     }
+    std::vector<Coord2D>().swap(h_init_placement);
+
+    // =============================
+    // print some temporary results
+    #if VERBOSE
+    std::cout << "Initial placement:\n";
+    for (uint32_t i = 0; i < num_nodes; ++i) {
+        if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
+            const coords place = init_placement[i];
+            std::cout << "  node " << i << " -> x=" << place.x << " y=" << place.y << "\n";
+        }
+    }
+    #endif
+    // =============================
 
     // initialize inverse placement
     CUDA_CHECK(cudaMemset(d_inv_placement, 0xFF, h_max_width * h_max_height * sizeof(uint32_t)));
@@ -830,17 +833,21 @@ int main(int argc, char** argv) {
     // =============================
     // print some example outputs
     #if VERBOSE
-    std::cout << "Final partitioning results:\n";
+    std::cout << "Final placement:\n";
     for (uint32_t i = 0; i < num_nodes; ++i) {
-        coords plc = placement[i];
         if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
-            if (plc.x == INT32_MAX) std::cout << "node " << i << " -> plc=none\n";
-            else std::cout << "node " << i << " ->" << " plc=(" << plc.x << ", " << plc.y << ")" << "\n";
+            coords place = placement[i];
+            std::cout << "  node " << i << " -> x=" << place.x << " y=" << place.y << "\n";
         }
     }
+    std::vector<uint32_t> final_inv_place_tmp(h_max_width * h_max_height);
+    CUDA_CHECK(cudaMemcpy(final_inv_place_tmp.data(), d_inv_placement, h_max_width * h_max_height * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    std::cout << "Final inverse placement:\n";
+    printMatrixHex16(final_inv_place_tmp.data(), h_max_width, h_max_height, VERBOSE_LENGTH, VERBOSE_LENGTH);
+    std::vector<uint32_t>().swap(final_inv_place_tmp);
     #endif
     // =============================
-
+    
     // cleanup device memory
     CUDA_CHECK(cudaFree(d_hedges));
     CUDA_CHECK(cudaFree(d_hedges_offsets));

@@ -75,7 +75,9 @@ void forces_kernel(
         const float my_hedge_weight = hedge_weights[actual_hedge_idx];
         for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
             if (my_hedge < not_my_hedge) {
-                const coords pin_place = placement[*my_hedge];
+                const uint32_t pin = *my_hedge;
+                if (pin == warp_id) continue;
+                const coords pin_place = placement[pin];
                 const uint32_t distance = manhattan(my_place, pin_place);
                 my_base_potential += my_hedge_weight * distance;
                 // logic: base potential = how much distant I am be from my connectees
@@ -91,7 +93,7 @@ void forces_kernel(
     // reduce across the warp
     my_base_potential = warpReduceSumLN0<float>(my_base_potential);
     for (uint32_t f = 0; f < 4; f++)
-    my_forces[f] = warpReduceSumLN0<float>(my_forces[f]);
+        my_forces[f] = warpReduceSumLN0<float>(my_forces[f]);
     
     if (lane_id == 0) {
         // logic: final force = reduction in distance if moved (higher is better)
@@ -485,6 +487,7 @@ void cascade_kernel(
         for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
             if (my_hedge < not_my_hedge) {
                 const uint32_t pin = *my_hedge;
+                if (pin == curr_node) continue;
                 coords pin_place;
                 uint32_t pin_event_idx = nodes_rank[pin];
                 // reconstruct the pin's placement w.r.t. the sequence of events
@@ -549,6 +552,7 @@ void cascade_kernel(
             for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
                 if (my_hedge < not_my_hedge) {
                     const uint32_t pin = *my_hedge;
+                    if (pin == curr_node) continue;
                     coords pin_place;
                     uint32_t pin_event_idx = nodes_rank[pin];
                     // reconstruct the pin's placement w.r.t. the sequence of events

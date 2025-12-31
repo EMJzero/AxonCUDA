@@ -1,5 +1,6 @@
 #pragma once
 #include <set>
+#include <queue>
 #include <vector>
 #include <ranges>
 #include <cstdint>
@@ -277,6 +278,101 @@ namespace hgraph {
 
             return HyperGraph(new_nodes, new_hedges, new_weights);
         }
+
+        HyperGraph feedForwardOrder() const {
+            std::vector<int32_t> new_id(node_count_, -1);
+            std::vector<float> priority(node_count_, 0.0f);
+            std::vector<bool> active(node_count_, false);
+
+            uint32_t next_id = 0;
+
+            struct pq_entry {
+                float priority;
+                uint32_t node;
+            };
+
+            struct max_cmp {
+                bool operator()(const pq_entry& a, const pq_entry& b) const {
+                    if (a.priority != b.priority)
+                        return a.priority < b.priority; // max-heap
+                    return a.node > b.node; // deterministic tie-break
+                }
+            };
+
+            std::priority_queue<pq_entry, std::vector<pq_entry>, max_cmp> heap;
+
+            auto activate = [&](uint32_t n, float delta) {
+                priority[n] += delta;
+                heap.push({priority[n], n});
+                active[n] = true;
+            };
+
+            while (next_id < node_count_) {
+                uint32_t min_inbound = UINT32_MAX;
+                std::vector<uint32_t> fallback;
+
+                for (uint32_t n = 0; n < node_count_; ++n) {
+                    if (new_id[n] != -1) continue;
+
+                    uint32_t deg = inbound_[n].size();
+                    if (deg == 0) {
+                        if (!active[n])
+                            activate(n, INFINITY);
+                    } else if (deg < min_inbound) {
+                        min_inbound = deg;
+                        fallback = {n};
+                    } else if (deg == min_inbound) {
+                        fallback.push_back(n);
+                    }
+                }
+
+                if (heap.empty()) {
+                    std::sort(fallback.begin(), fallback.end());
+                    for (uint32_t n : fallback)
+                        activate(n, INFINITY);
+                }
+
+                while (!heap.empty()) {
+                    auto [p, n] = heap.top();
+                    heap.pop();
+
+                    if (new_id[n] != -1) continue;
+                    if (p != priority[n]) continue;
+
+                    new_id[n] = next_id++;
+                    active[n] = false;
+
+                    for (uint32_t hid : outbound_[n]) {
+                        const HyperEdge& he = hedges_[hid];
+                        const float w = he.weight();
+
+                        for (uint32_t i = 0; i < he.length(); ++i) {
+                            uint32_t m = hedges_flat_[he.offset() + i];
+                            if (new_id[m] == -1)
+                                activate(m, w);
+                        }
+                    }
+                }
+            }
+
+            std::vector<std::vector<uint32_t>> new_hedges;
+            std::vector<float> new_weights;
+            new_hedges.reserve(hedges_.size());
+            new_weights.reserve(hedges_.size());
+
+            for (const auto& he : hedges_) {
+                std::vector<uint32_t> hv;
+                hv.reserve(he.length());
+                hv.push_back(new_id[he.source()]);
+                for (uint32_t d : he.destinations())
+                    hv.push_back(new_id[d]);
+                new_hedges.push_back(std::move(hv));
+                new_weights.push_back(he.weight());
+            }
+
+            return HyperGraph(node_count_, new_hedges, new_weights);
+        }
+
 
         // builds all neighborhoods (in- and outbound to each node)
         void buildNeighborhoods() {
