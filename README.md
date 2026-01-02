@@ -54,6 +54,6 @@ For convenience, we discuss algorithmic complexity using the following variables
 | Allen V1 | loihi84 | <code style="color : red">ko</code> |
 | 16k-rand | loihi64 | <code style="color : lime">ok</code> |
 | 64k-rand | loihi64 | <code style="color : lime">ok</code> |
-| 256k-rand | loihi64 | <code style="color : red">ko</code> |
+| 256k-rand | loihi64 | <code style="color : lime">ok</code> |
 
 > All "ko"s are out-of-memory instances...

@@ -517,7 +517,7 @@ namespace hwmodel {
         if (partitions.size() != snn.nodes())
             throw std::runtime_error("Each neuron must be assigned to a partition.");
 
-        // count neurons per partition and distinct partitions.
+        // count neurons per partition and distinct partitions
         std::unordered_map<uint32_t, uint32_t> partitions_counter;
         partitions_counter.reserve(partitions.size());
         for (uint32_t p : partitions) {

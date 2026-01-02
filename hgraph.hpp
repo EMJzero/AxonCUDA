@@ -565,72 +565,84 @@ namespace hgraph {
 
             return HyperGraph(nodes, hedges, weights);
         }
+
+        // doc: https://course.ece.cmu.edu/~ee760/760docs/hMetisManual.pdf
+        static HyperGraph load_hmetis(const std::string& path) {
+            std::ifstream f(path);
+            if (!f) throw std::runtime_error("Cannot open .hgr file");
+
+            auto nextDataLine = [&]() -> std::string {
+                std::string line;
+                while (std::getline(f, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    size_t i = line.find_first_not_of(" \t");
+                    if (i == std::string::npos) continue;
+                    if (line[i] == '%') continue;
+                    return line.substr(i);
+                }
+                return {};
+            };
+
+            std::string header = nextDataLine();
+            if (header.empty()) throw std::runtime_error("Empty .hgr file");
+
+            std::istringstream hs(header);
+            uint32_t E, V;
+            uint32_t fmt = 0;
+            hs >> E >> V;
+            if (!(hs >> fmt)) fmt = 0;
+
+            bool edge_weights = (fmt == 1 || fmt == 11);
+            bool node_weights = (fmt == 10 || fmt == 11);
+
+            std::vector<std::vector<uint32_t>> hedges;
+            std::vector<float> weights;
+            hedges.reserve(E);
+            weights.reserve(E);
+            uint32_t singleton_hyperedges = 0;
+
+            for (uint32_t i = 0; i < E; ++i) {
+                std::string line = nextDataLine();
+                if (line.empty()) throw std::runtime_error("Unexpected end of file while reading hyperedges");
+
+                std::istringstream ls(line);
+
+                float w = 1.0f;
+                if (edge_weights)
+                    ls >> w;
+                std::vector<uint32_t> nodes;
+                uint32_t v;
+                while (ls >> v) {
+                    if (v == 0 || v > V) throw std::runtime_error("Invalid node encountered");
+                    nodes.push_back(v - 1); // convert hMetis's 1-based to 0-based node id
+                }
+                if (nodes.size() < 1) throw std::runtime_error("Hyperedge must contain at least one node");
+                else if (nodes.size() == 1) {
+                    singleton_hyperedges++;
+                    continue;
+                }
+                hedges.push_back(nodes);
+                weights.push_back(w);
+            }
+
+            //std::vector<uint32_t> vertex_weights;
+            if (node_weights) {
+                std::cerr << "WARNING: .hgr files with vertex weights are not supported !!\n";
+                //vertex_weights.resize(V);
+                //for (uint32_t i = 0; i < V; ++i) {
+                //    std::string line = nextDataLine();
+                //    if (line.empty())
+                //        throw std::runtime_error("Unexpected end of file while reading vertex weights");
+                //    vertex_weights[i] = static_cast<uint32_t>(std::stoul(line));
+                //}
+            }
+            if (singleton_hyperedges > 0) {
+                std::cerr << "WARNING: skipped " << singleton_hyperedges << " singleton hyperedges (cardinality = 1) !!\n";
+            }
+
+            return HyperGraph(V, hedges, weights);
+        }
+    
     };
-
-    // doc: https://course.ece.cmu.edu/~ee760/760docs/hMetisManual.pdf
-    /*static HyperGraph load_hmetis(const std::string& path) {
-        std::ifstream f(path);
-        if (!f) throw std::runtime_error("Cannot open .hgr file");
-
-        auto nextDataLine = [&]() -> std::string {
-            std::string line;
-            while (std::getline(f, line)) {
-                if (!line.empty() && line[0] != '%')
-                    return line;
-            }
-            return {};
-        };
-
-        std::string header = nextDataLine();
-        if (header.empty()) throw std::runtime_error("Empty .hgr file");
-
-        std::istringstream hs(header);
-        uint32_t E, V;
-        uint32_t fmt = 0;
-        hs >> E >> V;
-        if (!(hs >> fmt)) fmt = 0;
-
-        bool edge_weights = (fmt == 1 || fmt == 11);
-        bool node_weights = (fmt == 10 || fmt == 11);
-
-        std::vector<std::vector<uint32_t>> hedges;
-        std::vector<float> weights;
-        hedges.reserve(E);
-        weights.reserve(E);
-
-        for (uint32_t i = 0; i < E; ++i) {
-            std::string line = nextDataLine();
-            if (line.empty()) throw std::runtime_error("Unexpected end of file while reading hyperedges");
-
-            std::istringstream ls(line);
-
-            float w = 1.0f;
-            if (edge_weights)
-                ls >> w;
-            std::vector<uint32_t> nodes;
-            uint32_t v;
-            while (ls >> v) {
-                if (v == 0 || v > V) throw std::runtime_error("Invalid node encountered");
-                nodes.push_back(v - 1); // convert hMetis's 1-based to 0-based node id
-            }
-            if (nodes.size() < 2) throw std::runtime_error("Hyperedge must contain at least 2 nodes");
-            hedges.push_back(nodes);
-            weights.push_back(w);
-        }
-
-        //std::vector<uint32_t> vertex_weights;
-        if (node_weights) {
-            std::cerr << "WARNING: .hgr files with vertex weights are not supported !!\n";
-            //vertex_weights.resize(V);
-            //for (uint32_t i = 0; i < V; ++i) {
-            //    std::string line = nextDataLine();
-            //    if (line.empty())
-            //        throw std::runtime_error("Unexpected end of file while reading vertex weights");
-            //    vertex_weights[i] = static_cast<uint32_t>(std::stoul(line));
-            //}
-        }
-
-        return HyperGraph(V, hedges, weights);
-    }*/
 
 };

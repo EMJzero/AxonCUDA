@@ -1,7 +1,7 @@
 # ==========================================
 # Project settings
 # ==========================================
-TARGET      := hgraph_gpu.exe
+TARGET      := balance_gpu.exe
 CXX         := g++
 NVCC        := nvcc
 
@@ -26,10 +26,10 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(NVCC) $(LINKFLAGS) -o $@ $^
 
-%.o: %.cpp hgraph.hpp nmhardware.hpp
+%.o: %.cpp ../hgraph.hpp ../nmhardware.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-%.o: %.cu hgraph.hpp nmhardware.hpp utils.cuh
+%.o: %.cu ../hgraph.hpp ../nmhardware.hpp ../utils.cuh utils.cuh
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 # ==========================================
@@ -62,7 +62,7 @@ run: $(TARGET)
 
 #   make run8k
 run8k: $(TARGET)
-	./$(TARGET) -r hgraphs/8k_model_ordered_processed
+	./$(TARGET) -r ../hgraphs/8k_model_ordered_processed
 
 # Profile:
 #   make profile <input_file>
