@@ -11,6 +11,8 @@ using dim_t = unsigned long long; // aka uint64_t
 #define WARP_SIZE 32u
 // TODO: determine this at runtime w.r.t. the mean and variance of the spike frequency!
 #define FIXED_POINT_SCALE 262144u // used to convert scores to fixed point
+// TODO: this is just a good guess on how much more memory give to oversized buffers during deduplication, refine it!
+#define OVERSIZED_SIZE_MULTIPLIER 1.5f
 
 #define SAVE_MEMORY_UP_TO_LEVEL 2 // number of coarsening levels for which to spill non-coarse data structures to the host, set to 0 to disable the feature
 
@@ -65,8 +67,8 @@ __forceinline__ __device__ T warpReduceSumLN0(T val) {
 
 // USED BY: neighborhoods kernel
 
-#define SM_MAX_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
-#define GM_MIN_DEDUPE_BUFFER_SIZE 256u
+#define SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
+#define GM_MIN_BLOCK_DEDUPE_BUFFER_SIZE 256u
 
 
 // USED BY: candidates kernel
@@ -169,12 +171,10 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* __restrict__ s, uin
 }
 
 
-// USED BY: coarsening routines
+// USED BY: coarsening routines (all, touching, hedges, and neighbors)
 
-// NOTE: these are local memory! No theoretical size limit!
-#define MAX_DEDUPE_BUFFER_SIZE 16384u //8192u // for hedges
-#define MAX_LARGE_DEDUPE_BUFFER_SIZE 32768u // for neighbors
-#define MAX_SM_DEDUPE_BUFFER_SIZE 3072u // for touching
+#define MAX_SM_WARP_DEDUPE_BUFFER_SIZE 3072u // the A100 has 48KB of SM, this is (48KB/4B of uint32s)/4 warps per block
+#define MIN_GM_WARP_DEDUPE_BUFFER_SIZE 256u // just for safety, interplays with 'MAX_HASH_PROBE_LENGTH' and 'OVERSIZED_SIZE_MULTIPLIER'
 
 
 // USED BY: fm refinement kernel

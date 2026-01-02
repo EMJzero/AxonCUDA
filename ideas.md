@@ -391,3 +391,50 @@ Memory solution:
 NONONONO, this could never work! The idea that "neighbors of a node never increase" is false! Terribly false, from the moment that you aggregate nodes, increasing their united neighbors set size w.r.t. each node by itself!
 
 Remember: even local memory eats up global memory if you give 8k or so entries to each thread!!!!
+
+---
+
+Idea for neighbors coarsening:
+- the issue is the large local memory buffer (~28GB)
+  => must vanquish any large local memory structure
+- upgrade both count and scatter to a node per warp and shared memory pre-lookup
+- rather than the sort + binary search like for touching, if we always use the same hash-set structure for nodes, we can use the has-set itself for deduping:
+  - easy when scattering, same pattern as the outbound part of touching
+  - less easy for counting, since you would need, for a node, to go take its ungroup, and for each ungroup node, go over each of my group node's neighbors set to see if it's there
+
+The warp divergence issue with the SM pre-lookup:
+Some threads will hit SM postively, others not, thus some go to GM, others not.
+The solution would be to make SM not into a pre-lookup but into a very precise index over GM, that surpasses what the hash-set can do and gives the result in almost always one access. Borrow ideas from database indices!
+
+=> for the "oversized" buffer strategy, you can compute the expected maximum number of neighbors per node as “new_num_nodes / curr_num_nodes” * (the previous max_neighbors_per_node), this does not account for deduplication tho…so as you keep updating max_neighbors_per_node, it becomes more and more oversized…
+
+
+Deduplication:
+- upgrade SM hash-sets to:
+  1) counting bloom filter or cuckoo Filter
+  2) hash-set with eviction
+  => with either option, revert back to an exact SM hash-set if the maximum entries count is <= SM size
+
+Issue:
+How can we know an upper bound to the number of neighbors per node?
+What we know:
+- new and prev number of nodes
+- initial maximum number of neighbors estimate
+Idea:
+- update the maximum neighbors estimate by scaling it by new_num_nodes/curr_num_nodes
+- allocate maximum neighbors * curr_num_nodes space
+- each warp (that handles one new node / group) takes its group size * maximum neighbors space
+  => to know where its space starts and ends, each node just re-uses the ungroup offsets, the ungroup offset * maximum neighbors gives you the offset inside the dedupe buffer
+
+For hedges it's easier: their size can only decrease! Just give them a pre-allocated size equal to min(1, 1.2 * new_num_nodes/curr_num_nodes) the previous size!
+
+TODO: move the "1.2" safety factor to a define!
+
+Maximum duplicates count while handling one group: MAX_GROUP_SIZE^2 
+ => each new neighbor of a node could appear MAX_GROUP_SIZE times if the node was a neighbor to all those that got grouped together, and then we could be considering a group where all MAX_GROUP_SIZE nodes had another group appear in its entirety among their neighbors
+ => this comes in handy to tune the counting bloom filter!
+
+Final upgrade:
+Transform the "scatter" into a true scatter. While counting, write everything in GM too, then while scattering you just need to copy from the oversized memory over to the new - correctly size - memory, a pack!
+=> do this with a runtime check, only when you have enough memory to keep allocated both the correctly-sized array and the oversized one!
+=>=> cuda check memory, if twice the oversized buffer's amount of memory is available, go for the "fast" strategy!
