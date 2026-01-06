@@ -622,7 +622,6 @@ void apply_coarsening_hedges_count(
     const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
     const uint32_t num_hedges,
     const uint32_t max_hedge_size,
-    const bool discharge, // if true -> finish by dumping SM into GM too, making GM contain the whole (sparse) set
     uint32_t* __restrict__ coarse_oversized_hedges,
     dim_t* __restrict__ coarse_hedges_offsets // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
 ) {
@@ -672,15 +671,6 @@ void apply_coarsening_hedges_count(
     }
 
     new_hedges_count = warpReduceSumLN0<uint32_t>(new_hedges_count);
-
-    if (discharge) {
-        // dump SM over to GM all at once; rely on the above warp-reduce as a sync
-        for (uint32_t i = lane_id; i < MAX_SM_WARP_DEDUPE_BUFFER_SIZE; i += WARP_SIZE) {
-            uint32_t pin = new_pins[i];
-            if (pin != HASH_EMPTY)
-                gm_hashset_insert(oversized_coarse_hedges_start, max_hedge_size, pin);
-        }
-    }
 
     if (lane_id == 0)
         coarse_hedges_offsets[warp_id + 1] = (dim_t)new_hedges_count; // leave the first entry to be 0 (offset of the first hedge)

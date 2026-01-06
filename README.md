@@ -40,20 +40,20 @@ For convenience, we discuss algorithmic complexity using the following variables
 
 # Working HyperGraphs
 
-| **hypergraph** | **hardware** | **status** |
-| --- | --- | --- |
-| 8k-model | loihi64 | <code style="color : lime">ok</code> |
-| 64k-model | loihi64 | <code style="color : lime">ok</code> |
-| 256k-model | loihi84 | <code style="color : lime">ok</code> |
-| 1M-model | loihi84 | <code style="color : lime">ok</code> |
-| 16M-model | loihi84 | <code style="color : red">ko</code> |
-| LenNet | loihi64 | <code style="color : lime">ok</code> |
-| VGG11 | loihi84 | <code style="color : lime">ok</code> |
-| AlexNet | loihi84 | <code style="color : lime">ok</code> |
-| MobileNet | loihi84 | <code style="color : red">ko</code> |
-| Allen V1 | loihi84 | <code style="color : red">ko</code> |
-| 16k-rand | loihi64 | <code style="color : lime">ok</code> |
-| 64k-rand | loihi64 | <code style="color : lime">ok</code> |
-| 256k-rand | loihi64 | <code style="color : lime">ok</code> |
+| **hypergraph** | **hardware** | **status** | score [cut cost] | time [ms] | notes |
+| --- | --- | --- | --- | --- | --- |
+| 8k-model | loihi64 | <code style="color : lime">ok</code> | 10123.654 | 376.632 |  |
+| 64k-model | loihi64 | <code style="color : lime">ok</code> | 45651.293 | 2604.534 |  |
+| 256k-model | loihi84 | <code style="color : lime">ok</code> | 53971.926 | 24197.279 |  |
+| 1M-model | loihi84 | <code style="color : lime">ok</code> | 164824.750 | 358181.033 | as of commit 99500e3 |
+| 16M-model | loihi84 | <code style="color : red">ko</code> |  |  |  |
+| LenNet | loihi64 | <code style="color : lime">ok</code> | 3631.116 | 878.774 |  |
+| VGG11 | loihi84 | <code style="color : lime">ok</code> | 71695.305 | 302039.327 |  |
+| AlexNet | loihi84 | <code style="color : lime">ok</code> | 20610.857 | 344111.681 |  |
+| MobileNet | loihi84 | <code style="color : red">ko</code> |  |  |  |
+| Allen V1 | loihi84 | <code style="color : red">ko</code> |  |  |  |
+| 16k-rand | loihi64 | <code style="color : lime">ok</code> | 90674.516 | 530.093 |  |
+| 64k-rand | loihi64 | <code style="color : lime">ok</code> | 709580.000 | 2246.531 |  |
+| 256k-rand | loihi64 | <code style="color : lime">ok</code> | 4108240.750 | 16451.505 |  |
 
 > All "ko"s are out-of-memory instances...

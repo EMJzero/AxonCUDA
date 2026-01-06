@@ -83,7 +83,6 @@ extern __global__ void apply_coarsening_hedges_count(
     const uint32_t* groups,
     const uint32_t num_hedges,
     const uint32_t max_hedge_size,
-    const bool discharge,
     uint32_t *coarse_oversized_hedges,
     dim_t* coarse_hedges_offsets
 );
@@ -1098,11 +1097,7 @@ int main(int argc, char** argv) {
         uint32_t *d_coarse_oversized_hedges = nullptr;
         dim_t *d_coarse_hedges_offsets = nullptr;
         dim_t curr_max_hedge_size = (dim_t)(OVERSIZED_SIZE_MULTIPLIER * (float)max_hedge_size);
-        // if there is enough memory for the full oversized buffer, SM dischard included, a speedier version is used, that replaced the scatter with a direct pack from the initial oversized allocation!
-        cudaMemGetInfo(&free_bytes, &total_bytes);
-        bool direct_scatter_coarse_hedges = (num_hedges * curr_max_hedge_size /*oversized (SM included)*/ + num_hedges * max_hedge_size /*final upper bound*/) * sizeof(uint32_t) + num_hedges * sizeof(dim_t) /*offsets*/ < free_bytes;
-        // no pack? can spare space in the oversized buffer equal to the amount of shared memory used for fast deduping
-        if (!direct_scatter_coarse_hedges) curr_max_hedge_size = curr_max_hedge_size > MAX_SM_WARP_DEDUPE_BUFFER_SIZE ? curr_max_hedge_size - MAX_SM_WARP_DEDUPE_BUFFER_SIZE : 0;
+        curr_max_hedge_size = curr_max_hedge_size > MAX_SM_WARP_DEDUPE_BUFFER_SIZE ? curr_max_hedge_size - MAX_SM_WARP_DEDUPE_BUFFER_SIZE : 0;
         curr_max_hedge_size = max(curr_max_hedge_size, (dim_t)MIN_GM_WARP_DEDUPE_BUFFER_SIZE);
         if (num_hedges * curr_max_hedge_size * sizeof(uint32_t) > (1ull << 32))
             std::cout << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_hedges * curr_max_hedge_size * sizeof(uint32_t)) / (1 << 30) << " GB for hedges deduplication ...\n";
@@ -1126,13 +1121,12 @@ int main(int argc, char** argv) {
             d_groups,
             num_hedges,
             curr_max_hedge_size,
-            direct_scatter_coarse_hedges,
             d_coarse_oversized_hedges,
             d_coarse_hedges_offsets
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
-        if (!direct_scatter_coarse_hedges) CUDA_CHECK(cudaFree(d_coarse_oversized_hedges));
+        CUDA_CHECK(cudaFree(d_coarse_oversized_hedges));
         // correct the max hedge size estimate
         auto actual_coarse_max_hedge_size = thrust::max_element(t_coarse_hedges_offsets, t_coarse_hedges_offsets + num_hedges + 1);
         dim_t actual_coarse_max_hedge_size_offset = static_cast<dim_t>(actual_coarse_max_hedge_size - t_coarse_hedges_offsets);
@@ -1143,33 +1137,19 @@ int main(int argc, char** argv) {
         dim_t new_hedges_size = 0; // last value in the inclusive scan = full reduce = total number of pins among all hedges
         CUDA_CHECK(cudaMemcpy(&new_hedges_size, d_coarse_hedges_offsets + num_hedges, sizeof(dim_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMalloc(&d_coarse_hedges, new_hedges_size * sizeof(uint32_t)));
-        if (direct_scatter_coarse_hedges) {
-            // launch configuration - coarsening kernel (hedges - pack) - same as coarsening kernel (hedges - count)
-            std::cout << "Running coarsening kernel (hedges - pack) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            // launch - neighborhoods scatter kernel
-            pack_segments<<<blocks, threads_per_block>>>(
-                d_coarse_oversized_hedges,
-                d_coarse_hedges_offsets,
-                num_hedges,
-                curr_max_hedge_size,
-                d_coarse_hedges
-            );
-        } else {
-            // launch configuration - coarsening kernel (hedges - scatter) - same as coarsening kernel (hedges - count)
-            // launch - coarsening kernel (hedges - scatter)
-            std::cout << "Running coarsening kernel (hedges - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            apply_coarsening_hedges_scatter<<<blocks, threads_per_block, shared_bytes>>>(
-                d_hedges,
-                d_hedges_offsets,
-                d_groups,
-                num_hedges,
-                d_coarse_hedges_offsets,
-                d_coarse_hedges
-            );
-        }
+        // launch configuration - coarsening kernel (hedges - scatter) - same as coarsening kernel (hedges - count)
+        // launch - coarsening kernel (hedges - scatter)
+        std::cout << "Running coarsening kernel (hedges - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        apply_coarsening_hedges_scatter<<<blocks, threads_per_block, shared_bytes>>>(
+            d_hedges,
+            d_hedges_offsets,
+            d_groups,
+            num_hedges,
+            d_coarse_hedges_offsets,
+            d_coarse_hedges
+        );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
-        if(direct_scatter_coarse_hedges) CUDA_CHECK(cudaFree(d_coarse_oversized_hedges));
 
         // prepare coarse touching buffers
         uint32_t *d_coarse_touching = nullptr;
