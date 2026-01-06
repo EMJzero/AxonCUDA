@@ -16,8 +16,6 @@ using dim_t = unsigned long long; // aka uint64_t
 
 #define SAVE_MEMORY_UP_TO_LEVEL 2 // number of coarsening levels for which to spill non-coarse data structures to the host, set to 0 to disable the feature
 
-// NOTE: everything tagged as "wrp" or "warp" assumes that all lanes are active, unless otherwise specified!
-
 // initialize memory for a block of threads: one consecutive chunk per warp
 // => the memory can be shared memory or global alike, so long as each location is exclusive to a block
 template <typename T>
@@ -46,50 +44,31 @@ __device__ __forceinline__ void thr_init(T* __restrict__ lm, const dim_t size, c
         lm[i] = val;
 }
 
-// every warp lane sees the sum
+// every warp lane sees the max
 template <typename T>
 __forceinline__ __device__ T warpReduceSum(T val) {
     #pragma unroll
-    for (int offset = 1; offset < WARP_SIZE; offset <<= 1)
-        val += __shfl_xor_sync(0xFFFFFFFFu, val, offset);
-    return val;
-}
-
-// only lane == 0 sees the sum
-template <typename T>
-__forceinline__ __device__ T warpReduceSumLN0(T val) {
-    #pragma unroll
-    for (int offset = WARP_SIZE/2; offset > 0; offset /= 2)
-        val += __shfl_down_sync(0xFFFFFFFFu, val, offset);
-    return val;
-}
-
-// lane i gets "sum_{k=0..i} in[k]"
-template <typename T>
-__forceinline__ __device__ T warpInclusiveScan(T val) {
-    int lane = threadIdx.x & (WARP_SIZE - 1);
-    #pragma unroll
     for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-        T n = __shfl_up_sync(0xFFFFFFFFu, val, offset);
-        if (lane >= offset) val += n;
+        val += __shfl_xor_sync(0xffffffff, val, offset);
     }
     return val;
 }
 
-// lane i gets "sum_{k=0..i-1} in[k]", lane 0 gets 0
+// only lane == 0 sees the max
 template <typename T>
-__forceinline__ __device__ T warpExclusiveScan(T val) {
-    T inclusive = warpInclusiveScan(val);
-    T excl = __shfl_up_sync(0xFFFFFFFFu, inclusive, 1);
-    int lane = threadIdx.x & (WARP_SIZE - 1);
-    if (lane == 0) excl = T(0);
-    return excl;
+__forceinline__ __device__ T warpReduceSumLN0(T val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
 }
 
 
 // USED BY: neighborhoods kernel
 
-#define SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
+#define SM_MAX_BLOCK_32DEDUPE_BUFFER_SIZE 8192u // for 32bit values // 16384u is too big for an A100...
+#define SM_MAX_BLOCK_64DEDUPE_BUFFER_SIZE 4096u // for 64bit values
 #define GM_MIN_BLOCK_DEDUPE_BUFFER_SIZE 256u
 
 
@@ -195,7 +174,8 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* __restrict__ s, uin
 
 // USED BY: coarsening routines (all, touching, hedges, and neighbors)
 
-#define MAX_SM_WARP_DEDUPE_BUFFER_SIZE 3072u // the A100 has 48KB of SM, this is (48KB/4B of uint32s)/4 warps per block
+#define MAX_SM_WARP_32DEDUPE_BUFFER_SIZE 3072u // the A100 has 48KB of SM, this is (48KB/4B of uint32s)/4 warps per block
+#define MAX_SM_WARP_64DEDUPE_BUFFER_SIZE 1536u // half the above, for 64bit entries instead of 32bit
 #define MIN_GM_WARP_DEDUPE_BUFFER_SIZE 256u // just for safety, interplays with 'MAX_HASH_PROBE_LENGTH' and 'OVERSIZED_SIZE_MULTIPLIER'
 
 
@@ -388,7 +368,7 @@ __device__ __forceinline__ bool gm_hashset_contains(const uint32_t* __restrict__
 
 // NOTE: this reuses defines and hash functions from the hash-set above
 
-typedef struct {
+typedef struct __align__(8) {
     uint32_t key;
     uint32_t value;
 } hashmap_entry;
@@ -537,7 +517,7 @@ __device__ __forceinline__ bool gm_hashmap_lookup(const hashmap_entry* __restric
         } else if (cur_key == HASH_EMPTY)
             return false;
     }
-    return false;
+    return false; 
 }
 
 
@@ -788,4 +768,135 @@ __device__ __forceinline__ uint32_t binary_search(const T* a, dim_t n, T value) 
             return mid; // found -> return idx
     }
     return UINT32_MAX; // not found
+}
+
+
+// BLOOM FILTER (w/ counting)
+
+// This admits false negatives:
+// - returns 'true' if surely the value has been seen already
+// - returns 'false' if not sure / the value may be new
+// Moreover, a 'true' outcome will never, under no circumstances, revert to a 'false'.
+// => this Bloom filter has a monotonic "certainty" property, once a value is "surely seen", it will forever remain "surely seen"!
+// => the false negative manifests as returning 'false' even though the value has already been inserted at least once before (with an earlier return of 'false').
+// In turn, this means that an exact backup structure behind it must store ALL values that get seen, thus being able to resolve any false negative...
+// this uses atomics, it's safe to use anywhere (preferibly SM)
+template <uint32_t DUPES> // maximum number of instances of any element allowed (must be < 256 aka a ushort)
+__device__ __forceinline__ bool blk_bloom_insert(uint32_t* __restrict__ bf, dim_t size, uint32_t value) {
+    static_assert(DUPES >= 1, "DUPES must be >= 1");
+    static_assert(DUPES < 256, "DUPES must fit in uint8_t counter");
+
+    // reinterpret sm as shorts
+    const uint32_t total_counters = (uint32_t)(size * 4);
+
+    // bloom filter with 2 hashes
+    uint32_t h = hash_uint32(value);
+    uint32_t h1 = h;
+    uint32_t h2 = (h >> 16) | (h << 16);
+
+    bool seen_before = true;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        uint32_t idx = (h1 + i * h2) % total_counters;
+        // get the byte and the 32-bit word holding the counter
+        uint32_t word_idx = idx >> 2; 
+        uint32_t shift = (idx & 3u) * 8u;
+        uint32_t mask = 0xFFu << shift;
+        uint32_t* word = &bf[word_idx];
+        uint32_t old_word = *word;
+        uint32_t old_cnt = (old_word & mask) >> shift;
+        if (old_cnt == 0) seen_before = false;
+        if (old_cnt >= DUPES) continue;
+        // bounded CAS retry (on the whole 32-bit word)
+        #pragma unroll
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            uint32_t cnt = (old_word & mask) >> shift;
+            if (cnt >= DUPES) break;
+            uint32_t newcnt = cnt + 1;
+            uint32_t updated = (old_word & ~mask) | (newcnt << shift);
+            uint32_t prev = atomicCAS(word, old_word, updated);
+            if (prev == old_word) break;
+            // data race lost, result uncertain, lean on the false negative
+            seen_before = false;
+            old_word = prev;
+        }
+    }
+
+    return seen_before;
+}
+
+// same as 'blk_bloom_insert' but uses warp primitives instead of atomics
+// => it can be safely run by a full warp at once, if a thread uses 'value = UINT32_MAX' it will safely participate while "doing nothing"!
+template <uint32_t DUPES> // maximum number of instances of any element allowed
+__device__ __forceinline__ bool wrp_bloom_insert(uint32_t* __restrict__ bf, dim_t size, uint32_t value) {
+    static_assert(DUPES >= 1, "DUPES must be >= 1");
+    static_assert(DUPES < 256, "DUPES must fit in uint8_t counter");
+
+    // reinterpret sm as shorts
+    uint8_t* __restrict__ counters = reinterpret_cast<uint8_t*>(bf);
+    const uint32_t total_counters = (uint32_t)(size * 4); // bytes
+
+    // bloom filter with 2 hashes
+    uint32_t h = hash_uint32(value);
+    uint32_t h1 = h;
+    uint32_t h2 = (h >> 16) | (h << 16);
+
+    const unsigned full = __activemask();
+    const bool participate = (value != 0xFFFFFFFFu);
+    const unsigned part_mask = __ballot_sync(full, participate);
+    if (part_mask == 0u) return false;
+    bool seen_before = true;
+
+    #pragma unroll
+    for (int probe = 0; probe < 2; ++probe) {
+        const uint32_t idx = (h1 + probe * h2) % total_counters;
+        const uint32_t word_idx = participate ? idx >> 2 : UINT32_MAX; // idx / 4
+        const uint32_t byte_sel = participate ? idx & 3u : 0u; // idx % 4
+        // find active lanes that target the same 32-bit word
+        const unsigned group_all = __match_any_sync(full, word_idx);
+        const unsigned group = group_all & part_mask;
+        const int leader = __ffs(group) - 1;
+        // if not participating in the probe, just sync and continue
+        if (!participate) { __syncwarp(full); continue; }
+        // leader lane loads the old 32-bit word (contains 4 counters)
+        uint32_t old_word = 0;
+        if ((int)(threadIdx.x & 31) == leader) old_word = bf[word_idx];
+        // broadcast old_word to lanes in this group
+        old_word = __shfl_sync(group, old_word, leader);
+        // each lane extracts its own old counter
+        const uint32_t shift = byte_sel * 8u;
+        const uint32_t old_cnt = (old_word >> shift) & 0xFFu;
+        if (old_cnt == 0) seen_before = false;
+        // if the counter already saturated, no need to increment (still counts as "seen" if non-zero)
+        if (old_cnt < DUPES) {
+            // build per-byte masks within this group
+            const unsigned m0 = __ballot_sync(full, participate && (byte_sel == 0u)) & group;
+            const unsigned m1 = __ballot_sync(full, participate && (byte_sel == 1u)) & group;
+            const unsigned m2 = __ballot_sync(full, participate && (byte_sel == 2u)) & group;
+            const unsigned m3 = __ballot_sync(full, participate && (byte_sel == 3u)) & group;
+            // single writer per word: leader applies all increments and stores once
+            if ((int)(threadIdx.x & 31) == leader) {
+                uint32_t new_word = old_word;
+
+                auto apply = [&](unsigned m, uint32_t bshift) {
+                    const uint32_t inc = (uint32_t)__popc(m);
+                    if (inc == 0) return;
+                    const uint32_t cnt = (old_word >> bshift) & 0xFFu;
+                    if (cnt >= DUPES) return;
+                    uint32_t sum = cnt + inc;
+                    if (sum > DUPES) sum = DUPES;
+                    new_word = (new_word & ~(0xFFu << bshift)) | (sum << bshift);
+                };
+
+                apply(m0, 0u);
+                apply(m1, 8u);
+                apply(m2, 16u);
+                apply(m3, 24u);
+                bf[word_idx] = new_word;
+            }
+        }
+        // ensure the store is visible before the next probe potentially touches the same word
+        __syncwarp(full);
+    }
+    return seen_before;
 }

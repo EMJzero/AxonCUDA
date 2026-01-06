@@ -45,7 +45,7 @@ For convenience, we discuss algorithmic complexity using the following variables
 | 8k-model | loihi64 | <code style="color : lime">ok</code> |
 | 64k-model | loihi64 | <code style="color : lime">ok</code> |
 | 256k-model | loihi84 | <code style="color : lime">ok</code> |
-| 1M-model | loihi84 | <code style="color : red">ko</code> |
+| 1M-model | loihi84 | <code style="color : lime">ok</code> |
 | 16M-model | loihi84 | <code style="color : red">ko</code> |
 | LenNet | loihi64 | <code style="color : lime">ok</code> |
 | VGG11 | loihi84 | <code style="color : lime">ok</code> |

@@ -12,24 +12,32 @@ __constant__ uint32_t max_inbound_per_part;
 
 // REMEMBER: "const" means the data pointed to is not modified, not the pointer itself!
 
-// count the number of distinct neighbors of each node (to then perform a scan and find offsets where to write the neighborhoods)
-// SEQUENTIAL COMPLEXITY: n*h*d
-// PARALLEL OVER: n
-__global__
-void neighborhoods_count_kernel(
-    const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
-    const uint32_t num_nodes,
-    uint32_t* __restrict__ neighbors_offsets // here filled as counters of "how many neighbors per node" -> then do a prefix sum for the offsets
-) {
-    /*
-    * Idea: BIN pattern of count->scan->scatter
-    */
+// TODO: upgrade "uint_32_t"s to "uint64_t"s to handle >4M nodes, >4M touching per node, >4M pins per hedge, >4M neighbors per node!
 
-    // STYLE: one node per block, one touching hedge per warp, distinct neighbors in shared memory!
+// find the best neighbor for each node to stay with (edge-coarsening)
+// SEQUENTIAL COMPLEXITY: n*h*d + n*(# neighbors)*h
+// PARALLEL OVER: n
+// SHUFFLES OVER: h*d (neighbors)
+__global__
+void candidates_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t* __restrict__ inbound_count,
+    const float* __restrict__ hedge_weights,
+    const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t num_hedges,
+    const uint32_t num_nodes,
+    const uint32_t max_neighbors_spill,
+    hashmap_entry* __restrict__ neighbors_spill,
+    uint32_t* __restrict__ pairs,
+    uint32_t* __restrict__ scores,
+    uint32_t* __restrict__ max_distinct
+) {
+    // STYLE: one node per block, one touching hedge per warp, neighbors histogram in shared memory + global spill!
     const uint32_t node_id = blockIdx.x;
+    // NOTE: the whole block returns, no need to sync
     if (node_id >= num_nodes) return;
 
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
@@ -39,85 +47,29 @@ void neighborhoods_count_kernel(
 
     const uint32_t* my_touching = touching + touching_offsets[node_id];
     //const uint32_t* not_my_touching = touching + touching_offsets[node_id + 1];
-    const uint32_t my_touching_count = touching_offsets[node_id + 1] - touching_offsets[node_id];
-    
-    // hash-set for deduplication
-    __shared__ uint32_t dedupe[SM_MAX_DEDUPE_BUFFER_SIZE];
+    const uint32_t my_touching_count = (uint32_t)(touching_offsets[node_id + 1] - touching_offsets[node_id]);
+
+    // no touching hedges, return immediately
+    if (my_touching_count == 0) return;
+
+    hashmap_entry* my_spill = neighbors_spill + node_id * max_neighbors_spill;
+
+    // all threads in the block should agree on those...
+    // TODO: only keep these in lane 0!
+    uint32_t best_score[MAX_CANDIDATES];
+    thr_init<uint32_t>(best_score, MAX_CANDIDATES, 0);
+    uint32_t best_neighbor[MAX_CANDIDATES];
+    thr_init<uint32_t>(best_neighbor, MAX_CANDIDATES, UINT32_MAX);
+
+    // hash-set for deduplication (allows false-negatives, back it up with true deduplication in global memory)
+    __shared__ hashmap_entry histogram[SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE];
+    // HP: each node has less than UINT32_MAX neighbors
     __shared__ uint32_t seen_distinct_total;
     uint32_t seen_distinct = 0;
     
     // initialize shared memory
-    sm_init<uint32_t>(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-    if (threadIdx.x == 0)
-        seen_distinct_total = 0;
-    __syncthreads();
-    
-    // can return only after helping initializing shared memory
-    if (warp_id >= my_touching_count) return;
-    
-    // TOOD: could optimize by iterating directly on pointers
-    for (uint32_t touching_hedge_idx = warp_id; touching_hedge_idx < my_touching_count; touching_hedge_idx += warps_per_block) { // the block loops over touching hedges
-        if (touching_hedge_idx < my_touching_count) {
-            const uint32_t my_hedge_idx = my_touching[touching_hedge_idx];
-            const uint32_t* my_hedge = hedges + hedges_offsets[my_hedge_idx];
-            //const uint32_t* not_my_hedge = hedges + hedges_offsets[my_hedge_idx + 1];
-            const uint32_t my_hedge_size = hedges_offsets[my_hedge_idx + 1] - hedges_offsets[my_hedge_idx];
-            for (uint32_t node_idx = lane_id; node_idx < my_hedge_size; node_idx += WARP_SIZE) { // the warp loops over hedge pins
-                if (node_idx < my_hedge_size) {
-                    uint32_t neighbor = my_hedge[node_idx];
-                    if (neighbor != node_id && sm_hashset_insert(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, neighbor))
-                        seen_distinct++;
-                }
-            }
-        }
-    }
-
-    // reduce distinct counts per-warp
-    seen_distinct = warpReduceSum<uint32_t>(seen_distinct);
-
-    // accumulate counts per-block
-    if (lane_id == 0)
-        atomicAdd(&seen_distinct_total, seen_distinct);
-    __syncthreads();
-
-    if (threadIdx.x == 0)
-        neighbors_offsets[node_id] = seen_distinct_total;
-}
-
-// compute the distinct neighbors of each node (again) and write them at the pre-computed offsets in global memory
-// SEQUENTIAL COMPLEXITY: n*h*d
-// PARALLEL OVER: n
-__global__
-void neighborhoods_scatter_kernel(
-    const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
-    const uint32_t num_nodes,
-    const uint32_t* __restrict__ neighbors_offsets,
-    uint32_t* __restrict__ neighbors
-) {
-    // STYLE: one node per block, one touching hedge per warp, distinct neighbors in shared memory!
-    const uint32_t node_id = blockIdx.x;
-    if (node_id >= num_nodes) return;
-
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // local per block - coincides with the touching hedge to handle
-    const uint32_t warp_id = threadIdx.x / WARP_SIZE;
-    const uint32_t warps_per_block = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-
-    const uint32_t* my_touching = touching + touching_offsets[node_id];
-    //const uint32_t* not_my_touching = touching + touching_offsets[node_id + 1];
-    const uint32_t my_touching_count = touching_offsets[node_id + 1] - touching_offsets[node_id];
-
-    uint32_t* my_neighbors = neighbors + neighbors_offsets[node_id];
-
-    // hash-set for deduplication
-    __shared__ uint32_t dedupe[SM_MAX_DEDUPE_BUFFER_SIZE];
-    __shared__ uint32_t seen_distinct_total;
-    
-    // initialize shared memory
-    sm_init<uint32_t>(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    blk_init<hashmap_entry>(histogram, SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE, { HASH_EMPTY, 0u });
+    blk_init<hashmap_entry>(my_spill, max_neighbors_spill, { HASH_EMPTY, 0u });
     if (threadIdx.x == 0)
         seen_distinct_total = 0;
     __syncthreads();
@@ -131,46 +83,52 @@ void neighborhoods_scatter_kernel(
             const uint32_t my_hedge_idx = my_touching[touching_hedge_idx];
             const uint32_t* my_hedge = hedges + hedges_offsets[my_hedge_idx];
             //const uint32_t* not_my_hedge = hedges + hedges_offsets[my_hedge_idx + 1];
-            const uint32_t my_hedge_size = hedges_offsets[my_hedge_idx + 1] - hedges_offsets[my_hedge_idx];
+            const uint32_t my_hedge_size = (uint32_t)(hedges_offsets[my_hedge_idx + 1] - hedges_offsets[my_hedge_idx]);
+            const uint32_t my_hedge_weight = (uint32_t)(hedge_weights[my_hedge_idx]*FIXED_POINT_SCALE);
             for (uint32_t node_idx = lane_id; node_idx < my_hedge_size; node_idx += WARP_SIZE) { // the warp loops over hedge pins
                 if (node_idx < my_hedge_size) {
                     uint32_t neighbor = my_hedge[node_idx];
-                    if (neighbor != node_id && sm_hashset_insert(dedupe, SM_MAX_DEDUPE_BUFFER_SIZE, neighbor)) {
-                        uint32_t offset = atomicAdd(&seen_distinct_total, 1); // returns the value as it was before the increment (reserving that idx)
-                        my_neighbors[offset] = neighbor;
-                    }
+                    if (neighbor == node_id) continue;
+                    uint32_t symm_noise = deterministic_noise(neighbor, node_id); // TODO: it's costly to recompute this each time
+                    uint8_t inserted = sm_hashmap_try_insert(histogram, SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE, neighbor, symm_noise, my_hedge_weight);
+                    // inserted == 1 -> no need to put into GM what already is in the SM hash-set
+                    // inserted == 2 -> SM full, check in GM
+                    if (inserted == 1 || inserted == 2 && gm_hashmap_insert(my_spill, max_neighbors_spill, neighbor, symm_noise, my_hedge_weight)) // triggers an assert if 'max_neighbors' is exceeded
+                        seen_distinct++;
                 }
             }
         }
     }
 
-    // TODO: could remove this, but for now keep it, just to make sure the hash-set is deterministic
+    // reduce distinct counts
+    seen_distinct = warpReduceSum<uint32_t>(seen_distinct);
+    if (lane_id == 0)
+        atomicAdd(&seen_distinct_total, seen_distinct);
     __syncthreads();
+
     if (threadIdx.x == 0)
-        assert(neighbors_offsets[node_id + 1] - neighbors_offsets[node_id] == seen_distinct_total);
-}
+        *max_distinct = (dim_t)seen_distinct_total;
+    
+    
+
+    for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
+        if (threadIdx.x == i) {
+            pairs[warp_id * MAX_CANDIDATES + i] = best_neighbor[i];
+            scores[warp_id * MAX_CANDIDATES + i] = best_score[i]; // stay fixed point for now!
+        }
+    }
 
 
-// find the best neighbor for each node to stay with (edge-coarsening)
-// SEQUENTIAL COMPLEXITY: n*h*d + n*(# neighbors)*h
-// PARALLEL OVER: n
-// SHUFFLES OVER: h*d (neighbors)
-__global__
-void candidates_kernel(
-    const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ neighbors,
-    const uint32_t* __restrict__ neighbors_offsets,
-    const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
-    const uint32_t* __restrict__ inbound_count,
-    const float* __restrict__ hedge_weights,
-    const uint32_t* __restrict__ nodes_sizes,
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    uint32_t* __restrict__ pairs,
-    uint32_t* __restrict__ scores
-) {
+    // TODO: FINISH FUSING THOSE TWO...
+
+
+
+
+
+
+
+
+
     // STYLE: one node per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
     // global across blocks - coincides with the node to handle
@@ -191,11 +149,17 @@ void candidates_kernel(
     * This kernel must give a symmetry invariant, if one node sees a candidate with score "s", then that candidate must also see this node as an option with score "s"!
     */
 
-    const uint32_t* my_neighbors = neighbors + neighbors_offsets[warp_id];
-    const uint32_t* not_my_neighbors = neighbors + neighbors_offsets[warp_id + 1];
-    uint32_t neighbors_count = neighbors_offsets[warp_id + 1] - neighbors_offsets[warp_id];
-    extern __shared__ hashmap_entry sm_histogram[];
-    hashmap_entry* histogram = sm_histogram + (HIST_SIZE + HIST_SPARE_SIZE) * (threadIdx.x / WARP_SIZE);
+    /*
+    * Idea, dramatic coarsening speedup:
+    * - we need to keep connections symmetric -> ids-based and permutation-invariant "deterministic_noise"!
+    * - during pairs construction, nudge up or down the hedge’s weight based on a very fast hash of the two node ids involved (order of the node ids must not matter)
+    * 
+    * TODO: simpler/faster hash, e.g. we could sum the node ids and pick the last 4 bits, adding those to the fixed point weight?
+    */
+
+    extern __shared__ uint32_t histogram[];
+    uint32_t* histogram_node = histogram + 2 * HIST_SIZE * (threadIdx.x / WARP_SIZE);
+    uint32_t* histogram_score = histogram + 2 * HIST_SIZE * (threadIdx.x / WARP_SIZE) + HIST_SIZE;
 
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
@@ -203,48 +167,39 @@ void candidates_kernel(
 
     const uint32_t my_size = nodes_sizes[warp_id];
 
-    // all threads in the warp should agree on those...
-    // TODO: only keep these in lane 0!
-    uint32_t best_score[MAX_CANDIDATES];
-    lm_init<uint32_t>(best_score, MAX_CANDIDATES, 0);
-    uint32_t best_neighbor[MAX_CANDIDATES];
-    lm_init<uint32_t>(best_neighbor, MAX_CANDIDATES, UINT32_MAX);
-
     // handle HIST_SIZE neighbors at a time
     for (; my_neighbors < not_my_neighbors; my_neighbors += HIST_SIZE) {
-        wm_init<hashmap_entry>(histogram, HIST_SIZE + HIST_SPARE_SIZE, {HASH_EMPTY, 0u});
+        // load the first HIST_SIZE neighbors and setup per-thread local histograms, each thread reads and prepares a neighbor
+        // TODO: maybe if you have an invalid node, sample another one to fill its place in the histogram?
+        for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
+            uint32_t curr_neighbor = UINT32_MAX;
+            if (nb < neighbors_count) {
+                curr_neighbor = my_neighbors[nb];
+                 // skip incompatible neighbors due to size constraints
+                if (my_size + nodes_sizes[curr_neighbor] <= max_nodes_per_part)
+                    histogram_node[nb] = curr_neighbor;
+                else
+                    histogram_node[nb] = UINT32_MAX;
+            } else
+                histogram_node[nb] = UINT32_MAX;
+        }
+        // warp sync after filling histograms
         __syncwarp();
 
-        // load the first HIST_SIZE neighbors and setup per-thread local histograms
-        // each thread reads and prepares a neighbor, then broadcasts it to complete the check of its inbound set size
-        for (uint32_t nb = 0; nb < HIST_SIZE; nb += WARP_SIZE) {
-            uint32_t my_neighbor = UINT32_MAX;
-            uint32_t my_neighbor_touching_offsets;
-            uint32_t my_neighbor_inbound_count;
-            if (nb + lane_id < neighbors_count) {
-                my_neighbor = my_neighbors[nb + lane_id];
-                // omit incompatible neighbors due to size constraints
-                if (my_size + nodes_sizes[my_neighbor] > max_nodes_per_part) my_neighbor = UINT32_MAX;
-                else {
-                    my_neighbor_touching_offsets = touching_offsets[my_neighbor];
-                    my_neighbor_inbound_count = inbound_count[my_neighbor];
-                }
-            }
-            // TODO: maybe if you have an invalid node, sample another one to fill its place in the histogram?
-            for (uint32_t broadcast_lane = 0; broadcast_lane < WARP_SIZE; broadcast_lane++) { // TODO: add to the condition "&& nb + broadcast_lane < neighbors_count"
-                const uint32_t neighbor = __shfl_sync(0xFFFFFFFF, my_neighbor, broadcast_lane);
-                if (neighbor == UINT32_MAX) continue; // skip incompatible neighbors due to size constraints
-                const uint32_t* neighbor_inbound = touching + __shfl_sync(0xFFFFFFFF, my_neighbor_touching_offsets, broadcast_lane);
-                const uint32_t* not_neighbor_inbound = neighbor_inbound + __shfl_sync(0xFFFFFFFF, my_neighbor_inbound_count, broadcast_lane);
-                uint32_t new_inbound_count = 0u; // skip incompatible neighbors due to inbound constraints
-                for (neighbor_inbound += lane_id; neighbor_inbound < not_neighbor_inbound; neighbor_inbound += WARP_SIZE)
-                    new_inbound_count += binary_search<uint32_t>(my_touching, my_inbound_count, *neighbor_inbound) == UINT32_MAX ? 1 : 0; // binary search only among the inbounds part of my_touching
-                new_inbound_count = warpReduceSumLN0<uint32_t>(new_inbound_count) + my_inbound_count;
-                if (lane_id == 0 && new_inbound_count <= max_inbound_per_part) sm_hashmap_insert(histogram, HIST_SIZE + HIST_SPARE_SIZE, neighbor, 0u);
-            }
+        // sort the histogram by node-id to then rely on binary search
+        wrp_bitonic_sort<uint32_t, HIST_SIZE>(histogram_node);
+        __syncwarp();
+
+        // add a little bit of symmetric deterministic noise
+        for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
+            uint32_t curr_neighbor = histogram_node[nb];
+            if (curr_neighbor != UINT32_MAX)
+                histogram_score[nb] = deterministic_noise(curr_neighbor, warp_id);
+            else
+                histogram_score[nb] = 0u;
         }
-        // warp sync after filling histograms => no need if we don't do anything dangerous in between!
-        //__syncwarp();
+
+        // TODO: shared memory caching of hyperedges!!
 
         // TODO: add this back when and if you start filling back up invalid nodes before going to the next histogram...
         // if no neighbor passed constraints checks (histogram is all UINT32_MAXs), exit the loop early
@@ -254,8 +209,7 @@ void candidates_kernel(
         // iterate over touching hyperedges
         // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
         for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-            uint32_t my_hedge_offset;
-            uint32_t not_my_hedge_offset;
+            dim_t my_hedge_offset, not_my_hedge_offset;
             uint32_t my_hedge_weight;
             if (lane_id == 0) {
                 const uint32_t actual_hedge_idx = *hedge_idx;
@@ -270,61 +224,61 @@ void candidates_kernel(
                 uint32_t pin = UINT32_MAX - 1;
                 if (my_hedge < not_my_hedge) pin = *my_hedge;
                 // update local histogram
-                // NOTE: no update atomic needed => all threads in the warp advance in sync and there are not duplicates in hedges, no two threads will ever write the same bin!
-                sm_hashmap_increment(histogram, HIST_SIZE + HIST_SPARE_SIZE , pin, my_hedge_weight);
-                // DEBUG: do we have all neighbors?
-                /*bool ok = false;
-                for (const uint32_t *nb = neighbors + neighbors_offsets[warp_id]; nb < not_my_neighbors; nb++) {
-                    if (pin == *nb || pin == UINT32_MAX - 1 || pin == warp_id) {
-                        ok = true;
-                        break;
-                    }
-                }
-                if (!ok) printf("Missing some neighbors (node %d, neighbor %d)!\n", warp_id, pin);*/
+                const uint32_t hist_idx = binary_search<uint32_t>(histogram_node, HIST_SIZE, pin);
+                // NOTE: no atomic needed => all threads in the warp advance in sync and there are not duplicates in hedges, no two threads will ever write the same bin!
+                if (hist_idx != UINT32_MAX) histogram_score[hist_idx] += my_hedge_weight;
             }
         }
-        // warp sync after the atomics
+        // warp sync after computing scores
         __syncwarp();
 
-        /*
-        * Idea, dramatic coarsening speedup:
-        * - we need to keep connections symmetric -> ids-based and permutation-invariant "deterministic_noise"!
-        * - during pairs construction, nudge up or down the hedge’s weight based on a very fast hash of the two node ids involved (order of the node ids must not matter)
-        * 
-        * TODO: simpler/faster hash, e.g. we could sum the node ids and pick the last 4 bits, adding those to the fixed point weight?
-        */
-        
-        // reduce max in histogram between threads (each thread grabs a different bin)
-        // tie-breaker: lower id node wins; invariant: partial neighbors order
-        for (uint32_t nb = lane_id; nb < HIST_SIZE + HIST_SPARE_SIZE; nb += WARP_SIZE) {
+        // sort the histogram by lowest score first (empty bins have score = 0), highest id first as a tiebreaker
+        // TODO: maybe replace with a warp-parallel max per candidate iteration below (dunno tho, the max requires a warp-parallel read of the whole histogram)
+        wrp_bitonic_sort_by_key<uint32_t, uint32_t, HIST_SIZE>(histogram_score, histogram_node);
+        __syncwarp();
+
+        // updated global maximum(s), checking inbound constraints before doing it
+        // => this postpones such an expensive constrain check as much as possible, and does it for as few neighbors as possible
+        for (int32_t candidate = HIST_SIZE - 1; candidate >= 0; candidate--) {
+            uint32_t curr_neighbor;
+            if (lane_id == 0)
+                curr_neighbor = histogram_node[candidate];
+            curr_neighbor = __shfl_sync(0xFFFFFFFF, curr_neighbor, 0);
+            if (curr_neighbor == UINT32_MAX) break;
+            uint32_t curr_score, neighbor_inbound_count;
+            dim_t neighbor_touching_offsets;
+            if (lane_id == 0) {
+                curr_score = histogram_score[candidate];
+                neighbor_touching_offsets = touching_offsets[curr_neighbor];
+                neighbor_inbound_count = inbound_count[curr_neighbor];
+            }
+            curr_score = __shfl_sync(0xFFFFFFFF, curr_score, 0);
+            if (curr_score < best_score[MAX_CANDIDATES - 1]) break;
+
+            // skip incompatible neighbors due to inbound constraints
+            const uint32_t* neighbor_inbound = touching + __shfl_sync(0xFFFFFFFF, neighbor_touching_offsets, 0);
+            const uint32_t* not_neighbor_inbound = neighbor_inbound + __shfl_sync(0xFFFFFFFF, neighbor_inbound_count, 0);
+            uint32_t new_inbound_count = 0u;
+            for (neighbor_inbound += lane_id; neighbor_inbound < not_neighbor_inbound; neighbor_inbound += WARP_SIZE)
+                new_inbound_count += binary_search<uint32_t>(my_touching, my_inbound_count, *neighbor_inbound) == UINT32_MAX ? 1 : 0; // binary search only among the inbounds part of my_touching
+            new_inbound_count = warpReduceSum<uint32_t>(new_inbound_count) + my_inbound_count;
+            if (new_inbound_count > max_inbound_per_part) continue;
+
             // get the best MAX_CANDIDATES candidates out of the histogram
-            uint32_t curr_neighbor = histogram[nb].key;
-            uint32_t curr_score;
-            if (curr_neighbor != UINT32_MAX)
-                curr_score = histogram[nb].value + deterministic_noise(curr_neighbor, warp_id); // NOTE: adding a little bit of symmetric deterministic noise
-            else
-                curr_score = 0u;
             for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
-                bin max = warpReduceMax(curr_score, curr_neighbor);
-                // TODO: only "lane_id = 0" actually needs to do all of this...
-                for (uint32_t j = 0; j < MAX_CANDIDATES; j++) {
-                    if (max.score > best_score[j] || max.score == best_score[j] && max.node < best_neighbor[j]) {
-                        for (uint32_t t = MAX_CANDIDATES - 1; t > j; t--) {
-                            best_score[t] = best_score[t - 1];
-                            best_neighbor[t] = best_neighbor[t - 1];
-                        }
-                        best_score[j] = max.score;
-                        best_neighbor[j] = max.node;
-                        break;
+                // tie-breaker: lower id node wins; invariant: partial neighbors order
+                if (curr_score > best_score[i] || curr_score == best_score[i] && curr_neighbor < best_neighbor[i]) {
+                    for (uint32_t j = MAX_CANDIDATES - 1; j > i; j--) {
+                        best_score[j] = best_score[j - 1];
+                        best_neighbor[j] = best_neighbor[j - 1];
                     }
-                }
-                if (curr_neighbor == max.node) {
-                    curr_neighbor = UINT32_MAX;
-                    curr_score = 0;
+                    best_score[i] = curr_score;
+                    best_neighbor[i] = curr_neighbor;
+                    break;
                 }
             }
         }
-
+        
         neighbors_count -= HIST_SIZE;
     }
 
@@ -346,22 +300,16 @@ void grouping_kernel(
     const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be grouped with pairs[idx]
     const uint32_t* __restrict__ nodes_sizes,
     const uint32_t num_nodes,
+    const uint32_t num_repeats,
     slot* __restrict__ group_slots, // initialized with -1 on the id
     uint32_t* __restrict__ groups // uninitialized, final group id of each node (non-zero based for now)
 ) {
     // SETUP FOR GLOBAL SYNC
     cg::grid_group grid = cg::this_grid();
 
-    // STYLE: one node per thread!
+    // STYLE: 'num_repeats' node per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) {
-        for (uint32_t i = 0; i < 2*MAX_CANDIDATES; i++)
-            grid.sync();
-        return;
-    }
-
-    int32_t path_length = 0;
-    uint32_t path[PATH_SIZE];
+    const uint32_t tcount = gridDim.x * blockDim.x;
 
     /*
     * Logic: a walk up (and down) the tree for grouping!
@@ -411,9 +359,10 @@ void grouping_kernel(
     * - use the "id" from the first slot as the final group reference
     * - going upward, each node has MAX_GROUP_SIZE slots, you claim the first free one or the first one you beat:
     *   - if you find a free slot, atomically settle there
-    *   - if your "id" is already there, break (someone else "handled you" already)
+    *   - if your "id" is already there, break (someone else "handled you" already) and continue upward
     *   - if you atomically beat someone, now repeat the process on the next slot, with your candidate becoming the guy you beat (essentially, go down the ladder,
     *     atomically), if you exceed the MAX_GROUP_SIZE slots, ditch the candidate and break
+    *     => this should be possible with just atomic_max_on_slot while retrieving the previous slot value, keeping slots sorted from highest to lowest score
     *   - in both above cases, after you wrote your "id" in your target, you attempt to write there also the "id" of the previous node in your path (that is
     *     the previous node you visited while going upward, that currently points to you) with the method, and repeat for up to MAX_GROUP_SIZE-1 nodes going back
     *     - optimization to not be exponential in MAX_GROUP_SIZE: nodes before you will always have a score lower than yours, so you can start searching a slot
@@ -436,121 +385,182 @@ void grouping_kernel(
     *
     * Note: cycles should still be impossible if I lock previous pairs! Otherwise, looking at all "second pairs" would allow for cycles longer than 2!
     * Note: the global synch means that if a thread returns, the others are deadlocked? Check this! Otherwise just rerurn after the downward path
+    *
+    * Necessity, this is a cooperative kernel, it must be fully instantiated, even if it means each thread must handle multiple nodes:
+    * - multiple nodes per thread (passed as an argument)
+    * - compute the ceiling of how many nodes each simultaneously loaded thread would need to handle, from that infer back the exact number of threads,
+    *   and run them, each thread repeats the upward and downward walk once for every node it was assigned
+    * - the effective PATH_SIZE available to nodes is thus reduced by the number of nodes per thread, but luckly at the beginning, when there are many nodes,
+    *   paths are also at their shortest...
     */
 
-    // initialize yourself to a one-node group, unless someone already claimed you
-    atomicCAS(&reinterpret_cast<unsigned long long*>(group_slots)[tid*MAX_GROUP_SIZE], pack_slot(0u, UINT32_MAX), pack_slot(0u, tid));
+    int32_t path_length[MAX_REPEATS];
+    uint32_t path[PATH_SIZE];
+    const uint32_t actual_path_size = PATH_SIZE / num_repeats;
+    uint32_t completed_repeats = 0u;
+
+    for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+        const uint32_t curr_tid = tid + repeat * tcount;
+        // initialize yourself to a one-node group, unless someone already claimed you
+        if (curr_tid < num_nodes) atomicCAS(&reinterpret_cast<unsigned long long*>(group_slots)[curr_tid*MAX_GROUP_SIZE], pack_slot(0u, UINT32_MAX), pack_slot(0u, curr_tid));
+    }
 
     for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
-        // if you formed a pair, stop
-        if (group_slots[tid*MAX_GROUP_SIZE].score == UINT32_MAX) {
-            grid.sync();
-            grid.sync();
-            continue;
-        }
+        // repeat for every node that you need to handle
+        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+            const uint32_t curr_tid = tid + repeat * tcount;
 
-        uint32_t current = tid; // current node in the tree of pairs
-        uint32_t target = pairs[tid * MAX_CANDIDATES + i]; // target node of "current"
-        uint32_t score = scores[tid * MAX_CANDIDATES + i]; // score with which "current" points to "target"
-        
-        // go up the tree
-        bool outcome = false;
-        if (target != UINT32_MAX) {
-            outcome = true;
-            uint32_t target_target = pairs[target * MAX_CANDIDATES + i]; // target node of "target"
-            while (current != target_target) {
-                // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
-                outcome = atomic_max_on_slot(group_slots, target*MAX_GROUP_SIZE, current, score);
-                // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
-                // NOTE: if the atomic already sees the value you were about to write (strict), you CANNOT stop, you must know what happens to your target before taking the final decision on your path
-                // => with the second note being a <cannot>, we can't guarantee that exactly one thread will go up any piece of path, but we still don't need atomics in the downward walk, as every thread takes the same decisions regardless
-                if (!outcome) break;
-                // DEBUG: prevent cycles longer than 2!
-                /*bool die = false;
-                for (uint32_t j = 0; j < path_length; j++) {
-                    if (path[j] == target) {
-                        die = true;
-                        printf("Broke cycle between %d -> %d!\n", current, target);
-                        break;
+            // if you are not a valid node
+            if (curr_tid >= num_nodes) break;
+            // if you formed a pair, stop
+            if (completed_repeats & (1u << repeat)) continue;
+
+            uint32_t* curr_path = path + actual_path_size * repeat;
+            int32_t curr_path_length = 0;
+
+            uint32_t current = curr_tid; // current node in the tree of pairs
+            uint32_t target = pairs[curr_tid * MAX_CANDIDATES + i]; // target node of "current"
+            uint32_t score = scores[curr_tid * MAX_CANDIDATES + i]; // score with which "current" points to "target"
+
+            // go up the tree
+            bool outcome = false;
+            if (target != UINT32_MAX) {
+                outcome = true;
+                uint32_t target_target = pairs[target * MAX_CANDIDATES + i]; // target node of "target"
+                while (current != target_target) {
+                    // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
+                    outcome = atomic_max_on_slot(group_slots, target*MAX_GROUP_SIZE, current, score);
+                    // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
+                    // NOTE: if the atomic already sees the value you were about to write (strict), you CANNOT stop, you must know what happens to your target before taking the final decision on your path
+                    // => with the second note being a <cannot>, we can't guarantee that exactly one thread will go up any piece of path, but we still don't need atomics in the downward walk, as every thread takes the same decisions regardless
+                    if (!outcome) break;
+                    // DEBUG: prevent cycles longer than 2!
+                    /*bool die = false;
+                    for (uint32_t j = 0; j < curr_path_length; j++) {
+                        if (curr_path[j] == target) {
+                            die = true;
+                            printf("Broke cycle between %d -> %d!\n", current, target);
+                            break;
+                        }
                     }
+                    if (die) break;*/
+                    assert(curr_path_length < actual_path_size);
+                    curr_path[curr_path_length++] = target;
+                    current = target;
+                    target = target_target;
+                    if (target == UINT32_MAX) break; // alternative root: a node with no target
+                    target_target = pairs[target_target * MAX_CANDIDATES + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
+                    score = scores[current * MAX_CANDIDATES + i];
                 }
-                if (die) break;*/
-                assert(path_length < PATH_SIZE);
-                path[path_length++] = target;
-                current = target;
-                target = target_target;
-                if (target == UINT32_MAX) break; // alternative root: a node with no target
-                target_target = pairs[target_target * MAX_CANDIDATES + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
-                score = scores[current * MAX_CANDIDATES + i];
             }
-        }
-        // handle "root(s)" as a pair of nodes pointing to each other
-        // NOTE: forceful writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
-        // NOTE: prevent locked groups from forming a 2-cycle after the next pairing candidates are considered
-        if (outcome && target != UINT32_MAX && group_slots[target*MAX_GROUP_SIZE].score != UINT32_MAX) {
-            const uint32_t lowest_id = min(current, target);
-            set_slot(group_slots, current*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
-            set_slot(group_slots, target*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
+            // handle "root(s)" as a pair of nodes pointing to each other
+            // NOTE: forceful writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
+            // NOTE: prevent locked groups from forming a 2-cycle after the next pairing candidates are considered
+            if (outcome && target != UINT32_MAX && group_slots[target*MAX_GROUP_SIZE].score != UINT32_MAX) {
+                const uint32_t lowest_id = min(current, target);
+                set_slot(group_slots, current*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
+                set_slot(group_slots, target*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
+            }
+
+            path_length[repeat] = curr_path_length;
         }
 
         // global synch
         grid.sync();
 
-        // go down the tree
-        // it the root had no target, path[path_length - 1] is the root, if the root was a mutual-poiting pair, path[path_length - 1] is the first encountered node of the pair
-        for (path_length = path_length - 2; path_length >= 0; path_length--) {
-            // NOTE: on the first iteration, coming from the upward walk, "current" is the last node that got its slot updated
-            target = path[path_length + 1]; // this is "who current would have liked to be with", the node one step back up the ladder towards root
-            current = path[path_length];
-            if (group_slots[target*MAX_GROUP_SIZE].id == current) {
-                // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine
-                group_slots[current*MAX_GROUP_SIZE].id = current;
-                // NOTE: lock groups by setting scores to the maximum
-                group_slots[current*MAX_GROUP_SIZE].score = UINT32_MAX;
-                group_slots[target*MAX_GROUP_SIZE].score = UINT32_MAX;
-                // NOTE: after a successful link the next node down the path has already lost its target, so we might as well skip it
-                path_length--;
+        // repeat for every node that you need to handle
+        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+            const uint32_t curr_tid = tid + repeat * tcount;
+
+            // if you are not a valid node
+            if (curr_tid >= num_nodes) break;
+            // if you formed a pair, stop
+            if (completed_repeats & (1u << repeat)) continue;
+
+            uint32_t* curr_path = path + actual_path_size * repeat;
+            int32_t curr_path_length = path_length[repeat];
+            path_length[repeat] = 0;
+
+            // go down the tree
+            // it the root had no target, path[path_length - 1] is the root, if the root was a mutual-poiting pair, path[path_length - 1] is the first encountered node of the pair
+            uint32_t current, target;
+            for (curr_path_length = curr_path_length - 2; curr_path_length >= 0; curr_path_length--) {
+                // NOTE: on the first iteration, coming from the upward walk, "current" is the last node that got its slot updated
+                target = curr_path[curr_path_length + 1]; // this is "who current would have liked to be with", the node one step back up the ladder towards root
+                current = curr_path[curr_path_length];
+                if (group_slots[target*MAX_GROUP_SIZE].id == current) {
+                    // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine
+                    group_slots[current*MAX_GROUP_SIZE].id = current;
+                    // NOTE: lock groups by setting scores to the maximum
+                    group_slots[current*MAX_GROUP_SIZE].score = UINT32_MAX;
+                    group_slots[target*MAX_GROUP_SIZE].score = UINT32_MAX;
+                    // NOTE: after a successful link the next node down the path has already lost its target, so we might as well skip it
+                    curr_path_length--;
+                }
             }
-        }
-        // the path did not include the "tid" node, handle it here iff you did not happen to group path[0] with path[1] during the last iteration above (leading to path_length == -2)
-        if (path_length == -1) {
-            target = path[0];
-            current = tid;
-            if (group_slots[target*MAX_GROUP_SIZE].id == current) {
-                group_slots[current*MAX_GROUP_SIZE].id = current;
-                 // lock groups by setting scores to the maximum
-                group_slots[current*MAX_GROUP_SIZE].score = UINT32_MAX;
-                group_slots[target*MAX_GROUP_SIZE].score = UINT32_MAX;
+            // the path did not include the "curr_tid" node, handle it here iff you did not happen to group path[0] with path[1] during the last iteration above (leading to path_length == -2)
+            if (curr_path_length == -1) {
+                target = curr_path[0];
+                current = curr_tid;
+                if (group_slots[target*MAX_GROUP_SIZE].id == current) {
+                    group_slots[current*MAX_GROUP_SIZE].id = current;
+                    // lock groups by setting scores to the maximum
+                    group_slots[current*MAX_GROUP_SIZE].score = UINT32_MAX;
+                    group_slots[target*MAX_GROUP_SIZE].score = UINT32_MAX;
+                }
             }
         }
         
         // global synch
         grid.sync();
 
-        path_length = 0;
+        // anyone not yet selected (score != UINT32_MAX), set your score to 0 to enable the next pairing round, then sync again and continue
+        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+            const uint32_t curr_tid = tid + repeat * tcount;
+            if (curr_tid >= num_nodes) break;
+            // if you formed a pair, stop
+            if (completed_repeats & (1u << repeat)) continue;
+            if (group_slots[curr_tid].score == UINT32_MAX) {
+                completed_repeats |= (1u << repeat);
+                continue;
+            }
+            group_slots[curr_tid].score = 0;
+        }
+
+        // global synch
+        grid.sync();
     }
 
     // write inside "groups" the minimum id among each node's slots, used to identify its group, eventually, zero-base those ids
-    uint32_t min_id = UINT32_MAX;
-    for (uint32_t i = 0; i < MAX_GROUP_SIZE; i++)
-        min_id = min(group_slots[tid*MAX_GROUP_SIZE + i].id, min_id);
-    groups[tid] = min_id;
+    for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+        const uint32_t curr_tid = tid + repeat * tcount;
+        if (curr_tid >= num_nodes) break;
+        uint32_t min_id = UINT32_MAX;
+        for (uint32_t i = 0; i < MAX_GROUP_SIZE; i++)
+            min_id = min(group_slots[curr_tid*MAX_GROUP_SIZE + i].id, min_id);
+        groups[curr_tid] = min_id;
+    }
 }
 
 // count how many distinct new pins are in each hedge
 // SEQUENTIAL COMPLEXITY: e*d
 // PARALLEL OVER: e
+// WARPS OVER: d
 __global__
 void apply_coarsening_hedges_count(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
-    const uint32_t num_hedges,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
-    uint32_t* __restrict__ coarse_hedges_offsets // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
+    const uint32_t num_hedges,
+    const uint32_t max_hedge_size,
+    uint32_t* __restrict__ coarse_oversized_hedges,
+    dim_t* __restrict__ coarse_hedges_offsets // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
 ) {
-    // STYLE: one hedge per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_hedges) return;
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the group to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
 
     /*
     * Idea:
@@ -562,181 +572,103 @@ void apply_coarsening_hedges_count(
     * - instead of three kernels to count distinct nodes, scan offsets, and scatter distinct nodes, can't we do all in one?
     * - one hedge per warp or block, use the shared memory hash-map to keep a "first-come-first-served" set of counters in shared memory,
     *   and reditect additional entries to atomically incremented global counters (issue: musre ensure the src is preserved!!)
+    *
+    * Must ensure that:
+    * - there are no self-cycles
+    * - the same node never appears twice in the same hedge
+    *   => exploited by the coarsening of touching sets
     */
 
-    const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
+    const dim_t hedge_start_idx = hedges_offsets[warp_id], hedge_end_idx = hedges_offsets[warp_id + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
-    uint32_t distinct = 0;
-    // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
-    uint32_t pins[MAX_DEDUPE_BUFFER_SIZE];
-    // TODO: maybe "memset(pins, 0xFF, sizeof(pins))" is faster?
-    lm_init<uint32_t>(pins, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    uint32_t *oversized_coarse_hedges_start = coarse_oversized_hedges + max_hedge_size * warp_id;
+    uint32_t new_hedges_count = 0;
+    wrp_init<uint32_t>(oversized_coarse_hedges_start, max_hedge_size, HASH_EMPTY); // HP: HASH_EMPTY is > than any value that could be inserted
 
-    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
-        const uint32_t pin = groups[*curr]; // read and map pin to its new id
-        bool not_seen = lm_hashset_insert(pins, MAX_DEDUPE_BUFFER_SIZE, pin);
-        if (not_seen) {
-            distinct++;
+    // SM deduplication hash-set
+    extern __shared__ uint32_t block_new_pins[];
+    uint32_t *new_pins = block_new_pins + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
+    wrp_init<uint32_t>(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    __syncwarp();
+
+    // go over the hedge's pins
+    for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_end; curr += WARP_SIZE) {
+        if (curr < hedge_end) {
+            const uint32_t pin = groups[*curr]; // read and map pin to its new id
+            uint8_t inserted = sm_hashset_try_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, pin); // check in the SM cache
+            if (inserted) {
+                if (inserted == 2) { // no need to put into GM what already is in the SM hash-set
+                    if (gm_hashset_insert(oversized_coarse_hedges_start, max_hedge_size, pin)) // actual dedupe
+                        new_hedges_count++;
+                } else
+                    new_hedges_count++;
+            }
         }
     }
 
-    // leave the first entry to be 0 (offset of the first hedge)
-    coarse_hedges_offsets[tid + 1] = distinct;
+    new_hedges_count = warpReduceSumLN0<uint32_t>(new_hedges_count);
+
+    if (lane_id == 0)
+        coarse_hedges_offsets[warp_id + 1] = (dim_t)new_hedges_count; // leave the first entry to be 0 (offset of the first hedge)
 }
 
 // write the new distinct pins of hedges
 // SEQUENTIAL COMPLEXITY: e*d
 // PARALLEL OVER: e
+// WARPS OVER: d
 __global__
 void apply_coarsening_hedges_scatter(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
-    const uint32_t num_hedges,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
-    const uint32_t* __restrict__ coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
+    const uint32_t num_hedges,
+    const dim_t* __restrict__ coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
     uint32_t* __restrict__ coarse_hedges
 ) {
-    // STYLE: one hedge per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_hedges) return;
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the group to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
 
     /* Idea: second part of "apply_coarsening_hedges_count" -> scatter
-    * NOTE: must ensure the source remains the first node in each coarse hedge
+    * 
+    * Must ensure that:
+    * - the source remains the first node in each coarse hedge (not truuuly a must, but better be safe than sorry)
     *
     * Important: this currently deletes self-cycles -> between src and dst, it keeps the SRC when deduplicating!
     * => therefore, this is the opposite of coarsening 'touching', where 'touching' preserves the inbound set and
     *    deduplicates the outbound, hedges preserve the notion of outbound! The two are complementary!
     */
 
-    const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
+    const dim_t hedge_start_idx = hedges_offsets[warp_id], hedge_end_idx = hedges_offsets[warp_id + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
-    const uint32_t coarse_hedge_start_idx = coarse_hedges_offsets[tid];
-    const uint32_t coarse_hedge_size = coarse_hedges_offsets[tid + 1] - coarse_hedges_offsets[tid];
+    const dim_t coarse_hedge_start_idx = coarse_hedges_offsets[warp_id];
+    const uint32_t coarse_hedge_size = (uint32_t)(coarse_hedges_offsets[warp_id + 1] - coarse_hedges_offsets[warp_id]);
     uint32_t *coarse_hedge_start = coarse_hedges + coarse_hedge_start_idx;
-    uint32_t distinct = 0;
-    // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
-    uint32_t pins[MAX_DEDUPE_BUFFER_SIZE];
-    lm_init<uint32_t>(pins, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    wrp_init<uint32_t>(coarse_hedge_start, coarse_hedge_size, HASH_EMPTY); // HP: HASH_EMPTY is > than any value that could be inserted
 
-    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) { // first pin is the src, always preserved
-        const uint32_t pin = groups[*curr]; // read and map pin to its new id
-        bool not_seen = lm_hashset_insert(pins, MAX_DEDUPE_BUFFER_SIZE, pin);
-        if (not_seen) {
-            assert(distinct < coarse_hedge_size);
-            coarse_hedge_start[distinct] = pin;
-            distinct++;
-        }
+    // SM deduplication hash-set
+    extern __shared__ uint32_t block_new_pins[];
+    uint32_t *new_pins = block_new_pins + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
+    wrp_init<uint32_t>(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    // handle the source separately first
+    __syncwarp();
+    if (lane_id == 0) {
+        const uint32_t src = __shfl_sync(0x00000003, groups[*hedge_start], 0);
+        coarse_hedge_start[0] = src; // not a problem if it's out of position and "breaks" the hash-set, since src will be always deduped in shared memory
+    } else if (lane_id == 1) {
+        const uint32_t src = __shfl_sync(0x00000003, 0, 0);
+        assert(sm_hashset_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, src)); // NOTE: could fail only if no SM is available...
     }
-}
+    __syncwarp();
 
-// count how many distinct neighbors there are in each group
-// SEQUENTIAL COMPLEXITY: n*d*h (in reality there are <<d*h neighbors per node)
-// PARALLEL OVER: n
-__global__
-void apply_coarsening_neighbors_count(
-    const uint32_t* __restrict__ neighbors,
-    const uint32_t* __restrict__ neighbors_offsets,
-    const uint32_t* __restrict__ groups, // groups[node id] -> node's group id
-    const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const uint32_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
-    const uint32_t num_groups,
-    uint32_t* __restrict__ coarse_neighbors_offsets // group id -> count of distinct neighbors
-) {
-    // STYLE: one group (new node) per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_groups) return;
-
-    /*
-    * Idea:
-    * - first translate to their new id and deduplicate neighbors inside each group to count their new, distinct, nodes
-    * - scan the counts per group to get the new offsets
-    * - repeat the deduplication and write (scatter) each new neighbor (neighboring group id) to its offset
-    *
-    * NOTE: by doing this, instead of rebuilding neighborhoods from scratch, we have fewer neighbors to deduplicate,
-    *       since most were already handled at the level above! While this runs we keep allocated both the old and new sets...
-    *
-    * TODO: compare this with rebuilding neighborhoods from scratch, to see if it is faster! (it is worth the memory investment)
-    */
-
-    /*
-    * TODO:
-    * - the neighbors of multiple nodes combined easily exceed 8k, sets are so large that not even grouping nodes makes their merged version shrink...
-    *   => we can continously use larger and larger local buffers..
-    * - upgrade this to be like the initial construction of neighbors, using shared memory and warps
-    * - use the one-block per group or one-warp per group method and move the hash set in SM, also then have warps read neighbors in //
-    */
-
-    const uint32_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
-    const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
-    uint32_t distinct = 0;
-    // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
-    uint32_t new_neighbors[MAX_LARGE_DEDUPE_BUFFER_SIZE];
-    lm_init<uint32_t>(new_neighbors, MAX_LARGE_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-
-    // for every original node in the group, go over its touching set
-    for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
-        const uint32_t node = *ungroup;
-        const uint32_t* my_neighbors = neighbors + neighbors_offsets[node];
-        const uint32_t* not_my_neighbors = neighbors + neighbors_offsets[node + 1];
-        for (const uint32_t* curr_neighbor = my_neighbors; curr_neighbor < not_my_neighbors; curr_neighbor++) {
-            const uint32_t new_neighbor = groups[*curr_neighbor]; // translate to group id
-            if (tid == new_neighbor)
-                continue;
-            bool not_seen = lm_hashset_insert(new_neighbors, MAX_LARGE_DEDUPE_BUFFER_SIZE, new_neighbor);
-            if (not_seen)
-                distinct++;
-        }
-    }
-
-    // leave the first entry to be 0 (offset of the first set)
-    coarse_neighbors_offsets[tid + 1] = distinct;
-}
-
-// write distinct neighbors
-// SEQUENTIAL COMPLEXITY: n*d*h (in reality there are <<d*h neighbors per node)
-// PARALLEL OVER: n
-__global__
-void apply_coarsening_neighbors_scatter(
-    const uint32_t* __restrict__ neighbors,
-    const uint32_t* __restrict__ neighbors_offsets,
-    const uint32_t* __restrict__ groups, // groups[node id] -> node's group id
-    const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const uint32_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
-    const uint32_t num_groups,
-    const uint32_t* __restrict__ coarse_neighbors_offsets, // group id -> count of distinct neighbors
-    uint32_t* __restrict__ coarse_neighbors
-) {
-    // STYLE: one group (new node) per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_groups) return;
-
-    // Idea: second part of "apply_coarsening_neighbors_count" -> scatter
-
-    const uint32_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
-    const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
-    const uint32_t coarse_neighbors_start_idx = coarse_neighbors_offsets[tid];
-    const uint32_t coarse_neighbors_size = coarse_neighbors_offsets[tid + 1] - coarse_neighbors_offsets[tid];
-    uint32_t *coarse_neighbors_start = coarse_neighbors + coarse_neighbors_start_idx;
-    uint32_t distinct = 0;
-    // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
-    uint32_t new_neighbors[MAX_LARGE_DEDUPE_BUFFER_SIZE];
-    lm_init<uint32_t>(new_neighbors, MAX_LARGE_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-
-    // for every original node in the group, go over its touching set
-    for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
-        const uint32_t node = *ungroup;
-        const uint32_t* my_neighbors = neighbors + neighbors_offsets[node];
-        const uint32_t* not_my_neighbors = neighbors + neighbors_offsets[node + 1];
-        for (const uint32_t* curr_neighbor = my_neighbors; curr_neighbor < not_my_neighbors; curr_neighbor++) {
-            const uint32_t new_neighbor = groups[*curr_neighbor]; // translate to group id
-            if (tid == new_neighbor)
-                continue;
-            bool not_seen = lm_hashset_insert(new_neighbors, MAX_LARGE_DEDUPE_BUFFER_SIZE, new_neighbor);
-            if (not_seen) {
-                assert(distinct < coarse_neighbors_size);
-                coarse_neighbors_start[distinct] = new_neighbor;
-                distinct++;
-            }
+    // go over the hedge's pins
+    for (const uint32_t* curr = hedge_start + lane_id + 1; curr < hedge_end; curr += WARP_SIZE) {
+        if (curr < hedge_end) {
+            const uint32_t pin = groups[*curr]; // read and map pin to its new id
+            if (sm_hashset_try_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, pin)) // check in the SM cache
+                gm_hashset_insert(coarse_hedge_start, coarse_hedge_size, pin); // actual dedupe and final insertion
         }
     }
 }
@@ -747,9 +679,9 @@ void apply_coarsening_neighbors_scatter(
 __global__
 void apply_coarsening_touching_count(
     const uint32_t* __restrict__ hedges, // already coarsened as of here, thus contain group ids!
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t num_hedges,
-    uint32_t* __restrict__ coarse_touching_offsets // here filled as counters of "how many hedges per node" -> then do a prefix sum for the offsets
+    dim_t* __restrict__ coarse_touching_offsets // here filled as counters of "how many hedges per node" -> then do a prefix sum for the offsets
 ) {
     // STYLE: one hedge per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -760,23 +692,26 @@ void apply_coarsening_touching_count(
     * - first coarsen hedge, then going over coarse hedge and counting the occurrencies of each group (new node) should be
     *   faster than just deduplicating touching hedges between nodes in the same group
     * - scan the touching counts per group (new node) to get the new offsets
-    * - OLD METHOD: repeat the above while deduplicating per-group and writing (scatter) each hedge to its offset in the new touching sets
-    * - NEW METHOD: change the way the scatter operates, assign one thread per group, the thread goes over the nodes
+    * - the scatter operates in a different way, assigning one thread per group, the thread goes over the nodes
     *   in the group via the "ungroups" and "ungroups_offsets" structures, deduplicates hedges and writes them in the touching set
-
+    *
+    * NOTE: this exploits the fact that the same pin never appears twice in the same hedge!
+    *
     * TODO, upgrade options:
     * - for now we just do atomics towards global memory, because nodes are too many for shared memory, eventually:
     *   => use the shared memory hash-map to keep a "first-come-first-served" set of counters in shared memory,
     *     and reditect additional entries to global counters, then atomically increment global memory
+    *
+    * TODO: could partially skip this counting step, because we already have the new distinct inbound count evaluated during the candidates kernel!
     */
 
-    const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
+    const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
 
     // TODO: initialize shared memory
     // in utils.cuh : #define SM_MAX_HASHMAP_SIZE 4096u ?
     //__shared__ hashmap_entry hashmap[SM_MAX_HASHMAP_SIZE];
-    //sm_init<uint32_t>(hashmap, SM_MAX_HASHMAP_SIZE*2, HASH_EMPTY);
+    //blk_init<uint32_t>(hashmap, SM_MAX_HASHMAP_SIZE*2, HASH_EMPTY);
 
     for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
         const uint32_t pin = *curr; // already a group id
@@ -784,26 +719,30 @@ void apply_coarsening_touching_count(
     }
 }
 
-// write distinct touching hedges
+// write distinct inbound touching hedges
 // SEQUENTIAL COMPLEXITY: n*h
 // PARALLEL OVER: n
+// SHUFFLES OVER: h (touching)
 __global__
-void apply_coarsening_touching_scatter(
+void apply_coarsening_touching_scatter_inbound(
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const uint32_t* __restrict__ inbound_count,
     const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const uint32_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
+    const dim_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
     const uint32_t num_groups,
-    const uint32_t* __restrict__ coarse_touching_offsets, // group id -> count of distinct touching hedges
+    const dim_t* __restrict__ coarse_touching_offsets, // group id -> count of distinct touching hedges
     uint32_t* __restrict__ coarse_touching,
     uint32_t* __restrict__ coarse_inbound_count
 ) {
-    // STYLE: one group (new node) per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_groups) return;
+    // STYLE: one group (new node) per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the group to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_groups) return;
 
-    /* Idea: second part of "apply_coarsening_touching_scatter" -> scatter
+    /*
+    * Idea: second part of "apply_coarsening_touching_scatter" -> scatter inbound
     * Alternative version: one thread per hedge and dedupe inside each touching set (by linearly going over it, with a CAS at the end)
     * 
     * Must ensure that:
@@ -811,8 +750,7 @@ void apply_coarsening_touching_scatter(
     * - inbound hedges are sorted by id
     *
     * TODO upgrade option:
-    * - one thread per node is fine with many nodes, but when nodes are few switch to one node per block!
-    * - or better, ever since the beginning, do a few nodes (down to one, eventually) per block!
+    * - one warp per node is fine with many nodes, but when nodes are few switch to one node per block!
     */
 
     /*
@@ -822,53 +760,99 @@ void apply_coarsening_touching_scatter(
     *            only for the first occurrence, that is, the inbound one!
     */
 
-    const uint32_t ungroups_start_idx = ungroups_offsets[tid], ungroups_end_idx = ungroups_offsets[tid + 1];
+    const dim_t ungroups_start_idx = ungroups_offsets[warp_id], ungroups_end_idx = ungroups_offsets[warp_id + 1];
     const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
-    const uint32_t coarse_touching_start_idx = coarse_touching_offsets[tid];
-    const uint32_t coarse_touching_size = coarse_touching_offsets[tid + 1] - coarse_touching_offsets[tid];
+    const dim_t coarse_touching_start_idx = coarse_touching_offsets[warp_id];
+    const uint32_t coarse_touching_size = (uint32_t)(coarse_touching_offsets[warp_id + 1] - coarse_touching_offsets[warp_id]);
     uint32_t *coarse_touching_start = coarse_touching + coarse_touching_start_idx;
-    uint32_t distinct = 0u;
-    // TODO: this is just a very large buffer for now (a part in registers, a part in cache) -> replace with small buffer + large spill buffer
-    uint32_t new_touching[MAX_DEDUPE_BUFFER_SIZE];
-    lm_init<uint32_t>(new_touching, MAX_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    uint32_t new_inbound_count = 0u;
+    wrp_init<uint32_t>(coarse_touching_start, coarse_touching_size, HASH_EMPTY); // HP: HASH_EMPTY is > than any value that could be inserted
+
+    // SM deduplication hash-set
+    extern __shared__ uint32_t block_new_touching[];
+    uint32_t *new_touching = block_new_touching + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
+    wrp_init<uint32_t>(new_touching, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    __syncwarp();
 
     // for every original node in the group, go over its inbound set
     for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
         const uint32_t node = *ungroup;
         const uint32_t* my_inbound = touching + touching_offsets[node];
         const uint32_t my_inbound_count = inbound_count[node];
-        for (uint32_t i = 0; i < my_inbound_count; i++) {
-            const uint32_t hedge_idx = my_inbound[i];
-            bool not_seen = lm_hashset_insert(new_touching, MAX_DEDUPE_BUFFER_SIZE, hedge_idx);
-            if (not_seen) {
-                assert(distinct < coarse_touching_size);
-                coarse_touching_start[distinct] = hedge_idx;
-                distinct++;
+        for (uint32_t i = lane_id; i < my_inbound_count; i += WARP_SIZE) {
+            if (i < my_inbound_count) {
+                const uint32_t hedge_idx = my_inbound[i];
+                if (sm_hashset_try_insert(new_touching, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, hedge_idx)) { // check in the SM cache
+                    if (gm_hashset_insert(coarse_touching_start, coarse_touching_size, hedge_idx)) // dedupe among inbound hedges
+                        new_inbound_count++;
+                }
             }
         }
     }
-    const uint32_t new_inbound_count = distinct;
+
+    new_inbound_count = warpReduceSumLN0<uint32_t>(new_inbound_count);
+
+    if (lane_id == 0)
+        coarse_inbound_count[warp_id] = new_inbound_count;
+}
+
+// write distinct outbound touching hedges
+// SEQUENTIAL COMPLEXITY: n*h
+// PARALLEL OVER: n
+// SHUFFLES OVER: h (touching)
+__global__
+void apply_coarsening_touching_scatter_outbound(
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t* __restrict__ inbound_count,
+    const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
+    const dim_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
+    const uint32_t num_groups,
+    const dim_t* __restrict__ coarse_touching_offsets, // group id -> count of distinct touching hedges
+    const uint32_t* __restrict__ coarse_inbound_count,
+    uint32_t* __restrict__ coarse_touching
+) {
+    // STYLE: one group (new node) per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the group to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_groups) return;
+
+    /* 
+    * Idea: third part of "apply_coarsening_touching_scatter" -> scatter outbound
+    *  => assumes each inbound set has been now sorted, and can be used for binary search
+    */
+
+    const dim_t ungroups_start_idx = ungroups_offsets[warp_id], ungroups_end_idx = ungroups_offsets[warp_id + 1];
+    const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
+    const dim_t coarse_touching_start_idx = coarse_touching_offsets[warp_id];
+    const uint32_t coarse_touching_size = (uint32_t)(coarse_touching_offsets[warp_id + 1] - coarse_touching_offsets[warp_id]);
+    const uint32_t new_inbound_count = coarse_inbound_count[warp_id];
+    const uint32_t coarse_outbound_size = coarse_touching_size - new_inbound_count;
+    uint32_t *coarse_touching_start = coarse_touching + coarse_touching_start_idx;
+    uint32_t *coarse_outbound_start = coarse_touching_start + new_inbound_count;
+
+    // SM deduplication hash-set
+    extern __shared__ uint32_t block_new_touching[];
+    uint32_t *new_touching = block_new_touching + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
+    wrp_init<uint32_t>(new_touching, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    __syncwarp();
 
     // for every original node in the group, go over its outbound set
     for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
         const uint32_t node = *ungroup;
         const uint32_t* my_outbound = touching + touching_offsets[node] + inbound_count[node];
-        const uint32_t my_outbound_count = touching_offsets[node + 1] - touching_offsets[node] - inbound_count[node];
-        for (uint32_t i = 0; i < my_outbound_count; i++) {
-            const uint32_t hedge_idx = my_outbound[i];
-            bool not_seen = lm_hashset_insert(new_touching, MAX_DEDUPE_BUFFER_SIZE, hedge_idx);
-            if (not_seen) {
-                assert(distinct < coarse_touching_size);
-                coarse_touching_start[distinct] = hedge_idx;
-                distinct++;
+        const uint32_t my_outbound_count = (uint32_t)(touching_offsets[node + 1] - touching_offsets[node]) - inbound_count[node];
+        for (uint32_t i = lane_id; i < my_outbound_count; i += WARP_SIZE) {
+            if (i < my_outbound_count) {
+                const uint32_t hedge_idx = my_outbound[i];
+                if (sm_hashset_try_insert(new_touching, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, hedge_idx)) { // check in the SM cache
+                    if(binary_search<uint32_t>(coarse_touching_start, new_inbound_count, hedge_idx) == UINT32_MAX) // check among inbound hedges
+                        gm_hashset_insert(coarse_outbound_start, coarse_outbound_size, hedge_idx); // dedupe among outbound hedges
+                }
             }
         }
     }
-
-    coarse_inbound_count[tid] = new_inbound_count;
-    
-    // ensure inbound hedges are always sorted
-    introsort(coarse_touching_start, new_inbound_count);
 }
 
 // write to each node the partition of its group
@@ -896,7 +880,7 @@ void apply_uncoarsening_partitions(
 __global__
 void pins_per_partition_kernel(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
     const uint32_t num_hedges,
     const uint32_t num_partitions,
@@ -920,7 +904,7 @@ void pins_per_partition_kernel(
     * => take the code from 'inbound_pins_per_partition_kernel' as of commit 'f803463'
     */
 
-    const uint32_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
+    const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
     uint32_t *my_pins_per_partitions = pins_per_partitions + tid * num_partitions;
 
@@ -937,7 +921,7 @@ void pins_per_partition_kernel(
 __global__
 void inbound_pins_per_partition_kernel(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
     const uint32_t num_hedges,
     const uint32_t num_partitions,
@@ -948,7 +932,7 @@ void inbound_pins_per_partition_kernel(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_hedges) return;
 
-    const uint32_t hedge_start_idx = hedges_offsets[tid];
+    const dim_t hedge_start_idx = hedges_offsets[tid];
     const uint32_t hedge_src = hedges[hedge_start_idx];
     const uint32_t src_part = partitions[hedge_src];
     uint32_t *my_inbound_pins_per_partitions = inbound_pins_per_partitions + tid * num_partitions;
@@ -964,7 +948,7 @@ void inbound_pins_per_partition_kernel(
 __global__
 void fm_refinement_gains_kernel(
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const float* __restrict__ hedge_weights,
     const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
     const uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
@@ -996,9 +980,6 @@ void fm_refinement_gains_kernel(
     *          per thread where each bin is then reduced! Just each thread in the warp is in charge of num_partitions/warp_size partitions!
     *
     * TODO: this kernel could undergo the same multi-candidate upgrade as "pairs"! Tho here it would be much harder with the moves sorting mechanism...
-    *
-    * TODO: like in HyperG, we could repurpose neighbors to keep a list of neighboring hedges to each node (maybe one-hot encoded), and thus
-    *       not build the full histogram, but build it only for those neighboring partitions...
     *
     * NOTE: no need for FIXED POINT here, since we don't need symmetry nor other invariants!
     */
@@ -1093,9 +1074,9 @@ void fm_refinement_gains_kernel(
 __global__
 void fm_refinement_cascade_kernel(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const float* hedge_weights,
     // CHOOSE: either rank nodes by their score and pass "move_ranks" or pass "scores" and sort on the fly, with the node id as a tie-breaker
     // CHOICE: sorted scores and move_ranks, because we need to keep scores in their current (sorted) order even after updating them
@@ -1204,7 +1185,7 @@ void fm_refinement_cascade_kernel(
 __global__
 void fm_refinement_apply_kernel(
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
     const uint32_t* __restrict__ move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
     const uint32_t* __restrict__ nodes_sizes,
@@ -1339,7 +1320,7 @@ void build_hedge_events_kernel(
     const uint32_t* __restrict__ ranks,
     const uint32_t* __restrict__ partitions,
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const uint32_t* __restrict__ inbound_count,
     const uint32_t num_nodes,
     uint32_t* __restrict__ ev_partition, // init. to UINT32_MAX (to spot invalid ones later)

@@ -438,3 +438,78 @@ Final upgrade:
 Transform the "scatter" into a true scatter. While counting, write everything in GM too, then while scattering you just need to copy from the oversized memory over to the new - correctly size - memory, a pack!
 => do this with a runtime check, only when you have enough memory to keep allocated both the correctly-sized array and the oversized one!
 =>=> cuda check memory, if twice the oversized buffer's amount of memory is available, go for the "fast" strategy!
+
+---
+
+In place pack technique:
+- one block per node / hedge
+- 2 warps per block
+- build a stack in shared memory, allocate exact as much a shared memory as the difference between the smallest final set (min in the counters initially stored in offsets, skip the first 0) and the initial oversized allocated for each instance
+- one warp does coalesced reads from the start of each set and puts on the stack the free cells (also keep in SM the stack pointer -> or better, two indices, the start and end of a cyclic buffer realizing a queue in SM)
+- one warp reads from the end and for each value it sees pops a entry from the stack/queue and writes it there
+- both warps stop as soon as the reach the size/count of the final set (or 1 - count, from the top)
+
+=> issue: this does not “pack”, just moved all free space at the end of each set!
+
+---
+
+> a sequence of bad ideas...
+
+Crazy idea:
+- when building neighbors from scratch, I am already doing the n*d*h work of visiting each touching hedge and for each its nodes
+- while computing neighbors from scratch I could use and hash-table and already track, for each node, it’s total score, incrementing it each time it’s deduplicated w.r.t. to the hedge giving the duplicate
+- thus, if we have the excuse to always rebuild neighbors from scratch, since we use them for nothing more than the candidates kernel, just merge the two things!
+=> there’s no need to build or dedupe kernels at all, just produce candidates while deduping neighbors, tagging those that failed the constraint checks
+=> and even if you need to keep neighbors for some reason, you can just keep them sparse, doing just the counting step into the oversized array, and using the maximum count to instantiate the next oversized array…
+
+=>=> new candidates kernel:
+- one node per block
+- large SM hash-set
+- GM hash-table
+=> nah, no need for the hash-set this way, because both hits and misses need to go write/update score in GM…
+- SM hash-table
+- GM hash-table with less space thx to SM?
+|
+- each thread of the block keeps the maximum score it has seen, at the end you do 4 block-wide maxes, masking duplicates, to get the candidates (after all, at least one thread must see the final value of each bin to write it…it can use that value to update its maximum!)
+- better if each warp keeps a running list of the last best 4 candidates
+
+The trick behind keeping neighbors in memory (and coarsening them along): they lower the $O(d \cdot h)$ complexity of computing candidate pairs strength to an $O(\delta)$. With just an upfront $O(d \cdot h)$ paid for construction them, and an additional $O(\delta)$ to coarsen them.
+
+FALSE! The candidates kernel still goes for each node over its hedges and for each hedge over its pins to compute scores!! This is still O(d*h)!!
+If you want the TRUE benefit:
+opt 1) don’t keep neighbors, just dedupe (merge scores) while computing candidates
+opt 2) keep neighbors WITH SCORES! Each neighbor brings along its score while you coarsen too (as before, dedupe = sum scores)
+
+Best opt for no-neighbors candidates kernel:
+Fill up SM, complete one pass over hedges, sort SM by score, update the maximums, sort again by node id, dump only its node ids (not scores) into GM, use a binary search into GM (one for ever duped strip of SM) to see if any node has already been seen when filling SM back up.
+
+Neighborless two kernel approach:
+- kernel 1 builds in the oversized global memory buffers the hash-map with the scores for each neighbor of each node
+  => one node per block, for maximum SM, change to one per warp as fewer nodes (and neighbors) remain
+  => it already adds the noise
+  => each hash bin must be (score, id) as to be used for sorting as a 64bit integer
+- CUB ascending segmented sort of each oversized buffer
+- kernel 2 reads the sorted neighbors, tries them from the first and sets aside the first MAX_CANDIDATES valid ones
+  => you can optimize this for speed and have one warp per node
+  => lane 0 reads the neighbor, the whole warp helps check inbounds validity
+
+Overall, the w/neighbors version should be faster, but this neighborless uses much less VRAM! Then there is the neighbors+scores, that avoids the candidates kernel all together, but wants double the neighbors VRAM…
+
+Note: kernel 1 could use SM as a quick lookup for GM, like an hash-map neighbor->GM-idx for all those nodes that didn't get inserted in GM with probe-length 1. Those, maybe just using it as a cache, and then dump-insert it into GM is better...
+=> using SM as an hash-map just like GM lowers the pressure on GM, reducing probe lenghts!
+=> since GM will be sorted anyway, be smart, don't insert from SM into GM with the hash-map method, rather have all threads in the block, all warps, do contigous accesses over GM, and in each empty space they find write an element they pop atomically from SM.
+=> before doing this SM->GM dump, use the "compacting" algorithm with all threads in the block over SM! Pack it into a dense stack (search the message "In place pack technique")!
+
+Crazier idea:
+Could we make the constraint check on inbounds (and size too) permanent by removing nodes from the neighbors set? It would be permanent-ish, because of set merges, but better than nothing!
+
+Neighborscores variant:
+- no scores when doing oversized & counting uniques
+- scores when doing the exact scatter
+
+Neighborless:
+- must be done with the 3 steps, build GM hash-sets, CUB segmented sort, pick maximums and check constraints
+
+
+avg. number of nodes in common between two hedges: d^2 / n
+avg. number of nodes in common between k hedges: d^k / n^(k-1)

@@ -469,6 +469,8 @@ namespace hgraph {
                     }
                 }
 
+                neigh.erase(n);
+
                 max_size = std::max(max_size, (uint32_t)neigh.size());
                 neigh.erase(n);
             }
