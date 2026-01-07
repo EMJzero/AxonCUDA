@@ -16,6 +16,8 @@ using dim_t = unsigned long long; // aka uint64_t
 
 #define SAVE_MEMORY_UP_TO_LEVEL 2 // number of coarsening levels for which to spill non-coarse data structures to the host, set to 0 to disable the feature
 
+#define SMALL_PART_MERGE_SIZE_THRESHOLD 15 // number of nodes below which partitions are considered "small" and an attempt is done at merging them with one-another
+
 // NOTE: everything tagged as "wrp" or "warp" assumes that all lanes are active, unless otherwise specified!
 
 // initialize memory for a block of threads: one consecutive chunk per warp
@@ -212,6 +214,14 @@ struct masked_value_functor {
     const uint32_t* valid_1;
     const uint32_t* valid_2;
     __host__ __device__ float operator()(uint32_t i) const { return valid_1[i] == 0 && valid_2[i] == 0 ? value[i] : -FLT_MAX; }
+};
+
+
+// USED BY: final small partitions merging
+
+struct constraints_state {
+    dim_t s, i;
+    uint32_t g;
 };
 
 
