@@ -403,6 +403,8 @@ __device__ __forceinline__ bool sm_hashmap_insert(hashmap_entry* __restrict__ ta
 // - "true (2)" if the set is full, the value was not found, and was not be inserted
 // - "false (0)" if the element is already in the hash-map, and its value got incremented by "inc_value" ("base_value" ignored)
 // => this admits false negatives! It never goes and checks the whole hash-map, so the value could have already been there but not be seen!
+// if MAX_NOT_SUM is true, then: update -> value = max(previous, base_value + inc_value)
+template <bool MAX_NOT_SUM>
 __device__ __forceinline__ uint8_t sm_hashmap_try_insert(hashmap_entry* __restrict__ table, const dim_t size, const uint32_t key, const uint32_t base_value, const uint32_t inc_value) {
     const uint32_t h = hash_uint32(key);
     int idx = h % size;
@@ -412,10 +414,12 @@ __device__ __forceinline__ uint8_t sm_hashmap_try_insert(hashmap_entry* __restri
         uint32_t* key_ptr = &table[slot].key;
         uint32_t old_key = atomicCAS(key_ptr, HASH_EMPTY, key);
         if (old_key == HASH_EMPTY) {
-            atomicAdd(&table[slot].value, base_value + inc_value);
+            if(MAX_NOT_SUM) atomicMax(&table[slot].value, base_value + inc_value);
+            else atomicAdd(&table[slot].value, base_value + inc_value);
             return 1; // "true (1)": new value inserted
         } else if (old_key == key) {
-            atomicAdd(&table[slot].value, inc_value);
+            if(MAX_NOT_SUM) atomicMax(&table[slot].value, base_value + inc_value);
+            else atomicAdd(&table[slot].value, inc_value);
             return false; // "false(0)": value already present -> updated
         }
         // else: collision with a different value, keep probing
@@ -484,6 +488,8 @@ __device__ __forceinline__ bool lm_hashmap_lookup(const hashmap_entry* __restric
 // GLOBAL MEMORY VERSION
 
 // new insert -> uses "base_value + inc_value"; update -> increments by "inc_value"
+// if MAX_NOT_SUM is true, then: update -> value = max(previous, base_value + inc_value)
+template <bool MAX_NOT_SUM>
 __device__ __forceinline__ bool gm_hashmap_insert(hashmap_entry* __restrict__ table, const dim_t size, const uint32_t key, const uint32_t base_value, const uint32_t inc_value) {
     const uint32_t h = hash_uint32_linear(key);
     int idx = h % size;
@@ -493,10 +499,12 @@ __device__ __forceinline__ bool gm_hashmap_insert(hashmap_entry* __restrict__ ta
         uint32_t* key_ptr = &table[slot].key;
         uint32_t old_key = atomicCAS(key_ptr, HASH_EMPTY, key);
         if (old_key == HASH_EMPTY) {
-            atomicAdd(&table[slot].value, base_value + inc_value);
+            if(MAX_NOT_SUM) atomicMax(&table[slot].value, base_value + inc_value);
+            else atomicAdd(&table[slot].value, base_value + inc_value);
             return true;
         } else if (old_key == key) {
-            atomicAdd(&table[slot].value, inc_value);
+            if(MAX_NOT_SUM) atomicMax(&table[slot].value, base_value + inc_value);
+            else atomicAdd(&table[slot].value, inc_value);
             return false;
         }
     }

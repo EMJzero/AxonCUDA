@@ -75,6 +75,7 @@ extern __global__ void grouping_kernel(
     const uint32_t num_nodes,
     const uint32_t num_repeats,
     slot* group_slots,
+    dp_score* d_dp_scores,
     uint32_t* groups
 );
 
@@ -517,6 +518,7 @@ int main(int argc, char** argv) {
     float *d_f_scores = nullptr;
     uint32_t *d_u_scores = nullptr;
     slot *d_slots = nullptr;
+    dp_score *d_dp_scores = nullptr;
     uint32_t *d_nodes_sizes = nullptr;
     uint32_t *d_partitions_sizes = nullptr;
     uint32_t *d_pins_per_partitions = nullptr;
@@ -542,6 +544,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_f_scores, num_nodes * sizeof(float))); // connection streght for each pair, used during refinement
     CUDA_CHECK(cudaMalloc(&d_u_scores, num_nodes * sizeof(uint32_t) * MAX_CANDIDATES)); // fixed point version of the above, used for the multi-candidates kernel
     CUDA_CHECK(cudaMalloc(&d_slots, num_nodes * sizeof(slot) * MAX_GROUP_SIZE)); // slot to finalize node pairs during grouping (true dtype: "slot")
+    CUDA_CHECK(cudaMalloc(&d_dp_scores, num_nodes * sizeof(dp_score))); // dynamic programming score for each node in the tree assuming it connected (with) or not (w/out) to its target
     CUDA_CHECK(cudaMalloc(&d_nodes_sizes, num_nodes * sizeof(uint32_t))); // nodes_size[node idx] -> how many pins the node counts as towards the partition size limit
 
     // copy to device
@@ -803,6 +806,7 @@ int main(int argc, char** argv) {
         thrust::device_ptr<slot> d_slots_ptr(d_slots);
         // TODO: could lower to just curr_num_nodes
         thrust::fill(d_slots_ptr, d_slots_ptr + curr_num_nodes * MAX_GROUP_SIZE, init_slot); // upper 32 bits to 0x00, lower 32 to 0xFF
+        CUDA_CHECK(cudaMemset(d_dp_scores, 0x00, num_nodes * sizeof(dp_score)));
         
         // prepare this level's coarsening groups
         uint32_t *d_groups = nullptr;
@@ -837,6 +841,7 @@ int main(int argc, char** argv) {
             (void*)&curr_num_nodes,
             (void*)&num_repeats,
             (void*)&d_slots,
+            (void*)&d_dp_scores,
             (void*)&d_groups
         };
         cudaLaunchCooperativeKernel((void*)grouping_kernel, blocks, threads_per_block, kernel_args, shared_bytes);
@@ -1791,8 +1796,7 @@ int main(int argc, char** argv) {
         thrust::transform(t_constraints_states.begin(), t_constraints_states.end(), t_groups.begin(), [] __host__ __device__ (const constraints_state& s) { return s.g; });
         // map groups to a representative partition id (lowest id in the group); groups are already contiguous, a single reduce-by-key is enough
         thrust::device_vector<uint32_t> t_rep_ids(t_groups.size());
-        auto rep_end = thrust::reduce_by_key(
-        t_groups.begin(), t_groups.end(), t_small_parts.begin(), thrust::make_discard_iterator(), t_rep_ids.begin(), thrust::equal_to<uint32_t>(), thrust::minimum<uint32_t>());
+        auto rep_end = thrust::reduce_by_key(t_groups.begin(), t_groups.end(), t_small_parts.begin(), thrust::make_discard_iterator(), t_rep_ids.begin(), thrust::equal_to<uint32_t>(), thrust::minimum<uint32_t>());
         t_rep_ids.resize(rep_end.second - t_rep_ids.begin());
         // build the map from partition id to the representative node
         thrust::device_vector<uint32_t> pid_map(num_partitions);

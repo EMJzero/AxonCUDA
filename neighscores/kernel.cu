@@ -162,11 +162,11 @@ void neighborhoods_scatter_kernel(
                     uint32_t neighbor = my_hedge[node_idx];
                     if (neighbor == node_id) continue;
                     uint32_t symm_noise = deterministic_noise(neighbor, node_id); // TODO: it's costly to recompute this each time
-                    uint8_t inserted = sm_hashmap_try_insert(dedupe, SM_MAX_BLOCK_64DEDUPE_BUFFER_SIZE, neighbor, symm_noise, my_hedge_weight);
+                    uint8_t inserted = sm_hashmap_try_insert<true>(dedupe, SM_MAX_BLOCK_64DEDUPE_BUFFER_SIZE, neighbor, symm_noise, my_hedge_weight);
                     // inserted == 1 -> value inserted in SM, no need to put it into GM for now;
                     // inserted == 2 -> SM full, check in GM; inserted == 0 -> value updated in SM;
                     if (inserted == 2)
-                        gm_hashmap_insert(my_neighbors, my_neighbors_count, neighbor, symm_noise, my_hedge_weight);
+                        gm_hashmap_insert<true>(my_neighbors, my_neighbors_count, neighbor, symm_noise, my_hedge_weight);
                 }
             }
         }
@@ -177,7 +177,7 @@ void neighborhoods_scatter_kernel(
     for (uint32_t i = warp_id * WARP_SIZE + lane_id; i < SM_MAX_BLOCK_64DEDUPE_BUFFER_SIZE; i += warps_per_block * WARP_SIZE) {
         hashmap_entry neighscore = dedupe[i];
         if (neighscore.key != HASH_EMPTY)
-            gm_hashmap_insert(my_neighbors, my_neighbors_count, neighscore.key, 0u, neighscore.value);
+            gm_hashmap_insert<true>(my_neighbors, my_neighbors_count, neighscore.key, 0u, neighscore.value);
     }
 }
 
@@ -789,11 +789,11 @@ void apply_coarsening_neighbors_scatter(
                 const uint32_t new_neighbor = groups[my_neighbor.key]; // translate to group id
                 if (warp_id == new_neighbor) continue;
                 // NOTE: this way, also symmetric noises add up, should be fine...
-                uint8_t inserted = sm_hashmap_try_insert(new_neighscores, MAX_SM_WARP_64DEDUPE_BUFFER_SIZE, new_neighbor, 0u, my_neighbor.value);
+                uint8_t inserted = sm_hashmap_try_insert<true>(new_neighscores, MAX_SM_WARP_64DEDUPE_BUFFER_SIZE, new_neighbor, 0u, my_neighbor.value);
                     // inserted == 1 -> value inserted in SM, no need to put it into GM for now;
                     // inserted == 2 -> SM full, check in GM; inserted == 0 -> value updated in SM;
                     if (inserted == 2)
-                        gm_hashmap_insert(coarse_neighbors_start, coarse_neighbors_size, new_neighbor, 0u, my_neighbor.value);
+                        gm_hashmap_insert<true>(coarse_neighbors_start, coarse_neighbors_size, new_neighbor, 0u, my_neighbor.value);
             }
         }
     }
@@ -803,7 +803,7 @@ void apply_coarsening_neighbors_scatter(
     for (int i = lane_id; i < MAX_SM_WARP_64DEDUPE_BUFFER_SIZE; i += WARP_SIZE) {
         hashmap_entry neighscore = new_neighscores[i];
         if (neighscore.key != HASH_EMPTY)
-            gm_hashmap_insert(coarse_neighbors_start, coarse_neighbors_size, neighscore.key, 0u, neighscore.value);
+            gm_hashmap_insert<true>(coarse_neighbors_start, coarse_neighbors_size, neighscore.key, 0u, neighscore.value);
     }
 }
 

@@ -371,6 +371,7 @@ void grouping_kernel(
     const uint32_t num_nodes,
     const uint32_t num_repeats,
     slot* __restrict__ group_slots, // initialized with -1 on the id
+    dp_score* __restrict__ dp_scores, // dynamic programming alternating scores, initialize to 0s
     uint32_t* __restrict__ groups // uninitialized, final group id of each node (non-zero based for now)
 ) {
     // SETUP FOR GLOBAL SYNC
@@ -461,6 +462,15 @@ void grouping_kernel(
     *   and run them, each thread repeats the upward and downward walk once for every node it was assigned
     * - the effective PATH_SIZE available to nodes is thus reduced by the number of nodes per thread, but luckly at the beginning, when there are many nodes,
     *   paths are also at their shortest...
+    * 
+    * From a greedy technique, to a true maximum matching!
+    * Exact maximum weighted matching with dynamic programming:
+    * - accumulate the score "w/out" on your target
+    * - update your next (that of the previous target) score "with" to your score plus the accumulated "w/out" from your children
+    * - update your next score "w/out" to "with" the accumulated "w/out" from your children, minus the w/out of the children holding the max / slot (may not be "you"), plus the same children's "with" score
+    * => we need to track / accumulate both "with" and "w/out" scores per node as we go up...
+    * - the last thread going up the path, as before sees and consolidate the right sums (no early break now)
+    * => now each node is claimed by the one such that, if the match is formed, the resulting subtree hash maximum score, accumulating alternating tree costs up through each branch, until the root
     */
 
     int32_t path_length[MAX_REPEATS];
@@ -489,7 +499,11 @@ void grouping_kernel(
 
             uint32_t current = curr_tid; // current node in the tree of pairs
             uint32_t target = pairs[curr_tid * MAX_CANDIDATES + i]; // target node of "current"
-            uint32_t score = scores[curr_tid * MAX_CANDIDATES + i]; // score with which "current" points to "target"
+            // total score in the traversed subtree assuming the current node will be paired with its targed
+            // initialized to the value with which "current" points to "target"
+            uint32_t score_with = scores[curr_tid * MAX_CANDIDATES + i];
+            // total score in the traversed subtree assuming the current node will NOT be paired with its targed
+            uint32_t score_wout = 0u;
 
             // go up the tree
             bool outcome = false;
@@ -497,12 +511,20 @@ void grouping_kernel(
                 outcome = true;
                 uint32_t target_target = pairs[target * MAX_CANDIDATES + i]; // target node of "target"
                 while (current != target_target) {
+                    const uint32_t prev_score_wout = atomicMax(&dp_scores[current].wout, score_wout);
+                    const uint32_t delta_score_wout = prev_score_wout < score_wout ? score_wout - prev_score_wout : 0u;
+                    slot prev_slot;
                     // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
-                    outcome = atomic_max_on_slot(group_slots, target*MAX_GROUP_SIZE, current, score);
+                    outcome = atomic_max_on_slot_ret(group_slots, target*MAX_GROUP_SIZE, current, score_with, prev_slot);
+                    if (prev_slot.score == UINT32_MAX) break; // alternative root: a node locked in a previous round
+                    const slot curr_slot = outcome ? (slot){ current, score_with } : prev_slot;
+                    const uint32_t prev_target_score_with = atomicAdd(&dp_scores[target].with, delta_score_wout);
+                    const uint32_t total_target_score_with = prev_target_score_with + delta_score_wout;
                     // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
                     // NOTE: if the atomic already sees the value you were about to write (strict), you CANNOT stop, you must know what happens to your target before taking the final decision on your path
                     // => with the second note being a <cannot>, we can't guarantee that exactly one thread will go up any piece of path, but we still don't need atomics in the downward walk, as every thread takes the same decisions regardless
-                    if (!outcome) break;
+                    // NOTE: can't break if we use the dynamic programming formulation, because with it every node must go up and add its scores to the 'dp_score' totals! Not much wasted effort, since each node anyway needed to reach the root for the downward walk...
+                    //if (!outcome) break;
                     // DEBUG: prevent cycles longer than 2!
                     /*bool die = false;
                     for (uint32_t j = 0; j < curr_path_length; j++) {
@@ -519,7 +541,9 @@ void grouping_kernel(
                     target = target_target;
                     if (target == UINT32_MAX) break; // alternative root: a node with no target
                     target_target = pairs[target_target * MAX_CANDIDATES + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
-                    score = scores[current * MAX_CANDIDATES + i];
+                    //score_wout = curr_slot.score + total_target_score_with - dp_scores[curr_slot.id].wout; // if the next node up the tree won't get paired, then his score is that of the best children's "with", and the other "w/out"
+                    score_wout = curr_slot.score + total_target_score_with - /*atomic load*/ atomicAdd(&dp_scores[curr_slot.id].wout, 0); // if the next node up the tree won't get paired, then his score is that of the best children's "with", and the other "w/out"
+                    score_with = total_target_score_with + scores[current * MAX_CANDIDATES + i]; // if the next node up the tree will get paired, then his score is his own candidate score, and all children's "w/out"
                 }
             }
             // handle "root(s)" as a pair of nodes pointing to each other
@@ -594,6 +618,7 @@ void grouping_kernel(
                 continue;
             }
             group_slots[curr_tid].score = 0;
+            dp_scores[curr_tid] = (dp_score){ 0u, 0u };
         }
 
         // global synch

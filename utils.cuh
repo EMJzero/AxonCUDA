@@ -5,7 +5,7 @@
 
 // USED BY: everyone
 
-// absolute replacement for "dim_t"
+// absolute replacement for "size_t"
 using dim_t = unsigned long long; // aka uint64_t
 
 #define WARP_SIZE 32u
@@ -143,6 +143,11 @@ typedef struct __align__(8) {
     uint32_t id; // lower 32 bits (Nvidia GPUs are little-endian)
     uint32_t score; // converted from float to fixed point! higher 32 bits
 } slot;
+
+typedef struct __align__(8) {
+    uint32_t with; // total score in the traversed subtree assuming the current node will be paired with its targed
+    uint32_t wout; // total score in the traversed subtree assuming the current node will NOT be paired with its targed
+} dp_score;
 
 __device__ __forceinline__ unsigned long long pack_slot(uint32_t score, uint32_t node) {
     // high 32 bits = score, low 32 bits = node
