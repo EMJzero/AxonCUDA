@@ -334,9 +334,9 @@ void candidates_kernel(
                 // tie-breaker: lower id node wins; invariant: partial neighbors order
                 // NOTE: tie-breaking doesn't need to be consistent with the max-on-slot of the 'grouping_kernel', somehow using "lower id wins" here and "higher id wins" there works better...
                 // WHAT ACTUALLY HAPPENS WHILE GROUPING that makes those equivalent:
-                // - same tie-breaking: roots naturally point to each-other with the highest score, no other node can overpower their takeover of each other's slots
-                // - opposite tie-breaking: the upward walk reaches two nodes pointing each-other and stops, at this time a node before them might have written in the roots a higher score, but there is a forceful overwrite + locking of the roots anyway
-                if (curr_score > best_score[i] || curr_score == best_score[i] && curr_neighbor < best_neighbor[i]) {
+                // - same tie-breaking (> and >): roots naturally point to each-other with the highest score, no other node can overpower their takeover of each other's slots
+                // - opposite tie-breaking (> and <): the upward walk reaches two nodes pointing each-other and stops, at this time a node before them might have written in the roots a higher score, but there is a forceful overwrite + locking of the roots anyway
+                if (curr_score > best_score[i] || curr_score == best_score[i] && curr_neighbor > best_neighbor[i]) {
                     for (uint32_t j = MAX_CANDIDATES - 1; j > i; j--) {
                         best_score[j] = best_score[j - 1];
                         best_neighbor[j] = best_neighbor[j - 1];
@@ -471,6 +471,8 @@ void grouping_kernel(
     * => we need to track / accumulate both "with" and "w/out" scores per node as we go up...
     * - the last thread going up the path, as before sees and consolidate the right sums (no early break now)
     * => now each node is claimed by the one such that, if the match is formed, the resulting subtree hash maximum score, accumulating alternating tree costs up through each branch, until the root
+    * 
+    * TODO: let only threads on leaves do the walks...
     */
 
     int32_t path_length[MAX_REPEATS];
@@ -553,6 +555,9 @@ void grouping_kernel(
                 const uint32_t lowest_id = min(current, target);
                 set_slot(group_slots, current*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
                 set_slot(group_slots, target*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
+                //atomic_max_on_slot(group_slots, target*MAX_GROUP_SIZE, lowest_id, score_with);
+                //assert(curr_path_length < actual_path_size);
+                //curr_path[curr_path_length++] = target;
             }
 
             path_length[repeat] = curr_path_length;
@@ -926,6 +931,8 @@ void apply_coarsening_touching_count(
     *     and reditect additional entries to global counters, then atomically increment global memory
     *
     * TODO: could partially skip this counting step, because we already have the new distinct inbound count evaluated during the candidates kernel!
+    * 
+    * TODO: could already count inbound and outbound separately, then use singler scatter kernel putting them already in the right place!
     */
 
     const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
@@ -1271,7 +1278,7 @@ void fm_refinement_gains_kernel(
             uint32_t part = my_initial_part + p;
             // TODO: could anticipate the constraint check! E.g. at the beginning of the iteration, entirely removing some partitions from the histogram,
             //       but this will require keeping a list of active partitions, since the initial-final indices won't suffice anymore...
-            if (my_initial_part + p < my_final_part && partitions_sizes[part] + my_size < max_nodes_per_part && (score > best_score || score == best_score && part < best_move)) {
+            if (my_initial_part + p < my_final_part && partitions_sizes[part] + my_size <= max_nodes_per_part && (score > best_score || score == best_score && part < best_move)) {
                 best_score = score;
                 best_move = part;
             }

@@ -513,3 +513,20 @@ Neighborless:
 
 avg. number of nodes in common between two hedges: d^2 / n
 avg. number of nodes in common between k hedges: d^k / n^(k-1)
+
+----
+
+Separate handling for inbound and outbound / src and dst:
+- two rounds of hedges counting, one for srcs, one for dsts, also keeping a "d_hedge_src_count" array!
+- custom pack operation over twin segments OR! If the pack is stable, use it as it is now!
+- coarsening touching hedges now uses two atomics with two counters, one inbound, one outbound! Then the scatter happens in one kernel, with two loops, one for each!
+
+The two kernel strategy for touching is better.
+
+The unlimited outbound mod needs:
+- counter d_hedge_src_count
+- two kernels with in between a sort to coarsen touching, like now, but dedupe each subset independently
+- pack kernel variant that skips the first X elements of the (sparse) src set and Y elements of the dst!
+
+Known flaw, or feature:
+With duplicates admitted between inbound and outbound, the candidates kernel could visit the same hedge twice, if that hedge is both inbound and outbound to the same node. This is not an issue when there are no cycles, but what about when there are? Should the hedge count twice in neighbor-score or not? IMO there just should not be cycles...

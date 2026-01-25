@@ -320,11 +320,10 @@ using namespace hwmodel;
 
 #define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
-  if (code != cudaSuccess) {
-    fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-    if (abort)
-      exit(code);
-  }
+    if (code != cudaSuccess) {
+        fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
 }
 
 void printHelp() {
@@ -371,10 +370,17 @@ int main(int argc, char** argv) {
 
     if (!load_path.empty()) {
         try {
-            std::cout << "Loading hypergraph from: " << load_path << " ...\n";
-            if (!std::filesystem::is_regular_file(load_path)) throw std::runtime_error("The provided path is not a file.");
-            std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
-            hg = HyperGraph::load(load_path);
+            if (!std::filesystem::is_regular_file(load_path)) throw std::runtime_error("Failed to load hypergraph, the provided path is not a file.");
+            std::filesystem::path file_path(load_path);
+            if (file_path.extension() == ".hgr") {
+                std::cout << "Loading hypergraph from: " << load_path << " (hMetis format) ...\n";
+                std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
+                hg = HyperGraph::load_hmetis(load_path);
+            } else {
+                std::cout << "Loading hypergraph from: " << load_path << " (binary format) ...\n";
+                std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
+                hg = HyperGraph::load(load_path);
+            }
             loaded = true;
         } catch (const std::exception& e) {
             std::cerr << "Error loading file: " << e.what() << "\n";
@@ -440,25 +446,29 @@ int main(int argc, char** argv) {
     hedges_offsets.reserve(num_hedges + 1);
     
     // prepare hedge offsets
-    // HP: no duplicates per hedge, no self-cycles (keep the src only, but still consider the hedge among the src's inbounds)
-    hg.deduplicateHyperedges();
+    // HP: no duplicates per hedge, no self-cycles (keep the src only, arg=false -> still consider the hedge among the src's inbounds, arg=true -> update the inbound set to match)
+    hg.deduplicateHyperedges(true);
     for (uint32_t i = 0; i < num_hedges; ++i)
         hedges_offsets.push_back(static_cast<dim_t>(hg.hedges()[i].offset()));
     hedges_offsets.push_back(hg.hedgesFlat().size());
     
     std::vector<uint32_t> touching_hedges;
     std::vector<dim_t> touching_hedges_offsets;
+    std::vector<uint32_t> inbound_count;
     touching_hedges.reserve(hg.hedgesFlat().size()); // with one outbound hedge per node, the total number of pins (e*d) is the total number of connections (n*h)
     touching_hedges_offsets.reserve(hg.nodes() + 1);
+    inbound_count.reserve(hg.nodes());
 
     // prepare touching sets
     // HP: no duplicates in either set, eventually duplicates in outbound w.r.t. inbounds will also be lost,
     //     inbounds must come first and their part must be sorted by id (ascending)
     for (uint32_t n = 0; n < hg.nodes(); ++n) {
-        touching_hedges_offsets.push_back(touching_hedges.size());
+        auto curr_size = touching_hedges.size();
+        touching_hedges_offsets.push_back(curr_size);
         // NOTE: must put in inbounds first!
         for (uint32_t h : hg.inboundSortedIds(n))
             touching_hedges.push_back(h);
+        inbound_count.push_back(touching_hedges.size() - curr_size);
         for (uint32_t h : hg.outboundSortedIds(n))
             touching_hedges.push_back(h);
     }
@@ -553,17 +563,15 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_touching, touching_hedges.data(), touching_hedges.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_touching_offsets, touching_hedges_offsets.data(), (num_nodes + 1) * sizeof(dim_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_hedge_weights, hedge_weights.data(), num_hedges * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_inbound_count, inbound_count.data(), num_nodes * sizeof(uint32_t), cudaMemcpyHostToDevice));
     std::vector<dim_t>().swap(hedges_offsets);
     std::vector<uint32_t>().swap(touching_hedges);
     std::vector<dim_t>().swap(touching_hedges_offsets);
+    std::vector<uint32_t>().swap(inbound_count);
 
     // initialize
     thrust::device_ptr<uint32_t> t_nodes_sizes(d_nodes_sizes);
     thrust::fill(t_nodes_sizes, t_nodes_sizes + num_nodes, 1u); // each initial node counts as 1 (NOTE: can be tuned to give some nodes more "space")
-    thrust::device_ptr<uint32_t> t_inbound_count(d_inbound_count);
-    thrust::device_ptr<dim_t> t_touching_offsets(d_touching_offsets);
-    // each initial node has one outbound hyperedge -> init. inbound counts to the number of touching - 1
-    thrust::transform(t_touching_offsets + 1, t_touching_offsets + 1 + num_nodes, t_touching_offsets, t_inbound_count, [] __device__ (dim_t next, dim_t curr) { return (uint32_t)(next - curr - 1); });
 
     // copy constants to device
     CUDA_CHECK(cudaMemcpyToSymbol(max_nodes_per_part, &h_max_nodes_per_part, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));

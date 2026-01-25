@@ -374,8 +374,9 @@ namespace hgraph {
         }
 
         // remove duplicate nodes (and self-cycles) inside each hyperedge
-        // NOTE: if a duplicate involves source + destination, the source is kept, while 'inbound_' and 'outbound_' sets are NOT updated (e.g. the hedge still shows among the source's inbounds)
-        void deduplicateHyperedges() {
+        // => if a duplicate involves source + destination, the source is kept
+        // => when 'update_in_out_sets' is false 'inbound_' and 'outbound_' sets are NOT updated (e.g. the hedge still shows among the source's inbounds)
+        void deduplicateHyperedges(bool update_in_out_sets = false) {
             std::vector<uint32_t> new_flat;
             new_flat.reserve(hedges_flat_.size());
             uint32_t new_offset = 0;
@@ -405,6 +406,13 @@ namespace hgraph {
             const uint32_t* base = hedges_flat_.data();
             for (auto& he : hedges_)
                 he = HyperEdge(he.offset(), he.length(), he.weight(), base);
+
+            if (update_in_out_sets) {
+                for (uint32_t i = 0; i < inbound_.size(); ++i) {
+                    const auto& out = outbound_[i];
+                    std::erase_if(inbound_[i], [&](auto x) { return out.contains(x); });
+                }
+            }
         }
 
         // builds all neighborhoods (in- and outbound to each node)
