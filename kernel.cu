@@ -1073,11 +1073,21 @@ void apply_coarsening_touching_scatter_outbound(
         const uint32_t my_outbound_count = (uint32_t)(touching_offsets[node + 1] - touching_offsets[node]) - inbound_count[node];
         for (uint32_t i = lane_id; i < my_outbound_count; i += WARP_SIZE) {
             const uint32_t hedge_idx = my_outbound[i];
-            if (sm_hashset_try_insert(new_touching, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, hedge_idx)) { // check in the SM cache
+            // insert == 0, 1 -> no need to put into GM what already is in the SM hash-set
+            // insert == 2 -> SM full, check in GM
+            if (sm_hashset_try_insert(new_touching, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, hedge_idx) == 2) { // check in the SM cache
                 if(binary_search<uint32_t>(coarse_touching_start, new_inbound_count, hedge_idx) == UINT32_MAX) // check among inbound hedges
                     gm_hashset_insert(coarse_outbound_start, coarse_outbound_size, hedge_idx); // dedupe among outbound hedges
             }
         }
+    }
+    __syncwarp();
+
+    // dump SM over to GM all at once => the deferred flush prevents catastrophic probe lengths in the main loop
+    for (uint32_t i = lane_id; i < MAX_SM_WARP_DEDUPE_BUFFER_SIZE; i += WARP_SIZE) {
+        uint32_t hedge_idx = new_touching[i];
+        if (hedge_idx != HASH_EMPTY && binary_search<uint32_t>(coarse_touching_start, new_inbound_count, hedge_idx) == UINT32_MAX)
+            gm_hashset_insert(coarse_outbound_start, coarse_outbound_size, hedge_idx);
     }
 }
 
@@ -1290,7 +1300,7 @@ void fm_refinement_gains_kernel(
         best_move = max.node; // yeah, "node" should be called "partition" here, but this way we repurpose the struct...
     }
 
-    if (lane_id == 0) {
+    if (lane_id == 0 && my_partition != best_move) { // move to where I already am -> no move
         moves[warp_id] = best_move;
         scores[warp_id] = best_score; // write even if negative since scores are uninitialized, we filter later!
     }

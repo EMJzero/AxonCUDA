@@ -447,7 +447,7 @@ int main(int argc, char** argv) {
     
     // prepare hedge offsets
     // HP: no duplicates per hedge, no self-cycles (keep the src only, arg=false -> still consider the hedge among the src's inbounds, arg=true -> update the inbound set to match)
-    hg.deduplicateHyperedges(true);
+    hg.deduplicateHyperedges(false);
     for (uint32_t i = 0; i < num_hedges; ++i)
         hedges_offsets.push_back(static_cast<dim_t>(hg.hedges()[i].offset()));
     hedges_offsets.push_back(hg.hedgesFlat().size());
