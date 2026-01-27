@@ -359,14 +359,13 @@ void candidates_kernel(
     }
 }
 
-// create groups of at most MAX_GROUP_SIZE nodes, highest score first
-// TODO: currently MAX_GROUP_SIZE is ignored, and groups are of at most 2!
+// create groups of at most MAX_GROUP_SIZE ( =2 for now ) nodes, highest score first
 // SEQUENTIAL COMPLEXITY: n*log n
 // PARALLEL OVER: n
 __global__
 void grouping_kernel(
-    const uint32_t* __restrict__ pairs, // pairs[idx] is the partner idx wants to be grouped with
-    const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be grouped with pairs[idx]
+    const uint32_t* __restrict__ pairs, // pairs[idx] is the partner idx wants to be grouped with (UINT32_MAX if undefined)
+    const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be grouped with pairs[idx] (0 if undefined)
     const uint32_t* __restrict__ nodes_sizes,
     const uint32_t num_nodes,
     const uint32_t num_repeats,
@@ -512,21 +511,15 @@ void grouping_kernel(
             if (target != UINT32_MAX) {
                 outcome = true;
                 uint32_t target_target = pairs[target * MAX_CANDIDATES + i]; // target node of "target"
-                while (current != target_target) {
-                    const uint32_t prev_score_wout = atomicMax(&dp_scores[current].wout, score_wout);
-                    const uint32_t delta_score_wout = prev_score_wout < score_wout ? score_wout - prev_score_wout : 0u;
+                while (current != target_target || current > target) { // break the two-cycle, always go up to the node of lowest id in the root pair
+                    const uint32_t prev_target_score_wout_sum = atomicAdd(&dp_scores[target].with, score_wout); // dp_scores[...].with contains the sum of childrens' wouts!
+                    const uint32_t target_score_wout_sum = prev_target_score_wout_sum + score_wout;
                     slot prev_slot;
                     // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
-                    outcome = atomic_max_on_slot_ret(group_slots, target*MAX_GROUP_SIZE, current, score_with, prev_slot);
+                    outcome = atomic_max_on_slot_ret(group_slots, target, current, score_with - score_wout, prev_slot); // atomic are done with the GAIN from the wout->with transition, wins the subtree with the highest gain if given the target
                     if (prev_slot.score == UINT32_MAX) break; // alternative root: a node locked in a previous round
-                    const slot curr_slot = outcome ? (slot){ current, score_with } : prev_slot;
-                    const uint32_t prev_target_score_with = atomicAdd(&dp_scores[target].with, delta_score_wout);
-                    const uint32_t total_target_score_with = prev_target_score_with + delta_score_wout;
-                    // NOTE: if the atomic fails you are surely not the maximum, thus you can stop here and not even bother continuing (we then start going down without even looking again at this target)
-                    // NOTE: if the atomic already sees the value you were about to write (strict), you CANNOT stop, you must know what happens to your target before taking the final decision on your path
-                    // => with the second note being a <cannot>, we can't guarantee that exactly one thread will go up any piece of path, but we still don't need atomics in the downward walk, as every thread takes the same decisions regardless
-                    // NOTE: can't break if we use the dynamic programming formulation, because with it every node must go up and add its scores to the 'dp_score' totals! Not much wasted effort, since each node anyway needed to reach the root for the downward walk...
-                    //if (!outcome) break;
+                    //const uint32_t holder_id = outcome ? current : prev_slot.id;
+                    const uint32_t holder_with_minus_wout = outcome ? score_with - score_wout : prev_slot.score;
                     // DEBUG: prevent cycles longer than 2!
                     /*bool die = false;
                     for (uint32_t j = 0; j < curr_path_length; j++) {
@@ -543,21 +536,19 @@ void grouping_kernel(
                     target = target_target;
                     if (target == UINT32_MAX) break; // alternative root: a node with no target
                     target_target = pairs[target_target * MAX_CANDIDATES + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
-                    //score_wout = curr_slot.score + total_target_score_with - dp_scores[curr_slot.id].wout; // if the next node up the tree won't get paired, then his score is that of the best children's "with", and the other "w/out"
-                    score_wout = curr_slot.score + total_target_score_with - /*atomic load*/ atomicAdd(&dp_scores[curr_slot.id].wout, 0); // if the next node up the tree won't get paired, then his score is that of the best children's "with", and the other "w/out"
-                    score_with = total_target_score_with + scores[current * MAX_CANDIDATES + i]; // if the next node up the tree will get paired, then his score is his own candidate score, and all children's "w/out"
+                    score_wout = target_score_wout_sum + /* + with[holder] - wout[holder] */ holder_with_minus_wout; // if the next node up the tree won't get paired, then his score is that of the best children's "with", and the other "w/out"
+                    score_with = target_score_wout_sum + scores[current * MAX_CANDIDATES + i]; // if the next node up the tree will get paired, then his score is his own candidate score, and all children's "w/out"
                 }
-            }
-            // handle "root(s)" as a pair of nodes pointing to each other
-            // NOTE: forceful writes are fine, anyone seing those two nodes will write the same thing: "this is a group" or "would you get married already!?"
-            // NOTE: prevent locked groups from forming a 2-cycle after the next pairing candidates are considered
-            if (outcome && target != UINT32_MAX && group_slots[target*MAX_GROUP_SIZE].score != UINT32_MAX) {
-                const uint32_t lowest_id = min(current, target);
-                set_slot(group_slots, current*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
-                set_slot(group_slots, target*MAX_GROUP_SIZE, lowest_id, UINT32_MAX);
-                //atomic_max_on_slot(group_slots, target*MAX_GROUP_SIZE, lowest_id, score_with);
-                //assert(curr_path_length < actual_path_size);
-                //curr_path[curr_path_length++] = target;
+                // no need to handle root pair, since we already broke the pair and made the lower-id node the sole root
+                // => the result does not change, since the lower-id node will be contended between the gains of the two subtrees
+                // handle "root(s)" as a pair of nodes pointing to each other from the POV of the lower-id node of the two
+                //if (current == target_target && current < target) {
+                    // tie back to your target (other root node) iff there is more to gain
+                    //const uint32_t with_sum = score_with + atomicAdd(&dp_scores[target].with, 0); // sum of the two roots' with dp_score and their score
+                    //const uint32_t holder_with_minus_wout = get_slot(group_slots, target).score;
+                    //const uint32_t wout_sum = score_wout + atomicAdd(&dp_scores[target].with, 0) + holder_with_minus_wout; // sum of the two root's wout dp_scores
+                    //if (with_sum > wout_sum) ...
+                //}
             }
 
             path_length[repeat] = curr_path_length;
@@ -586,12 +577,12 @@ void grouping_kernel(
                 // NOTE: on the first iteration, coming from the upward walk, "current" is the last node that got its slot updated
                 target = curr_path[curr_path_length + 1]; // this is "who current would have liked to be with", the node one step back up the ladder towards root
                 current = curr_path[curr_path_length];
-                if (group_slots[target*MAX_GROUP_SIZE].id == current) {
+                if (group_slots[target].id == current) {
                     // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine
-                    group_slots[current*MAX_GROUP_SIZE].id = current;
+                    group_slots[current].id = current;
                     // NOTE: lock groups by setting scores to the maximum
-                    group_slots[current*MAX_GROUP_SIZE].score = UINT32_MAX;
-                    group_slots[target*MAX_GROUP_SIZE].score = UINT32_MAX;
+                    group_slots[current].score = UINT32_MAX;
+                    group_slots[target].score = UINT32_MAX;
                     // NOTE: after a successful link the next node down the path has already lost its target, so we might as well skip it
                     curr_path_length--;
                 }
@@ -600,11 +591,11 @@ void grouping_kernel(
             if (curr_path_length == -1) {
                 target = curr_path[0];
                 current = curr_tid;
-                if (group_slots[target*MAX_GROUP_SIZE].id == current) {
-                    group_slots[current*MAX_GROUP_SIZE].id = current;
+                if (group_slots[target].id == current) {
+                    group_slots[current].id = current;
                     // lock groups by setting scores to the maximum
-                    group_slots[current*MAX_GROUP_SIZE].score = UINT32_MAX;
-                    group_slots[target*MAX_GROUP_SIZE].score = UINT32_MAX;
+                    group_slots[current].score = UINT32_MAX;
+                    group_slots[target].score = UINT32_MAX;
                 }
             }
         }
@@ -634,10 +625,7 @@ void grouping_kernel(
     for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
         const uint32_t curr_tid = tid + repeat * tcount;
         if (curr_tid >= num_nodes) break;
-        uint32_t min_id = UINT32_MAX;
-        for (uint32_t i = 0; i < MAX_GROUP_SIZE; i++)
-            min_id = min(group_slots[curr_tid*MAX_GROUP_SIZE + i].id, min_id);
-        groups[curr_tid] = min_id;
+        groups[curr_tid] = group_slots[curr_tid].id;
     }
 }
 
@@ -1256,10 +1244,10 @@ void fm_refinement_gains_kernel(
         for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
             const uint32_t actual_hedge_idx = *hedge_idx;
             const uint32_t* my_pin_per_partition = pins_per_partitions + actual_hedge_idx * num_partitions;
-            my_pin_per_partition += my_initial_part;
             const float my_hedge_weight = hedge_weights[actual_hedge_idx];
             // each thread in the warp reads partitions_per_thread counters
             for (uint32_t p = 0; p < partitions_per_thread; p++) {
+                const uint32_t part = p + my_initial_part;
                 if (my_initial_part + p < my_final_part) {
                     // Option 1: the gain is the weighted connections count with another partition <minus> the weighted connections count with the current one
                     /*uint32_t counter = my_pin_per_partition[my_initial_part + p];
@@ -1268,13 +1256,13 @@ void fm_refinement_gains_kernel(
                     // update local histogram
                     histogram[p] += counter*my_hedge_weight;*/
                     // Option 2: the gain is the sum the weights of hedges such that moving to a certain partition the hedge (same as HyperG)
-                    uint32_t counter = my_pin_per_partition[my_initial_part + p];
+                    uint32_t counter = my_pin_per_partition[part];
                     float gain = 0.0f;
                     // hedge connected to my partition: gain the hedge's weight iff moving would disconnect it from my partition (I am its last pin left there)
-                    if (counter == 1 && my_initial_part + p == my_partition)
+                    if (counter == 1 && part == my_partition)
                         gain = my_hedge_weight;
                     // hedge not yet connected to the partition: pay the hedge's weight iff moving there connects it to the new partition (I would become its first pin there)
-                    else if (counter == 0 && my_initial_part + p != my_partition)
+                    else if (counter == 0 && part != my_partition)
                         gain = -my_hedge_weight;
                     // update local histogram
                     histogram[p] += gain;
@@ -1284,8 +1272,8 @@ void fm_refinement_gains_kernel(
 
         // reduce max inside each threads
         for (uint32_t p = 0; p < partitions_per_thread; p++) {
-            float score = histogram[p];
-            uint32_t part = my_initial_part + p;
+            const float score = histogram[p];
+            const uint32_t part = my_initial_part + p;
             // TODO: could anticipate the constraint check! E.g. at the beginning of the iteration, entirely removing some partitions from the histogram,
             //       but this will require keeping a list of active partitions, since the initial-final indices won't suffice anymore...
             if (my_initial_part + p < my_final_part && partitions_sizes[part] + my_size <= max_nodes_per_part && (score > best_score || score == best_score && part < best_move)) {

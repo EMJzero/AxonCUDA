@@ -441,6 +441,18 @@ int main(int argc, char** argv) {
 
     std::cout << "Preparing hypergraph data...\n";
 
+    /*
+    * Note: by design, only inbound hedges can be constrained (because their deduplication takes priority over outbound), therefore to support other constraints there are two options:
+    * - to constrain outbound hedges, simply swap inbound and outbound hedges
+    * - to constrain incident (touching) hedges, make them all inbound (no src)
+    * 
+    * Important:
+    * - no cycles admitted
+    * - during execution, hedges and incidence sets will diverge:
+    *   - hedges remove duplicates (cycles) between sources and destinations, from the destinations (sources preserved)
+    *   - incidence sets (touching) remove duplicates between inbound and outbound, from the outbound (inbound preserved -> for constraint checks)
+    */
+
     uint32_t num_hedges = static_cast<uint32_t>(hg.hedges().size());
     std::vector<dim_t> hedges_offsets; // hedge idx -> hedge start index in the contiguous hedges array
     hedges_offsets.reserve(num_hedges + 1);
