@@ -112,7 +112,7 @@ __forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
     for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
         uint32_t other_val = __shfl_xor_sync(0xffffffff, val, offset);
         uint32_t other_payload = __shfl_xor_sync(0xffffffff, payload, offset);
-        if (other_val > val || other_val == val && other_payload > payload) {
+        if (other_val > val || other_val == val && other_payload < payload) {
             val = other_val;
             payload = other_payload;
         }
@@ -796,31 +796,21 @@ __device__ __forceinline__ void wrp_bitonic_sort_by_key(K* __restrict__ keys, V*
 }
 
 // binary search, returns the index of 'value' in 'a' or UINT32_MAX if it is not found
-// IMPORTANT: when 'ASC' is true, it assumes data sorted in ascending order, when false in descending order
-template <typename T, bool ASC>
+template <typename T>
 __device__ __forceinline__ uint32_t binary_search(const T* a, dim_t n, T value) {
     int lo = 0;
     int hi = n - 1;
     while (lo <= hi) {
         int mid = (lo + hi) >> 1;
         T v = a[mid];
-        if constexpr (ASC) {
-            if (v < value)
-                lo = mid + 1;
-            else if (v > value)
-                hi = mid - 1;
-            else
-                return mid;
-        } else {
-            if (v > value)
-                lo = mid + 1;
-            else if (v < value)
-                hi = mid - 1;
-            else
-                return mid;
-        }
+        if (v < value)
+            lo = mid + 1;
+        else if (v > value)
+            hi = mid - 1;
+        else
+            return mid; // found -> return idx
     }
-    return UINT32_MAX;
+    return UINT32_MAX; // not found
 }
 
 

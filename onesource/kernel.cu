@@ -174,7 +174,6 @@ __global__
 void candidates_kernel(
     const uint32_t* __restrict__ hedges,
     const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ srcs_count,
     const uint32_t* __restrict__ neighbors,
     const dim_t* __restrict__ neighbors_offsets,
     const uint32_t* __restrict__ touching,
@@ -218,12 +217,11 @@ void candidates_kernel(
     const uint32_t* not_my_neighbors = neighbors + neighbors_offsets[warp_id + 1];
     uint32_t neighbors_count = (uint32_t)(neighbors_offsets[warp_id + 1] - neighbors_offsets[warp_id]);
     extern __shared__ uint32_t histogram[];
-    uint32_t* histogram_node = histogram + 3 * HIST_SIZE * (threadIdx.x / WARP_SIZE);
-    uint32_t* histogram_score = histogram + 3 * HIST_SIZE * (threadIdx.x / WARP_SIZE) + HIST_SIZE;
-    uint32_t* histogram_inbound = histogram + 3 * HIST_SIZE * (threadIdx.x / WARP_SIZE) + 2 * HIST_SIZE;
+    uint32_t* histogram_node = histogram + 2 * HIST_SIZE * (threadIdx.x / WARP_SIZE);
+    uint32_t* histogram_score = histogram + 2 * HIST_SIZE * (threadIdx.x / WARP_SIZE) + HIST_SIZE;
 
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
-    const uint32_t my_touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
+    const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
     const uint32_t my_inbound_count = inbound_count[warp_id];
 
     const uint32_t my_size = nodes_sizes[warp_id];
@@ -261,92 +259,83 @@ void candidates_kernel(
         // add a little bit of symmetric deterministic noise
         for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
             uint32_t curr_neighbor = histogram_node[nb];
-            if (curr_neighbor != UINT32_MAX) {
+            if (curr_neighbor != UINT32_MAX)
                 histogram_score[nb] = deterministic_noise(curr_neighbor, warp_id);
-                histogram_inbound[nb] = inbound_count[curr_neighbor];
-            } else {
+            else
                 histogram_score[nb] = 0u;
-                histogram_inbound[nb] = 0u;
-            }
         }
+
+        // TODO: shared memory caching of hyperedges!!
+
+        // TODO: add this back when and if you start filling back up invalid nodes before going to the next histogram...
+        // if no neighbor passed constraints checks (histogram is all UINT32_MAXs), exit the loop early
+        //if (neighbors_count == 0)
+        //    break;
 
         // iterate over touching hyperedges
         // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
-        for (uint32_t hedge_idx = 0u; hedge_idx < my_touching_count; hedge_idx++) {
+        for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
             dim_t my_hedge_offset, not_my_hedge_offset;
-            uint32_t my_hedge_weight, my_hedge_src_count;
+            uint32_t my_hedge_weight;
             if (lane_id == 0) {
-                const uint32_t actual_hedge_idx = my_touching[hedge_idx];
+                const uint32_t actual_hedge_idx = *hedge_idx;
                 my_hedge_offset = hedges_offsets[actual_hedge_idx];
                 not_my_hedge_offset = hedges_offsets[actual_hedge_idx + 1];
                 my_hedge_weight = (uint32_t)(hedge_weights[actual_hedge_idx]*FIXED_POINT_SCALE);
-                my_hedge_src_count = srcs_count[actual_hedge_idx];
             }
-            my_hedge_offset = __shfl_sync(0xFFFFFFFF, my_hedge_offset, 0); // each thread in the warp reads one every WARP_SIZE pins
-            not_my_hedge_offset = __shfl_sync(0xFFFFFFFF, not_my_hedge_offset, 0);
+            const uint32_t* my_hedge = lane_id + hedges + __shfl_sync(0xFFFFFFFF, my_hedge_offset, 0); // each thread in the warp reads one every WARP_SIZE pins
+            const uint32_t* not_my_hedge = hedges + __shfl_sync(0xFFFFFFFF, not_my_hedge_offset, 0);
             my_hedge_weight = __shfl_sync(0xFFFFFFFF, my_hedge_weight, 0);
-            my_hedge_src_count = __shfl_sync(0xFFFFFFFF, my_hedge_src_count, 0);
-            const uint32_t* my_hedge = hedges + my_hedge_offset;
-            const dim_t my_hedge_size = not_my_hedge_offset - my_hedge_offset;
-            for (uint32_t i = lane_id; i < my_hedge_size; i += WARP_SIZE) {
-                uint32_t pin = my_hedge[i];
+            for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
+                uint32_t pin = *my_hedge;
                 // update local histogram
-                const uint32_t hist_idx = binary_search<uint32_t, true>(histogram_node, HIST_SIZE, pin);
+                const uint32_t hist_idx = binary_search<uint32_t>(histogram_node, HIST_SIZE, pin);
                 // NOTE: no atomic needed => all threads in the warp advance in sync and there are not duplicates in hedges, no two threads will ever write the same bin!
-                if (hist_idx != UINT32_MAX) {
-                    histogram_score[hist_idx] += my_hedge_weight;
-                    if (i >= my_hedge_src_count && hedge_idx < my_inbound_count) // the pin is a destination and the hedge is an inbound-to-me one
-                        histogram_inbound[hist_idx]--;
-                }
+                if (hist_idx != UINT32_MAX) histogram_score[hist_idx] += my_hedge_weight;
             }
         }
-
         // warp sync after computing scores
         __syncwarp();
 
-        // delete candidates that would lead to invalid clusters
-        // MAYBE: do this after sorting, only on the extracted neighbor!
-        for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
-            if (histogram_inbound[nb] + my_inbound_count > max_inbound_per_part) {
-                histogram_node[nb] = UINT32_MAX;
-                histogram_score[nb] = 0u;
-            }
-        }
-
         // sort the histogram by lowest score first (empty bins have score = 0), highest id first as a tiebreaker
         // TODO: maybe replace with a warp-parallel max per candidate iteration below (dunno tho, the max requires a warp-parallel read of the whole histogram)
-        //wrp_bitonic_sort_by_key<uint32_t, uint32_t, HIST_SIZE>(histogram_score, histogram_node);
-        //__syncwarp();
+        wrp_bitonic_sort_by_key<uint32_t, uint32_t, HIST_SIZE>(histogram_score, histogram_node);
+        __syncwarp();
 
-        // extract the global maximum(s)
+        // updated global maximum(s), checking inbound constraints before doing it
+        // => this postpones such an expensive constrain check as much as possible, and does it for as few neighbors as possible
         for (int32_t candidate = HIST_SIZE - 1; candidate >= 0; candidate--) {
-            // warp sync on updated histogram (after removing invalid candidates and after removing the last extracted max)
-            __syncwarp();
-            uint32_t curr_neighbor = UINT32_MAX;
-            uint32_t curr_score = 0u;
-            uint32_t best_hist_idx = 0u;
-            for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
-                const uint32_t nb_neighbor = histogram_node[nb];
-                const uint32_t nb_score = histogram_score[nb];
-                if (nb_score > curr_score || nb_score == curr_score && nb_neighbor > curr_neighbor) { // tie-breaking here too
-                    curr_neighbor = nb_neighbor;
-                    curr_score = nb_score;
-                    best_hist_idx = nb;
-                }
-            }
-            bin max_neighbor = warpReduceMax(curr_score, curr_neighbor); // this also tie-breaks
-            if (max_neighbor.node == curr_neighbor) {
-                histogram_node[best_hist_idx] = UINT32_MAX;
-                histogram_score[best_hist_idx] = 0u;
-            }
-            curr_neighbor = max_neighbor.node;
+            uint32_t curr_neighbor;
+            if (lane_id == 0)
+                curr_neighbor = histogram_node[candidate];
+            curr_neighbor = __shfl_sync(0xFFFFFFFF, curr_neighbor, 0);
             if (curr_neighbor == UINT32_MAX) break;
-            curr_score = max_neighbor.score;
+            uint32_t curr_score, neighbor_inbound_count;
+            dim_t neighbor_touching_offsets;
+            if (lane_id == 0) {
+                curr_score = histogram_score[candidate];
+                neighbor_touching_offsets = touching_offsets[curr_neighbor];
+                neighbor_inbound_count = inbound_count[curr_neighbor];
+            }
+            curr_score = __shfl_sync(0xFFFFFFFF, curr_score, 0);
             if (curr_score < best_score[MAX_CANDIDATES - 1]) break;
+
+            // skip incompatible neighbors due to inbound constraints
+            const uint32_t* neighbor_inbound = touching + __shfl_sync(0xFFFFFFFF, neighbor_touching_offsets, 0);
+            const uint32_t* not_neighbor_inbound = neighbor_inbound + __shfl_sync(0xFFFFFFFF, neighbor_inbound_count, 0);
+            uint32_t new_inbound_count = 0u;
+            for (neighbor_inbound += lane_id; neighbor_inbound < not_neighbor_inbound; neighbor_inbound += WARP_SIZE)
+                new_inbound_count += binary_search<uint32_t>(my_touching, my_inbound_count, *neighbor_inbound) == UINT32_MAX ? 1 : 0; // binary search only among the inbounds part of my_touching
+            new_inbound_count = warpReduceSum<uint32_t>(new_inbound_count) + my_inbound_count;
+            if (new_inbound_count > max_inbound_per_part) continue;
 
             // get the best MAX_CANDIDATES candidates out of the histogram
             for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
-                // tie-breaker: higher id node wins; invariant: partial neighbors order
+                // tie-breaker: lower id node wins; invariant: partial neighbors order
+                // NOTE: tie-breaking doesn't need to be consistent with the max-on-slot of the 'grouping_kernel', somehow using "lower id wins" here and "higher id wins" there works better...
+                // WHAT ACTUALLY HAPPENS WHILE GROUPING that makes those equivalent:
+                // - same tie-breaking (> and >): roots naturally point to each-other with the highest score, no other node can overpower their takeover of each other's slots
+                // - opposite tie-breaking (> and <): the upward walk reaches two nodes pointing each-other and stops, at this time a node before them might have written in the roots a higher score, but there is a forceful overwrite + locking of the roots anyway
                 if (curr_score > best_score[i] || curr_score == best_score[i] && curr_neighbor > best_neighbor[i]) {
                     for (uint32_t j = MAX_CANDIDATES - 1; j > i; j--) {
                         best_score[j] = best_score[j - 1];
@@ -648,13 +637,11 @@ __global__
 void apply_coarsening_hedges_count(
     const uint32_t* __restrict__ hedges,
     const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ srcs_count,
     const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
     const uint32_t num_hedges,
     const uint32_t max_hedge_size,
     uint32_t* __restrict__ coarse_oversized_hedges,
-    dim_t* __restrict__ coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
-    uint32_t* __restrict__ coarse_srcs_count
+    dim_t* __restrict__ coarse_hedges_offsets // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
 ) {
     // STYLE: one hedge per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
@@ -664,7 +651,7 @@ void apply_coarsening_hedges_count(
 
     /*
     * Idea:
-    * - first deduplicate inside hedges to count their new, distinct, nodes (count srcs and dsts all together)
+    * - first deduplicate inside hedges to count their new, distinct, nodes
     * - scan the counts per hedge to get the new offsets
     * - repeat the deduplication and write (scatter) each new hedge to its offset
     *
@@ -674,17 +661,15 @@ void apply_coarsening_hedges_count(
     *   and reditect additional entries to atomically incremented global counters (issue: musre ensure the src is preserved!!)
     *
     * Must ensure that:
-    * - there are no self-cycles (remove the >>src<< to break them)
+    * - there are no self-cycles
     * - the same node never appears twice in the same hedge
     *   => exploited by the coarsening of touching sets
     */
 
     const dim_t hedge_start_idx = hedges_offsets[warp_id], hedge_end_idx = hedges_offsets[warp_id + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
-    const uint32_t hedge_srcs_count = srcs_count[warp_id];
-    const uint32_t *hedge_srcs_end = hedges + hedge_start_idx + hedge_srcs_count;
     uint32_t *oversized_coarse_hedges_start = coarse_oversized_hedges + max_hedge_size * warp_id;
-    uint32_t new_hedges_count = 0, new_srcs_count = 0;
+    uint32_t new_hedges_count = 0;
     wrp_init<uint32_t>(oversized_coarse_hedges_start, max_hedge_size, HASH_EMPTY); // HP: HASH_EMPTY is > than any value that could be inserted
 
     // SM deduplication hash-set
@@ -693,8 +678,8 @@ void apply_coarsening_hedges_count(
     wrp_init<uint32_t>(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
     __syncwarp();
 
-    // go over the hedge's destinations
-    for (const uint32_t* curr = hedge_start + hedge_srcs_count + lane_id; curr < hedge_end; curr += WARP_SIZE) {
+    // go over the hedge's pins
+    for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_end; curr += WARP_SIZE) {
         const uint32_t pin = groups[*curr]; // read and map pin to its new id
         const uint8_t inserted = sm_hashset_try_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, pin); // check in the SM cache
         // inserted == 1 -> no need to put into GM what already is in the SM hash-set
@@ -703,34 +688,20 @@ void apply_coarsening_hedges_count(
             new_hedges_count++;
     }
 
-    // go over the hedge's sources
-    for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_srcs_end; curr += WARP_SIZE) {
-        const uint32_t pin = groups[*curr];
-        const uint8_t inserted = sm_hashset_try_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, pin);
-        if (inserted == 1 || inserted == 2 && gm_hashset_insert(oversized_coarse_hedges_start, max_hedge_size, pin))
-            new_srcs_count++;
-    }
-
-    new_hedges_count += new_srcs_count;
-
     new_hedges_count = warpReduceSumLN0<uint32_t>(new_hedges_count);
-    new_srcs_count = warpReduceSumLN0<uint32_t>(new_srcs_count);
 
-    if (lane_id == 0) {
+    if (lane_id == 0)
         coarse_hedges_offsets[warp_id + 1] = (dim_t)new_hedges_count; // leave the first entry to be 0 (offset of the first hedge)
-        coarse_srcs_count[warp_id] = new_srcs_count;
-    }
 }
 
-// write the new distinct destinations of hedges
+// write the new distinct pins of hedges
 // SEQUENTIAL COMPLEXITY: e*d
 // PARALLEL OVER: e
 // WARPS OVER: d
 __global__
-void apply_coarsening_hedges_scatter_dsts(
+void apply_coarsening_hedges_scatter(
     const uint32_t* __restrict__ hedges,
     const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ srcs_count,
     const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
     const uint32_t num_hedges,
     const dim_t* __restrict__ coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
@@ -745,13 +716,15 @@ void apply_coarsening_hedges_scatter_dsts(
     /* Idea: second part of "apply_coarsening_hedges_count" -> scatter
     * 
     * Must ensure that:
-    * - the source remains the first nodes in each coarse hedge
-    * - self-cycles are broken by removing the src, not the dst
+    * - the source remains the first node in each coarse hedge (not truuuly a must, but better be safe than sorry)
+    *
+    * Important: this currently deletes self-cycles -> between src and dst, it keeps the SRC when deduplicating!
+    * => therefore, this is the opposite of coarsening 'touching', where 'touching' preserves the inbound set and
+    *    deduplicates the outbound, hedges preserve the notion of outbound! The two are complementary!
     */
 
     const dim_t hedge_start_idx = hedges_offsets[warp_id], hedge_end_idx = hedges_offsets[warp_id + 1];
     const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
-    const uint32_t hedge_srcs_count = srcs_count[warp_id];
     const dim_t coarse_hedge_start_idx = coarse_hedges_offsets[warp_id];
     const uint32_t coarse_hedge_size = (uint32_t)(coarse_hedges_offsets[warp_id + 1] - coarse_hedges_offsets[warp_id]);
     uint32_t *coarse_hedge_start = coarse_hedges + coarse_hedge_start_idx;
@@ -761,74 +734,22 @@ void apply_coarsening_hedges_scatter_dsts(
     extern __shared__ uint32_t block_new_pins[];
     uint32_t *new_pins = block_new_pins + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
     wrp_init<uint32_t>(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-
-    // go over the hedge's destinations
-    for (const uint32_t* curr = hedge_start + hedge_srcs_count + lane_id; curr < hedge_end; curr += WARP_SIZE) {
-        const uint32_t pin = groups[*curr]; // read and map pin to its new id
-        if (sm_hashset_try_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, pin)) // check in the SM cache
-            gm_hashset_insert(coarse_hedge_start, coarse_hedge_size, pin); // actual dedupe and final insertion
-    }
-}
-
-// write the new distinct sources of hedges
-// SEQUENTIAL COMPLEXITY: e*d
-// PARALLEL OVER: e
-// WARPS OVER: d
-__global__
-void apply_coarsening_hedges_scatter_srcs(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ srcs_count,
-    const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
-    const uint32_t num_hedges,
-    const dim_t* __restrict__ coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
-    const uint32_t* __restrict__ coarse_srcs_count,
-    uint32_t* __restrict__ coarse_hedges
-) {
-    // STYLE: one hedge per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the hedge to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_hedges) return;
-
-    /* 
-    * Second half of 'apply_coarsening_hedges_scatter_srcs'
-    * => assumes the destinations segments have been now sorted, and can be used for binary search
-    */
-
-    const dim_t hedge_start_idx = hedges_offsets[warp_id];
-    const uint32_t *hedge_start = hedges + hedge_start_idx;
-    const uint32_t hedge_srcs_count = srcs_count[warp_id];
-    const uint32_t *hedge_srcs_end = hedges + hedge_start_idx + hedge_srcs_count;
-    const dim_t coarse_hedge_start_idx = coarse_hedges_offsets[warp_id];
-    const uint32_t coarse_hedge_size = (uint32_t)(coarse_hedges_offsets[warp_id + 1] - coarse_hedges_offsets[warp_id]);
-    const uint32_t coarse_hedge_srcs_count = coarse_srcs_count[warp_id];
-    const uint32_t coarse_hedge_dsts_count = coarse_hedge_size - coarse_hedge_srcs_count;
-    uint32_t *coarse_hedge_srcs_start = coarse_hedges + coarse_hedge_start_idx;
-    uint32_t *coarse_hedge_dsts_start = coarse_hedges + coarse_hedge_start_idx + coarse_hedge_srcs_count;
-
-    // SM deduplication hash-set
-    extern __shared__ uint32_t block_new_pins[];
-    uint32_t *new_pins = block_new_pins + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
-    wrp_init<uint32_t>(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-
-    // go over the hedge's destinations
-    for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_srcs_end; curr += WARP_SIZE) {
-        const uint32_t pin = groups[*curr]; // read and map pin to its new id
-        // insert == 0, 1 -> no need to put into GM what already is in the SM hash-set
-        // insert == 2 -> SM full, check in GM
-        if (sm_hashset_try_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, pin) == 2) { // check in the SM cache
-            if(binary_search<uint32_t, false>(coarse_hedge_dsts_start, coarse_hedge_dsts_count, pin) == UINT32_MAX) // check among destinations (be wary: descending order!)
-                gm_hashset_insert(coarse_hedge_srcs_start, coarse_hedge_srcs_count, pin); // actual dedupe and final insertion
-        }
+    // handle the source separately first
+    __syncwarp();
+    if (lane_id == 0) {
+        const uint32_t src = __shfl_sync(0x00000003, groups[*hedge_start], 0);
+        coarse_hedge_start[0] = src; // not a problem if it's out of position and "breaks" the hash-set, since src will be always deduped in shared memory
+    } else if (lane_id == 1) {
+        const uint32_t src = __shfl_sync(0x00000003, 0, 0);
+        assert(sm_hashset_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, src)); // NOTE: could fail only if no SM is available...
     }
     __syncwarp();
 
-    // dump SM over to GM all at once => the deferred flush prevents catastrophic probe lengths in the main loop
-    for (uint32_t i = lane_id; i < MAX_SM_WARP_DEDUPE_BUFFER_SIZE; i += WARP_SIZE) {
-        uint32_t pin = new_pins[i];
-        if (pin != HASH_EMPTY && binary_search<uint32_t, false>(coarse_hedge_dsts_start, coarse_hedge_dsts_count, pin) == UINT32_MAX)
-            gm_hashset_insert(coarse_hedge_srcs_start, coarse_hedge_srcs_count, pin);
+    // go over the hedge's pins
+    for (const uint32_t* curr = hedge_start + lane_id + 1; curr < hedge_end; curr += WARP_SIZE) {
+        const uint32_t pin = groups[*curr]; // read and map pin to its new id
+        if (sm_hashset_try_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, pin)) // check in the SM cache
+            gm_hashset_insert(coarse_hedge_start, coarse_hedge_size, pin); // actual dedupe and final insertion
     }
 }
 
@@ -1143,7 +1064,7 @@ void apply_coarsening_touching_scatter_outbound(
             // insert == 0, 1 -> no need to put into GM what already is in the SM hash-set
             // insert == 2 -> SM full, check in GM
             if (sm_hashset_try_insert(new_touching, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, hedge_idx) == 2) { // check in the SM cache
-                if(binary_search<uint32_t, true>(coarse_touching_start, new_inbound_count, hedge_idx) == UINT32_MAX) // check among inbound hedges
+                if(binary_search<uint32_t>(coarse_touching_start, new_inbound_count, hedge_idx) == UINT32_MAX) // check among inbound hedges
                     gm_hashset_insert(coarse_outbound_start, coarse_outbound_size, hedge_idx); // dedupe among outbound hedges
             }
         }
@@ -1153,7 +1074,7 @@ void apply_coarsening_touching_scatter_outbound(
     // dump SM over to GM all at once => the deferred flush prevents catastrophic probe lengths in the main loop
     for (uint32_t i = lane_id; i < MAX_SM_WARP_DEDUPE_BUFFER_SIZE; i += WARP_SIZE) {
         uint32_t hedge_idx = new_touching[i];
-        if (hedge_idx != HASH_EMPTY && binary_search<uint32_t, true>(coarse_touching_start, new_inbound_count, hedge_idx) == UINT32_MAX)
+        if (hedge_idx != HASH_EMPTY && binary_search<uint32_t>(coarse_touching_start, new_inbound_count, hedge_idx) == UINT32_MAX)
             gm_hashset_insert(coarse_outbound_start, coarse_outbound_size, hedge_idx);
     }
 }
@@ -1218,14 +1139,13 @@ void pins_per_partition_kernel(
     }
 }
 
-// for each hyperedge, remove its sources from the pins per partition counts
+// for each hyperedge, remove it source from the pins per partition counts
 // SEQUENTIAL COMPLEXITY: e
 // PARALLEL OVER: e
 __global__
 void inbound_pins_per_partition_kernel(
     const uint32_t* __restrict__ hedges,
     const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ srcs_count,
     const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
     const uint32_t num_hedges,
     const uint32_t num_partitions,
@@ -1237,16 +1157,12 @@ void inbound_pins_per_partition_kernel(
     if (tid >= num_hedges) return;
 
     const dim_t hedge_start_idx = hedges_offsets[tid];
-    const uint32_t *hedge_start = hedges + hedge_start_idx;
-    const uint32_t hedge_srcs_count = srcs_count[tid];
-    const uint32_t *hedge_srcs_end = hedges + hedge_srcs_count;
+    const uint32_t hedge_src = hedges[hedge_start_idx];
+    const uint32_t src_part = partitions[hedge_src];
     uint32_t *my_inbound_pins_per_partitions = inbound_pins_per_partitions + tid * num_partitions;
 
-    for (const uint32_t* curr = hedge_start; curr < hedge_srcs_end; curr++) {
-        const uint32_t src_part = partitions[*curr];
-        const uint32_t prev = atomicSub(&my_inbound_pins_per_partitions[src_part], 1);
-        if (prev == 1) atomicSub(&partitions_inbound_sizes[src_part], 1);
-    }
+    const uint32_t prev = atomicSub(&my_inbound_pins_per_partitions[src_part], 1);
+    if (prev == 1) atomicSub(&partitions_inbound_sizes[src_part], 1);
 }
 
 // find moves of nodes from one partition to another that yield a positive gain
@@ -1645,7 +1561,7 @@ void build_hedge_events_kernel(
     
     /*
     * Idea:
-    * - let each move write to an offset given by "touching_offsets", this will leave some blank events at the end of each // S;G
+    * - let each move write to an offset given by "touching_offsets", this will leave some blank events at the end of each
     *   move's, but we can easily filter those out later by identifying them from the UINT32_MAX ev_partition...
     */
 

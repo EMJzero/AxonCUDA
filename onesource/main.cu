@@ -56,7 +56,6 @@ extern __global__ void neighborhoods_scatter_kernel(
 extern __global__ void candidates_kernel(
     const uint32_t* hedges,
     const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
     const uint32_t* neighbors,
     const dim_t* neighbors_offsets,
     const uint32_t* touching,
@@ -83,33 +82,19 @@ extern __global__ void grouping_kernel(
 extern __global__ void apply_coarsening_hedges_count(
     const uint32_t* hedges,
     const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
     const uint32_t* groups,
     const uint32_t num_hedges,
     const uint32_t max_hedge_size,
     uint32_t *coarse_oversized_hedges,
-    dim_t* coarse_hedges_offsets,
-    uint32_t* coarse_srcs_count
+    dim_t* coarse_hedges_offsets
 );
 
-extern __global__ void apply_coarsening_hedges_scatter_dsts(
+extern __global__ void apply_coarsening_hedges_scatter(
     const uint32_t* hedges,
     const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
     const uint32_t* groups,
     const uint32_t num_hedges,
     const dim_t* coarse_hedges_offsets,
-    uint32_t* coarse_hedges
-);
-
-extern __global__ void apply_coarsening_hedges_scatter_srcs(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
-    const uint32_t* groups,
-    const uint32_t num_hedges,
-    const dim_t* coarse_hedges_offsets,
-    const uint32_t* coarse_srcs_count,
     uint32_t* coarse_hedges
 );
 
@@ -188,7 +173,6 @@ extern __global__ void pins_per_partition_kernel(
 extern __global__ void inbound_pins_per_partition_kernel(
     const uint32_t* hedges,
     const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
     const uint32_t* partitions,
     const uint32_t num_hedges,
     const uint32_t num_partitions,
@@ -332,7 +316,7 @@ extern __constant__ uint32_t max_inbound_per_part;
 
 
 using namespace hgraph;
-using namespace constraints;
+using namespace hwmodel;
 
 #define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
@@ -395,7 +379,7 @@ int main(int argc, char** argv) {
             } else {
                 std::cout << "Loading hypergraph from: " << load_path << " (binary format) ...\n";
                 std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
-                hg = HyperGraph::loadSNN(load_path);
+                hg = HyperGraph::load(load_path);
             }
             loaded = true;
         } catch (const std::exception& e) {
@@ -405,37 +389,40 @@ int main(int argc, char** argv) {
 
         // print statistics
         std::cout << "Loaded hypergraph:\n";
-        std::cout << "  Nodes:      " << hg.nodes() << "\n";
-        std::cout << "  Hyperedges: " << hg.hedges().size() << "\n";
-        std::cout << "  Total pins: " << hg.hedgesFlat().size() << "\n";
-        std::cout << "  Total connections weight: " << std::fixed << std::setprecision(3) << hg.connectivity() << "\n";
+        std::cout << "  Nodes:       " << hg.nodes() << "\n";
+        std::cout << "  Hyperedges:  " << hg.hedges().size() << "\n";
+        std::cout << "  Total pins:  " << hg.hedgesFlat().size() << "\n";
+        std::cout << "  Total Spike Frequency: " << std::fixed << std::setprecision(3) << hg.totalSpikeFrequency() << "\n";
     } else {
         std::cout << "WARNING, no hypergraph provided (-r), performing a dry-run !!\n";
     }
 
-    // setup constraints
-    std::optional<Constraints> constr_tmp;
-    std::unordered_map<std::string, Constraints (*)()> configurations {
-        { "loihi64", Constraints::createLoihiLarge },
-        { "loihi84", Constraints::createLoihiJin84 },
-        { "loihi1024", Constraints::createLoihiJin1024 },
-        { "truenorth", Constraints::createTrueNorth }
+    // setup the hardware model
+    std::optional<HardwareModel> hw_tmp;
+    std::unordered_map<std::string, HardwareModel (*)()> configurations {
+        { "loihi64", HardwareModel::createLoihiLarge },
+        { "loihi84", HardwareModel::createLoihiJin84 },
+        { "loihi1024", HardwareModel::createLoihiJin1024 },
+        { "truenorth", HardwareModel::createTrueNorth }
     };
-    auto constr_it = configurations.find(constraints);
-    if (constr_it == configurations.end()) {
+    auto hw_it = configurations.find(constraints);
+    if (hw_it == configurations.end()) {
         std::cerr << "WARNING, no constraints provided (-c), using loihi64 !!\n";
-        constr_tmp = Constraints::createLoihiLarge();
+        hw_tmp = HardwareModel::createLoihiLarge();
     } else {
-        constr_tmp = constr_it->second();
+        hw_tmp = hw_it->second();
     }
-    Constraints &constr = *constr_tmp;
+    HardwareModel &hw = *hw_tmp;
     
-    std::cout << "Using hardware model \"" << constr.name() << "\":\n";
-    std::cout << "  Nodes per partition:         " << constr.nodesPerPart() << "\n";
-    std::cout << "  Inbound hedge per partition: " << constr.inboundPerPart() << "\n";
-    std::cout << "  Maximum partitions:          " << constr.maxParts() << "\n";
+    std::cout << "Using hardware model \"" << hw.name() << "\":\n";
+    std::cout << "  Neurons per core:  " << hw.neuronsPerCore() << "\n";
+    std::cout << "  Synapses per core: " << hw.synapsesPerCore() << "\n";
+    std::cout << "  Cores along x, y:  " << hw.coresPerChipX() << ", " << hw.coresPerChipY() << " (" << hw.coresPerChipX() * hw.coresPerChipY() << " tot.)" << "\n";
+    std::cout << "  Chips along x, y:  " << hw.chipsPerSystemX() << ", " << hw.chipsPerSystemY() << " (" << hw.chipsPerSystemX() * hw.chipsPerSystemY() << " tot.)" << "\n";
+    std::cout << "  Routing energy, latency: " << std::fixed << std::setprecision(3) << hw.energyPerRouting() << " pJ, " << hw.latencyPerRouting() << " ns\n";
+    std::cout << "  Wire energy, latency:    " << std::fixed << std::setprecision(3) << hw.energyPerWire() << " pJ, " << hw.latencyPerWire() << " ns\n";
     
-    if (!constr.checkFit(hg, false, true))
+    if (!hw.checkSnnFit(hg, false, true))
         std::cerr << "WARNING, the hypergraph did not pass the fit check on the given constraints (NOTE: this test admits false negatives) !!\n";
 
     std::cout << "CUDA device:\n";
@@ -464,24 +451,17 @@ int main(int argc, char** argv) {
     * - during execution, hedges and incidence sets will diverge:
     *   - hedges remove duplicates (cycles) between sources and destinations, from the destinations (sources preserved)
     *   - incidence sets (touching) remove duplicates between inbound and outbound, from the outbound (inbound preserved -> for constraint checks)
-    * 
-    * Chore: for hedges and incidence sets alike, the half that "keeps the element" in case of a duplicate between srcs-dsts or in-out should always be the first half of the
-    *        contigous segment. Unfortunately, right now hedges are the other way around...
     */
 
     uint32_t num_hedges = static_cast<uint32_t>(hg.hedges().size());
     std::vector<dim_t> hedges_offsets; // hedge idx -> hedge start index in the contiguous hedges array
-    std::vector<uint32_t> srcs_count;
     hedges_offsets.reserve(num_hedges + 1);
-    srcs_count.reserve(num_hedges);
     
     // prepare hedge offsets
     // HP: no duplicates per hedge, no self-cycles (keep the src only, arg=false -> still consider the hedge among the src's inbounds, arg=true -> update the inbound set to match)
-    hg.deduplicateHyperedges(2, false); // remove the srcs
-    for (uint32_t i = 0; i < num_hedges; ++i) {
+    hg.deduplicateHyperedges(false);
+    for (uint32_t i = 0; i < num_hedges; ++i)
         hedges_offsets.push_back(static_cast<dim_t>(hg.hedges()[i].offset()));
-        srcs_count.push_back(hg.hedges()[i].src_count());
-    }
     hedges_offsets.push_back(hg.hedgesFlat().size());
     
     std::vector<uint32_t> touching_hedges;
@@ -522,9 +502,9 @@ int main(int argc, char** argv) {
     std::cout << "Max hedges estimate set to " << max_hedge_size << ", neighbors estimate set to " << max_neighbors << "\n";
 
     // constraints
-    const uint32_t h_max_nodes_per_part = constr.nodesPerPart();
-    const uint32_t h_max_inbound_per_part = constr.inboundPerPart();
-    const uint32_t max_parts = constr.maxParts(); // not needed in kernels
+    const uint32_t h_max_nodes_per_part = hw.neuronsPerCore();
+    const uint32_t h_max_inbound_per_part = hw.synapsesPerCore();
+    const uint32_t max_parts = hw.coresCount(); // not needed in kernels
     const uint32_t target_parts = min(max_parts, (num_nodes + h_max_nodes_per_part - 1) / h_max_nodes_per_part);
 
     std::cout << "Starting timer...\n";
@@ -554,7 +534,6 @@ int main(int argc, char** argv) {
     // device pointers
     uint32_t *d_hedges = nullptr;
     dim_t *d_hedges_offsets = nullptr;
-    uint32_t *d_srcs_count = nullptr;
     uint32_t *d_neighbors = nullptr;
     dim_t *d_neighbors_offsets = nullptr;
     uint32_t *d_touching = nullptr;
@@ -583,7 +562,6 @@ int main(int argc, char** argv) {
     // allocate device memory
     CUDA_CHECK(cudaMalloc(&d_hedges, hg.hedgesFlat().size() * sizeof(uint32_t))); // contigous hedges array (each hedge must be stored as src+destinations, with the src in the first position)
     CUDA_CHECK(cudaMalloc(&d_hedges_offsets, (num_hedges + 1) * sizeof(dim_t))); // hedges_offsets[hedge idx] -> hedge start idx in d_hedges
-    CUDA_CHECK(cudaMalloc(&d_srcs_count, num_hedges * sizeof(uint32_t))); // srcs_count[hedge idx] -> number of sources of hedge idx
     CUDA_CHECK(cudaMalloc(&d_touching, touching_hedges.size() * sizeof(uint32_t))); // contigous inbound+outbout sets array (first inbound, then outbound)
     CUDA_CHECK(cudaMalloc(&d_touching_offsets, (num_nodes + 1) * sizeof(dim_t))); // touching_offsets[node idx] -> touching set start idx in d_touching
     CUDA_CHECK(cudaMalloc(&d_inbound_count, num_nodes * sizeof(uint32_t))); // inbound_count[node idx] -> how many hedge of touching[node idx] are inbound (inbound hedges are before inbound_count[node idx], then outbound)
@@ -598,14 +576,12 @@ int main(int argc, char** argv) {
     // copy to device
     CUDA_CHECK(cudaMemcpy(d_hedges, hg.hedgesFlat().data(), hg.hedgesFlat().size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_hedges_offsets, hedges_offsets.data(), (num_hedges + 1) * sizeof(dim_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_srcs_count, srcs_count.data(), num_hedges * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_touching, touching_hedges.data(), touching_hedges.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_touching_offsets, touching_hedges_offsets.data(), (num_nodes + 1) * sizeof(dim_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_hedge_weights, hedge_weights.data(), num_hedges * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_inbound_count, inbound_count.data(), num_nodes * sizeof(uint32_t), cudaMemcpyHostToDevice));
     std::vector<dim_t>().swap(hedges_offsets);
     std::vector<uint32_t>().swap(touching_hedges);
-    std::vector<uint32_t>().swap(srcs_count);
     std::vector<dim_t>().swap(touching_hedges_offsets);
     std::vector<uint32_t>().swap(inbound_count);
 
@@ -706,12 +682,11 @@ int main(int argc, char** argv) {
 
 
     // returns the number of partitions and the pointer to the final partitions device buffer
-    std::function<std::tuple<uint32_t, uint32_t*>(const uint32_t, const uint32_t, uint32_t*&, dim_t*&, uint32_t*&, dim_t, uint32_t*&, dim_t*&, dim_t, uint32_t*&, uint32_t*&)> coarsen_refine_uncoarsen = [&](
+    std::function<std::tuple<uint32_t, uint32_t*>(const uint32_t, const uint32_t, uint32_t*&, dim_t*&, dim_t, uint32_t*&, dim_t*&, dim_t, uint32_t*&, uint32_t*&)> coarsen_refine_uncoarsen = [&](
         const uint32_t level_idx,
         const uint32_t curr_num_nodes,
         uint32_t*& d_hedges,
         dim_t*& d_hedges_offsets,
-        uint32_t*& d_srcs_count,
         dim_t hedges_size,
         uint32_t*& d_touching,
         dim_t*& d_touching_offsets,
@@ -794,14 +769,13 @@ int main(int argc, char** argv) {
         num_warps_needed = curr_num_nodes ; // 1 warp per node
         blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
         // compute shared memory per block (bytes)
-        bytes_per_warp = 3 * HIST_SIZE * sizeof(uint32_t);
+        bytes_per_warp = 2 * HIST_SIZE * sizeof(uint32_t);
         shared_bytes = warps_per_block * bytes_per_warp;
         // launch - candidates kernel
         std::cout << "Running candidates kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         candidates_kernel<<<blocks, threads_per_block, shared_bytes>>>(
             d_hedges,
             d_hedges_offsets,
-            d_srcs_count,
             d_neighbors,
             d_neighbors_offsets,
             d_touching,
@@ -1150,10 +1124,8 @@ int main(int argc, char** argv) {
 
         // prepare coarse hedges buffers
         uint32_t *d_coarse_hedges = nullptr;
-        uint32_t *d_coarse_hedges_buffer = nullptr;
         uint32_t *d_coarse_oversized_hedges = nullptr;
         dim_t *d_coarse_hedges_offsets = nullptr;
-        uint32_t* d_coarse_srcs_count = nullptr;
         dim_t curr_max_hedge_size = (dim_t)(OVERSIZED_SIZE_MULTIPLIER * (float)max_hedge_size);
         curr_max_hedge_size = curr_max_hedge_size > MAX_SM_WARP_DEDUPE_BUFFER_SIZE ? curr_max_hedge_size - MAX_SM_WARP_DEDUPE_BUFFER_SIZE : 0;
         curr_max_hedge_size = max(curr_max_hedge_size, (dim_t)MIN_GM_WARP_DEDUPE_BUFFER_SIZE);
@@ -1161,7 +1133,6 @@ int main(int argc, char** argv) {
             std::cout << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_hedges * curr_max_hedge_size * sizeof(uint32_t)) / (1 << 30) << " GB for hedges deduplication ...\n";
         CUDA_CHECK(cudaMalloc(&d_coarse_oversized_hedges, num_hedges * curr_max_hedge_size * sizeof(uint32_t))); // space for spilling deduplication hash-sets
         CUDA_CHECK(cudaMalloc(&d_coarse_hedges_offsets, (1 + num_hedges) * sizeof(dim_t))); // NOTE: the number of hedges never decreases (for now), unlike that of nodes!
-        CUDA_CHECK(cudaMalloc(&d_coarse_srcs_count, num_hedges * sizeof(uint32_t)));
         CUDA_CHECK(cudaMemset(d_coarse_hedges_offsets, 0x00, sizeof(dim_t))); // init. the first offset at 0
         thrust::device_ptr<dim_t> t_coarse_hedges_offsets(d_coarse_hedges_offsets);
         // launch configuration - coarsening kernel (hedges - count)
@@ -1177,13 +1148,11 @@ int main(int argc, char** argv) {
         apply_coarsening_hedges_count<<<blocks, threads_per_block, shared_bytes>>>(
             d_hedges,
             d_hedges_offsets,
-            d_srcs_count,
             d_groups,
             num_hedges,
             curr_max_hedge_size,
             d_coarse_oversized_hedges,
-            d_coarse_hedges_offsets,
-            d_coarse_srcs_count
+            d_coarse_hedges_offsets
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -1198,14 +1167,12 @@ int main(int argc, char** argv) {
         dim_t new_hedges_size = 0; // last value in the inclusive scan = full reduce = total number of pins among all hedges
         CUDA_CHECK(cudaMemcpy(&new_hedges_size, d_coarse_hedges_offsets + num_hedges, sizeof(dim_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMalloc(&d_coarse_hedges, new_hedges_size * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&d_coarse_hedges_buffer, new_hedges_size * sizeof(uint32_t)));
-        // launch configuration - coarsening kernel (hedges - scatter - dsts) - same as coarsening kernel (hedges - count)
-        // launch - coarsening kernel (hedges - scatter - dsts)
-        std::cout << "Running coarsening kernel (hedges - scatter - dsts) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        apply_coarsening_hedges_scatter_dsts<<<blocks, threads_per_block, shared_bytes>>>(
+        // launch configuration - coarsening kernel (hedges - scatter) - same as coarsening kernel (hedges - count)
+        // launch - coarsening kernel (hedges - scatter)
+        std::cout << "Running coarsening kernel (hedges - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        apply_coarsening_hedges_scatter<<<blocks, threads_per_block, shared_bytes>>>(
             d_hedges,
             d_hedges_offsets,
-            d_srcs_count,
             d_groups,
             num_hedges,
             d_coarse_hedges_offsets,
@@ -1213,36 +1180,6 @@ int main(int argc, char** argv) {
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
-        // sort destinations (descending)
-        cub::DoubleBuffer<uint32_t> c_coarse_hedges_double_buffer(d_coarse_hedges, d_coarse_hedges_buffer);
-        void* c_hedges_storage = nullptr;
-        size_t c_hedges_storage_bytes = 0;
-        cub::DeviceSegmentedRadixSort::SortKeysDescending(c_hedges_storage, c_hedges_storage_bytes, c_coarse_hedges_double_buffer, new_hedges_size, num_hedges, d_coarse_hedges_offsets, d_coarse_hedges_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
-        std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_hedges_size * sizeof(uint32_t)) / (1 << 30) << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_hedges_storage_bytes) / (1 << 20) << " MB of temporary storage ...\n";
-        cudaMalloc(&c_hedges_storage, c_hedges_storage_bytes);
-        cub::DeviceSegmentedRadixSort::SortKeysDescending(c_hedges_storage, c_hedges_storage_bytes, c_coarse_hedges_double_buffer, new_hedges_size, num_hedges, d_coarse_hedges_offsets, d_coarse_hedges_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
-        if (c_coarse_hedges_double_buffer.Current() != d_coarse_hedges) {
-            uint32_t* tmp = d_coarse_hedges_buffer;
-            d_coarse_hedges_buffer = d_coarse_hedges;
-            d_coarse_hedges = tmp;
-        }
-        // launch configuration - coarsening kernel (hedges - scatter - srcs) - same as coarsening kernel (hedges - count)
-        // launch - coarsening kernel (hedges - scatter - srcs)
-        std::cout << "Running coarsening kernel (hedges - scatter - srcs) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        apply_coarsening_hedges_scatter_srcs<<<blocks, threads_per_block, shared_bytes>>>(
-            d_hedges,
-            d_hedges_offsets,
-            d_srcs_count,
-            d_groups,
-            num_hedges,
-            d_coarse_hedges_offsets,
-            d_coarse_srcs_count,
-            d_coarse_hedges
-        );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaFree(d_coarse_hedges_buffer));
-        CUDA_CHECK(cudaFree(c_hedges_storage));
 
         // prepare coarse touching buffers
         uint32_t *d_coarse_touching = nullptr;
@@ -1297,12 +1234,12 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceSynchronize());
         // sort each inbound touching set
         cub::DoubleBuffer<uint32_t> c_coarse_touching_double_buffer(d_coarse_touching, d_coarse_touching_buffer);
-        void* c_touching_storage = nullptr;
-        size_t c_touching_storage_bytes = 0;
-        cub::DeviceSegmentedRadixSort::SortKeys(c_touching_storage, c_touching_storage_bytes, c_coarse_touching_double_buffer, new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
-        std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_touching_size * sizeof(uint32_t)) / (1 << 30) << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_touching_storage_bytes) / (1 << 20) << " MB of temporary storage ...\n";
-        cudaMalloc(&c_touching_storage, c_touching_storage_bytes);
-        cub::DeviceSegmentedRadixSort::SortKeys(c_touching_storage, c_touching_storage_bytes, c_coarse_touching_double_buffer, new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
+        void* c_temp_storage = nullptr;
+        size_t c_storage_bytes = 0;
+        cub::DeviceSegmentedRadixSort::SortKeys(c_temp_storage, c_storage_bytes, c_coarse_touching_double_buffer, new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
+        std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_touching_size * sizeof(uint32_t)) / (1 << 30) << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_storage_bytes) / (1 << 20) << " MB of temporary storage ...\n";
+        cudaMalloc(&c_temp_storage, c_storage_bytes);
+        cub::DeviceSegmentedRadixSort::SortKeys(c_temp_storage, c_storage_bytes, c_coarse_touching_double_buffer, new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
         if (c_coarse_touching_double_buffer.Current() != d_coarse_touching) {
             uint32_t* tmp = d_coarse_touching_buffer;
             d_coarse_touching_buffer = d_coarse_touching;
@@ -1325,7 +1262,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaFree(d_coarse_touching_buffer));
-        CUDA_CHECK(cudaFree(c_touching_storage));
+        CUDA_CHECK(cudaFree(c_temp_storage));
         
         // spill non-coarse data structures to host
         std::vector<uint32_t> h_hedges;
@@ -1334,7 +1271,6 @@ int main(int argc, char** argv) {
         std::vector<dim_t> h_touching_offsets;
         if (level_idx < SAVE_MEMORY_UP_TO_LEVEL) {
             // TODO: make these async, move everything out of the default stream and use a "compute" and a "transfer" stream
-            // TODO: spill inbound counts and src counts too!
             h_hedges.resize(hedges_size);
             h_hedges_offsets.resize(num_hedges + 1);
             h_touching.resize(touching_size);
@@ -1357,7 +1293,6 @@ int main(int argc, char** argv) {
             new_num_nodes,
             d_coarse_hedges,
             d_coarse_hedges_offsets,
-            d_coarse_srcs_count,
             new_hedges_size,
             d_coarse_touching,
             d_coarse_touching_offsets,
@@ -1413,7 +1348,6 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaFree(d_ungroups_offsets));
         CUDA_CHECK(cudaFree(d_coarse_hedges));
         CUDA_CHECK(cudaFree(d_coarse_hedges_offsets));
-        CUDA_CHECK(cudaFree(d_coarse_srcs_count));
         CUDA_CHECK(cudaFree(d_coarse_touching));
         CUDA_CHECK(cudaFree(d_coarse_touching_offsets));
         CUDA_CHECK(cudaFree(d_coarse_inbound_count));
@@ -1642,7 +1576,6 @@ int main(int argc, char** argv) {
         inbound_pins_per_partition_kernel<<<blocks, threads_per_block>>>(
             d_hedges,
             d_hedges_offsets,
-            d_srcs_count,
             d_partitions,
             num_hedges,
             num_partitions,
@@ -1851,7 +1784,6 @@ int main(int argc, char** argv) {
         num_nodes,
         d_hedges,
         d_hedges_offsets,
-        d_srcs_count,
         hg.hedgesFlat().size(),
         d_touching,
         d_touching_offsets,
@@ -1940,7 +1872,6 @@ int main(int argc, char** argv) {
     // cleanup device memory
     CUDA_CHECK(cudaFree(d_hedges));
     CUDA_CHECK(cudaFree(d_hedges_offsets));
-    CUDA_CHECK(cudaFree(d_srcs_count));
     //CUDA_CHECK(cudaFree(d_neighbors)); // should have already been freed at the innermost recursion level
     //CUDA_CHECK(cudaFree(d_neighbors_offsets));
     CUDA_CHECK(cudaFree(d_touching));
@@ -1982,15 +1913,16 @@ int main(int argc, char** argv) {
     std::cout << "Total device execution time: " << std::fixed << std::setprecision(3) << d_total_ms << " ms\n";
     std::cout << "Total host execution time: " << std::fixed << std::setprecision(3) << total_ms << " ms\n";
 
-    if (constr.checkPartitionValidity(hg, partitions, true)) {
-        auto partitioned_hg = hg.getPartitionsHypergraph(partitions, 2, true); // remove the destination if self-cycles happen
-        auto hedge_overlap = constr.hedgeOverlap(hg, partitions);
+    if (hw.checkPartitionValidity(hg, partitions, true)) {
+        auto partitioned_hg = hg.getPartitionsHypergraph(partitions, false, true);
+        //auto metrics = hw.getAllMetrics(partitioned_hg, placement);
+        auto synaptic_reuse = hw.synapticReuse(hg, partitions);
         std::cout << "Partitioned hypergraph:\n";
-        std::cout << "  Nodes:         " << partitioned_hg.nodes() << "\n";
-        std::cout << "  Hyperedges:    " << partitioned_hg.hedges().size() << "\n";
-        std::cout << "  Total pins:    " << partitioned_hg.hedgesFlat().size() << "\n";
-        std::cout << "  Connectivity:  " << partitioned_hg.connectivity() << "\n";
-        std::cout << "  Hedge overlap: " << std::fixed << std::setprecision(3) << hedge_overlap.ar_mean << " ar. mean, " << hedge_overlap.geo_mean << " geo. mean\n";
+        std::cout << "  Nodes:       " << partitioned_hg.nodes() << "\n";
+        std::cout << "  Hyperedges:  " << partitioned_hg.hedges().size() << "\n";
+        std::cout << "  Total pins:  " << partitioned_hg.hedgesFlat().size() << "\n";
+        std::cout << "  Total Spike Frequency: " << partitioned_hg.totalSpikeFrequency() << "\n";
+        std::cout << "  Synaptic reuse:        " << std::fixed << std::setprecision(3) << synaptic_reuse.ar_mean << " ar. mean, " << synaptic_reuse.geo_mean << " geo. mean\n";
         
         // save hypergraph
         if (!save_path.empty()) {

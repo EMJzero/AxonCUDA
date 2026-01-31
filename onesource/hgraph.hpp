@@ -1,13 +1,10 @@
 #pragma once
 #include <set>
-#include <cmath>
 #include <queue>
 #include <vector>
 #include <ranges>
-#include <utility>
 #include <cstdint>
 #include <fstream>
-#include <iostream>
 #include <stdexcept>
 #include <algorithm>
 #include <functional>
@@ -22,7 +19,6 @@ namespace hgraph {
     * HyperEdge:
     * - offset into the HyperGraph's node array
     * - length
-    * - sources count
     * - weight
     */
     class HyperEdge {
@@ -32,16 +28,14 @@ namespace hgraph {
         private:
         uint32_t offset_; // offset inside HyperGraph::hedges_flat_
         uint32_t length_; // total nodes = 1 + destinations
-        uint32_t src_count_; // how many pins are sources (stored at the start of each segment)
         float weight_;
         const uint32_t* hedges_flat_; // pointer to the owning hypergraph's hedges_flat_ array
 
         public:
-        HyperEdge(uint32_t offset, uint32_t length, uint32_t src_count, float weight, const uint32_t* hedges_flat) : offset_(offset), length_(length), src_count_(src_count), weight_(weight), hedges_flat_(hedges_flat) {}
+        HyperEdge(uint32_t offset, uint32_t length, float weight, const uint32_t* hedges_flat) : offset_(offset), length_(length), weight_(weight), hedges_flat_(hedges_flat) {}
 
         uint32_t offset() const { return offset_; }
         uint32_t length() const { return length_; }
-        uint32_t src_count() const { return src_count_; }
         float weight() const { return weight_; }
         // aliases for compatibility
         float spikeFrequency() const { return weight_; }
@@ -50,12 +44,14 @@ namespace hgraph {
 
         void updateWeight(float w) { weight_ = w; }
 
-        // These are "views", the real data lives in HyperGraph.HyperGraph must provide access to hedges_flat_, therefore HyperGraph declares HyperEdge as a "friend".
-        std::vector<uint32_t> sources() const {
-            return std::vector<uint32_t>(hedges_flat_ + offset_, hedges_flat_ + offset_ + src_count_);
+        // These are "views", the real data lives in HyperGraph.
+        // HyperGraph must provide access to hedges_flat_,
+        // therefore HyperGraph declares HyperEdge as a "friend".
+        const uint32_t& source() const {
+            return hedges_flat_[offset_];
         }
         std::vector<uint32_t> destinations() const {
-            return std::vector<uint32_t>(hedges_flat_ + offset_ + src_count_, hedges_flat_ + offset_ + length_);
+            return std::vector<uint32_t>(hedges_flat_ + offset_ + 1, hedges_flat_ + offset_ + length_);
         }
         std::vector<uint32_t> nodes() const {
             return std::vector<uint32_t>(hedges_flat_ + offset_, hedges_flat_ + offset_ + length_);
@@ -107,18 +103,18 @@ namespace hgraph {
         public:
         // constructor:
         // - nodes: number of nodes
-        // - hedges: vector of pairs of two vectors, srcs and dsts, like: [([src1, src2, ...], [dst1, dst2, ...]), (...), ...]
+        // - hedges: vector of vectors each vector must be: [src, dst1, dst2, ...]
         // - weights: same length as hedges, one weight per hyperedge.
-        HyperGraph(uint32_t nodes, const std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>>& hedges, const std::vector<float>& weights) : node_count_(nodes) {
+        HyperGraph(uint32_t nodes, const std::vector<std::vector<uint32_t>>& hedges, const std::vector<float>& weights) : node_count_(nodes) {
             if (hedges.size() != weights.size())
                 throw std::runtime_error("Number of hyperedges != number of weights");
 
             // compute total nodes needed
             size_t total_pins = 0;
             for (auto& he : hedges) {
-                if (he.first.size() < 1 || he.second.size() < 1)
+                if (he.size() < 2)
                     throw std::runtime_error("Hyperedge must have at least 1 source and 1 destination");
-                total_pins += he.first.size() + he.second.size();
+                total_pins += he.size();
             }
 
             hedges_flat_.reserve(total_pins);
@@ -130,13 +126,11 @@ namespace hgraph {
                 const auto& he = hedges[i];
                 float w = weights[i];
 
-                for (uint32_t v : he.first)
+                for (uint32_t v : he)
                     hedges_flat_.push_back(v);
-                for (uint32_t v : he.second)
-                    hedges_flat_.push_back(v);
-                    
-                hedges_.emplace_back(offset, he.first.size() + he.second.size(), he.first.size(), w, hedges_flat_.data());
-                offset += he.first.size() + he.second.size();
+
+                hedges_.emplace_back(offset, he.size(), w, hedges_flat_.data());
+                offset += he.size();
             }
 
             // build inbound/outbound maps
@@ -145,14 +139,17 @@ namespace hgraph {
 
             for (uint32_t idx = 0; idx < hedges_.size(); idx++) {
                 auto& he = hedges_[idx];
+                uint32_t src = he.source();
 
-                for (uint32_t src : he.sources()) {
-                    if (src >= nodes) throw std::runtime_error("Invalid source node");
-                    outbound_[src].insert(idx);
-                }
+                if (src >= nodes)
+                    throw std::runtime_error("Invalid source node");
+
+                outbound_[src].insert(idx);
 
                 for (uint32_t dst : he.destinations()) {
-                    if (dst >= nodes) throw std::runtime_error("Invalid destination node");
+                    if (dst >= nodes)
+                        throw std::runtime_error("Invalid destination node");
+
                     inbound_[dst].insert(idx);
                 }
             }
@@ -203,13 +200,9 @@ namespace hgraph {
             return total;
         }
         // aliases for compatibility
-        float connectivity() const { return totalWeight(); }
+        float totalSpikeFrequency() const { return totalWeight(); }
 
-        // remove_self_cycles can be:
-        // 0 : do not remove
-        // 1 : remove the source of the cycle
-        // 2 : remove the destination of the cycle
-        HyperGraph getPartitionsHypergraph(const std::vector<uint32_t>& part, uint8_t remove_self_cycles, bool squish_hyperedges) const {
+        HyperGraph getPartitionsHypergraph(const std::vector<uint32_t>& part, bool keep_self_cycles, bool squish_hyperedges) const {
             if (part.size() != node_count_)
                 throw std::runtime_error("Partition size mismatch");
 
@@ -221,67 +214,52 @@ namespace hgraph {
                     throw std::runtime_error("Partitions must be 0..N sequential");
             }
 
-            std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> new_hedges;
+            std::vector<std::vector<uint32_t>> new_hedges;
             std::vector<float> new_weights;
 
             if (!squish_hyperedges) {
                 for (auto& he : hedges_) {
-                    std::set<uint32_t> srcp;
+                    uint32_t srcp = part[he.source()];
                     std::set<uint32_t> dstp;
 
-                    for (uint32_t i = 0; i < he.src_count(); i++)
-                        srcp.insert(part[hedges_flat_[he.offset() + i]]);
-                    
-                    for (uint32_t i = he.src_count(); i < he.length(); i++)
+                    for (uint32_t i = 1; i < he.length(); i++)
                         dstp.insert(part[hedges_flat_[he.offset() + i]]);
-                    
-                    if (remove_self_cycles == 1) {
-                        for (auto dst : dstp)
-                            srcp.erase(dst);
-                    } else if (remove_self_cycles == 2) {
-                        for (auto src : srcp)
-                            dstp.erase(src);
-                    }
 
-                    if (srcp.size() > 1 || !dstp.empty()) {
-                        std::pair<std::vector<uint32_t>, std::vector<uint32_t>> hv;
-                        hv.first.insert(hv.first.end(), srcp.begin(), srcp.end());
-                        hv.second.insert(hv.second.end(), dstp.begin(), dstp.end());
+                    if (!keep_self_cycles)
+                        dstp.erase(srcp);
+
+                    if (!dstp.empty()) {
+                        std::vector<uint32_t> hv;
+                        hv.push_back(srcp);
+                        hv.insert(hv.end(), dstp.begin(), dstp.end());
                         new_hedges.push_back(hv);
                         new_weights.push_back(he.weight());
                     }
                 }
             } else {
                 std::unordered_map<uint64_t, float> freq_acc;
-                std::unordered_map<uint64_t, std::vector<uint32_t>> src_map;
                 std::unordered_map<uint64_t, std::vector<uint32_t>> dst_map;
+                std::unordered_map<uint64_t, uint32_t> src_map;
 
                 for (auto& he : hedges_) {
-                    std::set<uint32_t> srcp;
+                    uint32_t srcp = part[he.source()];
                     std::set<uint32_t> dstp;
 
-                    for (uint32_t i = 0; i < he.src_count(); i++)
-                        srcp.insert(part[hedges_flat_[he.offset() + i]]);
-                    
-                    for (uint32_t i = he.src_count(); i < he.length(); i++)
+                    for (uint32_t i = 1; i < he.length(); i++)
                         dstp.insert(part[hedges_flat_[he.offset() + i]]);
-                    
-                    if (remove_self_cycles == 1) {
-                        for (auto dst : dstp)
-                            srcp.erase(dst);
-                    } else if (remove_self_cycles == 2) {
-                        for (auto src : srcp)
-                            dstp.erase(src);
-                    }
 
-                    if (srcp.size() <= 1 && dstp.empty()) continue;
+                    if (!keep_self_cycles)
+                        dstp.erase(srcp);
+
+                    if (dstp.empty()) continue;
 
                     uint64_t key = 146527;
-                    for (auto s : srcp) key ^= std::hash<uint32_t>()(s) + 0x9e3779b97f4a7c15ULL + (key << 6) + (key >> 2);
-                    for (auto d : dstp) key ^= std::hash<uint32_t>()(d) + 0x9e3779b97f4a7c15ULL + (key << 6) + (key >> 2);
+                    key ^= std::hash<uint32_t>()(srcp) + 0x9e3779b97f4a7c15ULL;
+                    for (auto d : dstp)
+                        key ^= std::hash<uint32_t>()(d) + 0x9e3779b97f4a7c15ULL + (key << 6) + (key >> 2);
 
                     freq_acc[key] += he.weight();
-                    src_map[key] = std::vector<uint32_t>(srcp.begin(), srcp.end());;
+                    src_map[key] = srcp;
                     dst_map[key] = std::vector<uint32_t>(dstp.begin(), dstp.end());
                 }
 
@@ -289,11 +267,10 @@ namespace hgraph {
                     uint64_t k = it.first;
                     float w = it.second;
 
-                    std::pair<std::vector<uint32_t>, std::vector<uint32_t>> hv;
-                    auto& srcs = src_map[k];
-                    hv.first.insert(hv.first.end(), srcs.begin(), srcs.end());
+                    std::vector<uint32_t> hv;
+                    hv.push_back(src_map[k]);
                     auto& dsts = dst_map[k];
-                    hv.second.insert(hv.second.end(), dsts.begin(), dsts.end());
+                    hv.insert(hv.end(), dsts.begin(), dsts.end());
                     new_hedges.push_back(hv);
                     new_weights.push_back(w);
                 }
@@ -378,19 +355,17 @@ namespace hgraph {
                 }
             }
 
-            std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> new_hedges;
+            std::vector<std::vector<uint32_t>> new_hedges;
             std::vector<float> new_weights;
             new_hedges.reserve(hedges_.size());
             new_weights.reserve(hedges_.size());
 
             for (const auto& he : hedges_) {
-                std::pair<std::vector<uint32_t>, std::vector<uint32_t>> hv;
-                hv.first.reserve(he.src_count());
-                for (uint32_t s : he.sources())
-                    hv.first.push_back(new_id[s]);
-                hv.second.reserve(he.length() - he.src_count());
+                std::vector<uint32_t> hv;
+                hv.reserve(he.length());
+                hv.push_back(new_id[he.source()]);
                 for (uint32_t d : he.destinations())
-                    hv.second.push_back(new_id[d]);
+                    hv.push_back(new_id[d]);
                 new_hedges.push_back(std::move(hv));
                 new_weights.push_back(he.weight());
             }
@@ -399,58 +374,29 @@ namespace hgraph {
         }
 
         // remove duplicate nodes (and self-cycles) inside each hyperedge
-        // => if a duplicate involves source + destination, what happens depends on cycle_breaking_rule:
-        // 0 : keep both
-        // 1 : remove the source of the cycle
-        // 2 : remove the destination of the cycle
+        // => if a duplicate involves source + destination, the source is kept
         // => when 'update_in_out_sets' is false 'inbound_' and 'outbound_' sets are NOT updated (e.g. the hedge still shows among the source's inbounds)
-        void deduplicateHyperedges(uint8_t cycle_breaking_rule, bool update_in_out_sets = false) {
+        void deduplicateHyperedges(bool update_in_out_sets = false) {
             std::vector<uint32_t> new_flat;
             new_flat.reserve(hedges_flat_.size());
             uint32_t new_offset = 0;
             for (auto& he : hedges_) {
                 const uint32_t old_offset = he.offset();
-                const uint32_t old_src_cnt = he.src_count();
                 const uint32_t old_length = he.length();
+                const uint32_t src = hedges_flat_[old_offset];
 
                 std::set<uint32_t> seen;
-                uint32_t start, end;
-                if (cycle_breaking_rule == 2) { // remove the destination -> insert sources first
-                    start = old_offset;
-                    end = old_offset + old_src_cnt;
-                } else {
-                    start = old_offset + old_src_cnt;
-                    end = old_offset + old_length;
-                }
+                new_flat.push_back(src);
+                seen.insert(src);
 
-                for (uint32_t i = start; i < end; ++i) {
-                    uint32_t v = hedges_flat_[i];
-                    if (seen.insert(v).second)
-                        new_flat.push_back(v);
-                }
-
-                uint32_t new_halfway = static_cast<uint32_t>(new_flat.size() - new_offset);
-
-                if (cycle_breaking_rule == 0) // keep self-cycles -> don't track duplicates
-                    seen.clear();
-
-                if (cycle_breaking_rule == 2) { // remove the destination -> now insert destinations
-                    start = old_offset + old_src_cnt;
-                    end = old_offset + old_length;
-                } else {
-                    start = old_offset;
-                    end = old_offset + old_src_cnt;
-                }
-
-                for (uint32_t i = start; i < end; ++i) {
-                    uint32_t v = hedges_flat_[i];
+                for (uint32_t i = 1; i < old_length; ++i) {
+                    uint32_t v = hedges_flat_[old_offset + i];
                     if (seen.insert(v).second)
                         new_flat.push_back(v);
                 }
 
                 uint32_t new_length = static_cast<uint32_t>(new_flat.size() - new_offset);
-                uint32_t new_src_cnt = cycle_breaking_rule == 2 ? new_halfway : new_length - new_halfway;
-                he = HyperEdge(new_offset, new_length, new_src_cnt, he.weight(), nullptr);
+                he = HyperEdge(new_offset, new_length, he.weight(), nullptr);
                 new_offset += new_length;
             }
 
@@ -459,7 +405,7 @@ namespace hgraph {
 
             const uint32_t* base = hedges_flat_.data();
             for (auto& he : hedges_)
-                he = HyperEdge(he.offset(), he.length(), he.src_count(), he.weight(), base);
+                he = HyperEdge(he.offset(), he.length(), he.weight(), base);
 
             if (update_in_out_sets) {
                 for (uint32_t i = 0; i < inbound_.size(); ++i) {
@@ -493,7 +439,8 @@ namespace hgraph {
 
                 for (uint32_t idx : inbound_[n]) {
                     const HyperEdge& he = hedges_[idx];
-                    for (uint32_t i = 0; i < he.length(); i++) {
+                    neigh.insert(he.source());
+                    for (uint32_t i = 1; i < he.length(); i++) {
                         neigh.insert(hedges_flat_[he.offset() + i]);
                     }
                 }
@@ -524,7 +471,8 @@ namespace hgraph {
 
                 for (uint32_t idx : inbound_[n]) {
                     const HyperEdge& he = hedges_[idx];
-                    for (uint32_t i = 0; i < he.length(); i++) {
+                    neigh.insert(he.source());
+                    for (uint32_t i = 1; i < he.length(); i++) {
                         neigh.insert(hedges_flat_[he.offset() + i]);
                     }
                 }
@@ -590,8 +538,7 @@ namespace hgraph {
             }
         }
 
-        // HP: one src per hyperedge
-        static HyperGraph loadSNN(const std::string& path) {
+        static HyperGraph load(const std::string& path) {
             std::ifstream f(path, std::ios::binary);
             if (!f) throw std::runtime_error("Cannot open file");
 
@@ -602,7 +549,7 @@ namespace hgraph {
             R32(nodes);
             R32(num_edges);
 
-            std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> hedges(num_edges);
+            std::vector<std::vector<uint32_t>> hedges(num_edges);
             std::vector<float> weights(num_edges);
 
             for (uint32_t i = 0; i < num_edges; i++) {
@@ -610,14 +557,14 @@ namespace hgraph {
                 R32(dstc);
                 R32(src);
 
-                std::pair<std::vector<uint32_t>, std::vector<uint32_t>> hv;
-                hv.first.push_back(src);
-                hv.second.reserve(dstc);
+                std::vector<uint32_t> hv;
+                hv.reserve(dstc + 1);
+                hv.push_back(src);
 
                 for (uint32_t k = 0; k < dstc; k++) {
                     uint32_t d;
                     R32(d);
-                    hv.second.push_back(d);
+                    hv.push_back(d);
                 }
                 hedges[i] = hv;
 
@@ -658,7 +605,7 @@ namespace hgraph {
             bool edge_weights = (fmt == 1 || fmt == 11);
             bool node_weights = (fmt == 10 || fmt == 11);
 
-            std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> hedges;
+            std::vector<std::vector<uint32_t>> hedges;
             std::vector<float> weights;
             hedges.reserve(E);
             weights.reserve(E);
@@ -684,7 +631,7 @@ namespace hgraph {
                     singleton_hyperedges++;
                     continue;
                 }
-                hedges.push_back(std::make_pair(std::vector<uint32_t>{}, std::move(nodes)));
+                hedges.push_back(nodes);
                 weights.push_back(w);
             }
 

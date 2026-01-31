@@ -530,3 +530,14 @@ The unlimited outbound mod needs:
 
 Known flaw, or feature:
 With duplicates admitted between inbound and outbound, the candidates kernel could visit the same hedge twice, if that hedge is both inbound and outbound to the same node. This is not an issue when there are no cycles, but what about when there are? Should the hedge count twice in neighbor-score or not? IMO there just should not be cycles...
+
+----
+
+Candidates kernel:
+- I am already reaching nodes from every hedge they have in common with the present node, once per hedge
+- in the histogram, I can keep a counter on every node starting with its inbound set size
+- when a node is a destination in the hedge, I decrement its counter
+- the final counter is the number of hedges the node would add to my inbound set, that is, the number of hedges NOT yet seen
+
+Another upgrade that could have been:
+When a neighbor fails constraint checks during candidate selection, delete it from neighbors by setting it to UINT32_MAX, and the pack will do the rest. Never retry an invalid neighbor at the coarser level. Sure, node merges may bring it back, but that it’s acceptable…
