@@ -115,11 +115,13 @@ namespace hgraph {
 
             // compute total nodes needed
             size_t total_pins = 0;
+            uint32_t no_src_warning = 0;
             for (auto& he : hedges) {
-                if (he.first.size() < 1 || he.second.size() < 1)
-                    throw std::runtime_error("Hyperedge must have at least 1 source and 1 destination");
+                if (he.second.size() < 1) throw std::runtime_error("Hyperedge must have at least 1 destination");
+                if (he.first.size() < 1) no_src_warning++;
                 total_pins += he.first.size() + he.second.size();
             }
+            if (no_src_warning) std::cout << "WARNING: found " << no_src_warning << " hyperedges with zero sources (make sure this is intended - e.g. you loaded an hypergraph in hMETIS format) !!\n";
 
             hedges_flat_.reserve(total_pins);
             hedges_.reserve(hedges.size());
@@ -511,7 +513,7 @@ namespace hgraph {
         uint32_t sampleMaxNeighborhoodSize(uint32_t sample_size) {
             uint32_t max_size = 0;
 
-            for (uint32_t n = 0; n < node_count_; n += node_count_ / sample_size) {
+            for (uint32_t n = 0; n < node_count_; n += std::max<uint32_t>(1, node_count_ / sample_size)) {
 
                 std::set<uint32_t> neigh; // distinct neighbors
 
@@ -564,39 +566,38 @@ namespace hgraph {
             return neighborhood_offsets_;
         }
 
-        void save(const std::string& path) const {
-            std::ofstream f(path, std::ios::binary);
-            if (!f) throw std::runtime_error("Cannot open output file");
-
-            uint32_t num_edges = hedges_.size();
-
-            auto W32 = [&](uint32_t v) { f.write((char*)&v, 4); };
-            auto WF  = [&](float v)    { f.write((char*)&v, 4); };
-
-            W32(node_count_);
-            W32(num_edges);
-
-            for (auto& he : hedges_) {
-                uint32_t dst_count = he.length() - 1;
-                uint32_t src = hedges_flat_[he.offset()];
-
-                W32(dst_count);
-                W32(src);
-
-                for (uint32_t i = 1; i < he.length(); i++)
-                    W32(hedges_flat_[he.offset() + i]);
-
-                WF(he.weight());
-            }
-        }
-
-        // HP: one src per hyperedge
+        /**
+         * SNN binary hypergraph format (.snn)
+         *
+         * A compact binary format for directed hypergraphs with
+         * exactly one source node per hyperedge.
+         *
+         * File layout (little-endian):
+         *
+         *   uint32  node_count        // total number of nodes
+         *   uint32  edge_count        // number of hyperedges
+         *
+         *   Repeated edge_count times:
+         *     uint32  dst_count       // number of destination nodes
+         *     uint32  src             // source node id (0-based)
+         *     uint32  dst[dst_count]  // destination node ids (0-based)
+         *     float   weight          // hyperedge weight
+         *
+         * Notes:
+         * - Node IDs are 0-based.
+         * - Hyperedges are directed: src → dst[...].
+         * - The format supports exactly one source per hyperedge.
+         * - If a hyperedge has multiple sources internally, only the first source
+         *   is preserved; additional sources are converted into destinations and
+         *   a warning is emitted during saving.
+         * - No vertex weights or metadata are stored.
+         */
         static HyperGraph loadSNN(const std::string& path) {
             std::ifstream f(path, std::ios::binary);
             if (!f) throw std::runtime_error("Cannot open file");
 
             auto R32 = [&](uint32_t& v) { f.read((char*)&v, 4); };
-            auto RF  = [&](float& v)    { f.read((char*)&v, 4); };
+            auto RF = [&](float& v) { f.read((char*)&v, 4); };
 
             uint32_t nodes, num_edges;
             R32(nodes);
@@ -629,8 +630,199 @@ namespace hgraph {
             return HyperGraph(nodes, hedges, weights);
         }
 
-        // doc: https://course.ece.cmu.edu/~ee760/760docs/hMetisManual.pdf
-        static HyperGraph load_hmetis(const std::string& path) {
+        // HP: one src per hyperedge
+        void saveSNN(const std::string& path) const {
+            std::ofstream f(path, std::ios::binary);
+            if (!f) throw std::runtime_error("Cannot open output file");
+            bool multiple_srcs_warning = false;
+
+            uint32_t num_edges = hedges_.size();
+
+            auto W32 = [&](uint32_t v) { f.write((char*)&v, 4); };
+            auto WF = [&](float v) { f.write((char*)&v, 4); };
+
+            W32(node_count_);
+            W32(num_edges);
+
+            for (auto& he : hedges_) {
+                uint32_t dst_count = he.length() - 1;
+                uint32_t src = hedges_flat_[he.offset()];
+                if (he.src_count() > 1) multiple_srcs_warning = true;
+
+                W32(dst_count);
+                W32(src);
+
+                for (uint32_t i = 1; i < he.length(); i++)
+                    W32(hedges_flat_[he.offset() + i]);
+
+                WF(he.weight());
+            }
+
+            if (multiple_srcs_warning) std::cout << "WARNING: the partitioned hypergraph had hedge with multiple sources, a feature unsupported in '.snn' format, every source after the first was converted to a destination !!\n";
+        }
+
+        /**
+         * Axon hypergraph binary format (.axh)
+         *
+         * A compact binary format for directed hypergraphs supporting
+         * an arbitrary number of source and destination nodes per hyperedge.
+         * It generalizes the SNN format while having a similar - but not compatible - layout.
+         *
+         * File layout (little-endian):
+         *
+         *   uint32  node_count        // total number of nodes
+         *   uint32  edge_count        // number of hyperedges
+         *
+         *   Repeated edge_count times:
+         *     uint32  pin_count       // total number of pins (sources + destinations)
+         *     uint32  src_count       // number of source nodes (>= 1)
+         *     uint32  pins[pin_count] // node ids, sources first, then destinations (0-based)
+         *     float   weight          // hyperedge weight
+         *
+         * Semantics:
+         * - pin_count >= src_count >= 1
+         * - destinations are pins[src_count .. pin_count-1]
+         * - Node IDs are 0-based.
+         * - Hyperedges are directed from sources to destinations.
+         *
+         * Notes:
+         * - No vertex weights or metadata are stored.
+         * - This format is lossless with respect to the internal HyperGraph model.
+         * - All integers and floats are stored in native little-endian format.
+         */
+
+        static HyperGraph loadAXH(const std::string& path) {
+            std::ifstream f(path, std::ios::binary);
+            if (!f) throw std::runtime_error("Cannot open .axh file");
+
+            auto R32 = [&](uint32_t& v) { f.read((char*)&v, 4); };
+            auto RF  = [&](float& v)    { f.read((char*)&v, 4); };
+
+            uint32_t nodes, num_edges;
+            R32(nodes);
+            R32(num_edges);
+
+            std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> hedges;
+            std::vector<float> weights;
+            hedges.reserve(num_edges);
+            weights.reserve(num_edges);
+
+            for (uint32_t i = 0; i < num_edges; ++i) {
+                uint32_t pin_count, src_count;
+                R32(pin_count);
+                R32(src_count);
+
+                if (src_count == 0 || pin_count < src_count)
+                    throw std::runtime_error("Invalid AXH hyperedge header");
+
+                std::vector<uint32_t> srcs;
+                std::vector<uint32_t> dsts;
+                srcs.reserve(src_count);
+                dsts.reserve(pin_count - src_count);
+
+                for (uint32_t k = 0; k < pin_count; ++k) {
+                    uint32_t v;
+                    R32(v);
+                    if (v >= nodes)
+                        throw std::runtime_error("Invalid node id in AXH file");
+
+                    if (k < src_count)
+                        srcs.push_back(v);
+                    else
+                        dsts.push_back(v);
+                }
+
+                float w;
+                RF(w);
+
+                hedges.emplace_back(std::move(srcs), std::move(dsts));
+                weights.push_back(w);
+            }
+
+            return HyperGraph(nodes, hedges, weights);
+        }
+
+        void saveAXH(const std::string& path) const {
+            std::ofstream f(path, std::ios::binary);
+            if (!f) throw std::runtime_error("Cannot open output .axh file");
+
+            auto W32 = [&](uint32_t v) { f.write((char*)&v, 4); };
+            auto WF  = [&](float v)    { f.write((char*)&v, 4); };
+
+            const uint32_t num_edges = hedges_.size();
+
+            W32(node_count_);
+            W32(num_edges);
+
+            for (const auto& he : hedges_) {
+                const uint32_t pin_count = he.length();
+                const uint32_t src_count = he.src_count();
+
+                if (src_count == 0 || pin_count < src_count)
+                    throw std::runtime_error("Invalid hyperedge encountered while saving AXH");
+
+                W32(pin_count);
+                W32(src_count);
+
+                for (uint32_t i = 0; i < pin_count; ++i)
+                    W32(hedges_flat_[he.offset() + i]);
+
+                WF(he.weight());
+            }
+        }
+
+        /**
+         * hMETIS hypergraph format (limited support) (.hgr)
+         *
+         * doc: https://course.ece.cmu.edu/~ee760/760docs/hMetisManual.pdf
+         *
+         * This implementation supports loading from and saving to the hMETIS
+         * plain-text hypergraph format as described in the hMETIS manual, with
+         * the following restrictions and conventions.
+         *
+         * General format:
+         *
+         *   First non-comment line:
+         *     E V [fmt]
+         *
+         *     E   = number of hyperedges
+         *     V   = number of vertices
+         *     fmt = optional format flag
+         *           0  : unweighted hyperedges (default)
+         *           1  : weighted hyperedges
+         *          10  : weighted vertices (unsupported)
+         *          11  : weighted hyperedges and vertices (vertex weights unsupported)
+         *
+         *   Followed by E hyperedge lines (comments starting with '%' are ignored):
+         *
+         *     [w] v1 v2 v3 ...
+         *
+         *     where:
+         *       w  = integer hyperedge weight (only if fmt == 1 or 11)
+         *       vi = 1-based vertex indices
+         *
+         * Semantics and limitations:
+         *
+         * - Hyperedges are treated as undirected, as per hMETIS.
+         * - Vertex indices are converted from 1-based (hMETIS) to 0-based internally.
+         * - Hyperedge weights are supported; unweighted hyperedges default to weight 1.
+         * - Vertex weights (fmt == 10 or 11) are detected but ignored; a warning is printed.
+         * - Hyperedges of cardinality 1 (singleton hyperedges) are valid in hMETIS but
+         *   unsupported here; they are skipped and counted, and a warning is printed.
+         *
+         * Export behavior (savehMETIS):
+         *
+         * - Writes a valid hMETIS .hgr file using only hyperedge weights (fmt = 1 if needed).
+         * - Vertex weights are never written.
+         * - Hyperedges are exported by listing all pins (sources first, then destinations),
+         *   preserving internal order.
+         * - Node indices are written using 1-based indexing, as required by hMETIS.
+         *
+         * Note:
+         * - Directionality and source/destination distinctions are not represented in
+         *   hMETIS and are ignored on load; all pins are treated uniformly.
+         */
+        static HyperGraph loadhMETIS(const std::string& path) {
             std::ifstream f(path);
             if (!f) throw std::runtime_error("Cannot open .hgr file");
 
@@ -704,6 +896,44 @@ namespace hgraph {
             }
 
             return HyperGraph(V, hedges, weights);
+        }
+
+        // HP: export undirected hyperedge, no vertex weights, only on hypredges
+        void savehMETIS(const std::string& path) const {
+            std::ofstream f(path);
+            if (!f) throw std::runtime_error("Cannot open output .hgr file");
+
+            const uint32_t E = hedges_.size();
+            const uint32_t V = node_count_;
+
+            bool emit_weights = false;
+            for (const auto& he : hedges_) {
+                if (he.weight() != 1.0f) {
+                    emit_weights = true;
+                    break;
+                }
+            }
+
+            // header
+            if (emit_weights)
+                f << E << " " << V << " 1\n";
+            else
+                f << E << " " << V << "\n";
+
+            // hyperedges
+            for (const auto& he : hedges_) {
+                if (emit_weights)
+                    f << static_cast<uint32_t>(std::round(he.weight())) << " ";
+
+                // write all pins (sources first, then destinations)
+                for (uint32_t i = 0; i < he.length(); ++i) {
+                    uint32_t v = hedges_flat_[he.offset() + i];
+                    f << (v + 1); // convert 0-based -> 1-based idxs
+                    if (i + 1 < he.length())
+                        f << " ";
+                }
+                f << "\n";
+            }
         }
     
     };

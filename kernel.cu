@@ -43,14 +43,6 @@ void neighborhoods_count_kernel(
     //const uint32_t* not_my_touching = touching + touching_offsets[node_id + 1];
     const uint32_t my_touching_count = (uint32_t)(touching_offsets[node_id + 1] - touching_offsets[node_id]);
 
-    // no touching hedges, return immediately
-    // NOTE: the whole block returns, no need to sync
-    if (my_touching_count == 0) {
-        if (threadIdx.x == 0)
-            neighbors_offsets[node_id] = 0;
-        return;
-    }
-
     uint32_t* my_neighbors = neighbors + node_id * max_neighbors;
 
     // hash-set for deduplication (allows false-negatives, back it up with true deduplication in global memory)
@@ -65,8 +57,14 @@ void neighborhoods_count_kernel(
     if (threadIdx.x == 0)
         seen_distinct_total = 0;
     __syncthreads();
-
-    // can return only after helping initializing shared memory
+    
+    // no touching hedges, return immediately
+    // NOTE: the whole block returns, no need to sync
+    // MUST: return only after helping initializing shared memory
+    if (my_touching_count == 0) {
+        if (threadIdx.x == 0) neighbors_offsets[node_id] = 0;
+        return;
+    }
     if (warp_id >= my_touching_count && !discharge) return;
 
     // TODO: could optimize by iterating directly on pointers
@@ -158,9 +156,9 @@ void neighborhoods_scatter_kernel(
             //const uint32_t* not_my_hedge = hedges + hedges_offsets[my_hedge_idx + 1];
             const uint32_t my_hedge_size = (uint32_t)(hedges_offsets[my_hedge_idx + 1] - hedges_offsets[my_hedge_idx]);
             for (uint32_t node_idx = lane_id; node_idx < my_hedge_size; node_idx += WARP_SIZE) { // the warp loops over hedge pins
-                    uint32_t neighbor = my_hedge[node_idx];
-                    if (neighbor != node_id && sm_hashset_try_insert(dedupe, SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE, neighbor))
-                        gm_hashset_insert(my_neighbors, my_neighbors_count, neighbor); // should never happen, but could trigger an assert if 'my_neighbors_count' is exceeded
+                uint32_t neighbor = my_hedge[node_idx];
+                if (neighbor != node_id && sm_hashset_try_insert(dedupe, SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE, neighbor))
+                    gm_hashset_insert(my_neighbors, my_neighbors_count, neighbor); // should never happen, but could trigger an assert if 'my_neighbors_count' is exceeded
             }
         }
     }
@@ -1825,11 +1823,12 @@ void pack_segments(
     //const uint32_t out_len = (uint32_t)(offsets[warp_id + 1] - offsets[warp_id]);
     const dim_t in_start_idx = warp_id * sub_size;
 
-    // Process K items in rounds
+    // Process WARP_SIZE items in rounds
     for (int i = lane_id; i < sub_size; i += WARP_SIZE) {
         uint32_t v = oversized[in_start_idx + i];
         int p = (v != UINT32_MAX);
-        unsigned mask = __ballot_sync(0xFFFFFFFFu, p); // bit set to 1 for every lane not seeing a null value
+        unsigned active = __activemask();
+        unsigned mask = __ballot_sync(active, p); // bit set to 1 for every lane not seeing a null value
 
         int lane_rank = __popc(mask & ((1u << lane_id) - 1u)); // count how many bits were set to 1 before by lanes before me
         int p_count = __popc(mask); // total number of non-null value seen by the warp
@@ -1862,11 +1861,12 @@ void pack_segments_varsize(
     // TODO: some warps get large subarrays and work more...not balanced!
     const dim_t sub_size = sub_base_size * (oversized_offsets[warp_id + 1] - oversized_offsets[warp_id]);
 
-    // Process K items in rounds
+    // process WARP_SIZE items in rounds
     for (int i = lane_id; i < sub_size; i += WARP_SIZE) {
         uint32_t v = oversized[in_start_idx + i];
         int p = (v != UINT32_MAX);
-        unsigned mask = __ballot_sync(0xFFFFFFFFu, p); // bit set to 1 for every lane not seeing a null value
+        unsigned active = __activemask();
+        unsigned mask = __ballot_sync(active, p); // bit set to 1 for every lane not seeing a null value
 
         int lane_rank = __popc(mask & ((1u << lane_id) - 1u)); // count how many bits were set to 1 before by lanes before me
         int p_count = __popc(mask); // total number of non-null value seen by the warp

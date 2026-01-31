@@ -389,13 +389,19 @@ int main(int argc, char** argv) {
             if (!std::filesystem::is_regular_file(load_path)) throw std::runtime_error("Failed to load hypergraph, the provided path is not a file.");
             std::filesystem::path file_path(load_path);
             if (file_path.extension() == ".hgr") {
-                std::cout << "Loading hypergraph from: " << load_path << " (hMetis format) ...\n";
+                std::cout << "Loading hypergraph from: " << load_path << " (hMETIS format) ...\n";
                 std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
-                hg = HyperGraph::load_hmetis(load_path);
-            } else {
-                std::cout << "Loading hypergraph from: " << load_path << " (binary format) ...\n";
+                hg = HyperGraph::loadhMETIS(load_path);
+            } else if (file_path.extension() == ".snn") {
+                std::cout << "Loading hypergraph from: " << load_path << " (SNN format) ...\n";
                 std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
                 hg = HyperGraph::loadSNN(load_path);
+            } else if (file_path.extension() == ".axh") {
+                std::cout << "Loading hypergraph from: " << load_path << " (AXH format) ...\n";
+                std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
+                hg = HyperGraph::loadAXH(load_path);
+            } else {
+                throw std::runtime_error("Failed to load hypergraph, unsupported file format (supported: '.hgr', '.snn', '.axh').");
             }
             loaded = true;
         } catch (const std::exception& e) {
@@ -658,7 +664,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
     if (!direct_scatter_neighbors) CUDA_CHECK(cudaFree(d_oversized_neighbors)); // no pack? free oversized immediately
     // correct the max neighbors count estimate
-    auto actual_max_neighbors = thrust::max_element(t_neigh_offsets, t_neigh_offsets + num_nodes + 1);
+    auto actual_max_neighbors = thrust::max_element(t_neigh_offsets, t_neigh_offsets + num_nodes);
     dim_t actual_max_neighbors_offset = static_cast<dim_t>(actual_max_neighbors - t_neigh_offsets);
     CUDA_CHECK(cudaMemcpy(&max_neighbors, d_neighbors_offsets + actual_max_neighbors_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
     std::cout << "Max neighbors estimate corrected to " << max_neighbors << "\n";
@@ -749,7 +755,7 @@ int main(int argc, char** argv) {
         * - d_ungroups, d_ungroups_offsets
         * - all event buffers for constraint checks
         * Buffers constructed anew before (and passed as args to) each level:
-        * - d_hedges, d_hedges_offsets
+        * - d_hedges, d_hedges_offsets, d_srcs_count
         * - d_touching, d_touching_offsets, d_inbound_count
         * - d_nodes_sizes / d_groups_sizes
         * Buffers (constructed by and) returned from each level:
@@ -765,11 +771,6 @@ int main(int argc, char** argv) {
         * - d_partitions_inbound_sizes
         * Untouched buffers:
         * - d_hedge_weights
-        *
-        * TODO:
-        * - use (multi)function bits to coarsen/uncoarsen hedges in-place
-        * - use (multi)function bits to coarsen/uncoarsen hedges in-place
-        * - DO NOT DO THE ABOVE for neighbors (not used during refinement)
         *
         * TODO: could remove some (or even all) the synchronizes
         */
@@ -1999,9 +2000,21 @@ int main(int argc, char** argv) {
                 return 1;
             }
             try {
-                // TODO: apply the partitioning before saving!
-                partitioned_hg.save(save_path);
+                std::filesystem::path file_path(save_path);
+                if (file_path.extension() == ".hgr") {
+                    std::cout << "Saving partitioned hypergraph to: " << save_path << " (hMETIS format) ...\n";
+                    partitioned_hg.savehMETIS(save_path);
+                } else if (file_path.extension() == ".snn") {
+                    std::cout << "Saving partitioned hypergraph to: " << save_path << " (SNN format) ...\n";
+                    partitioned_hg.saveSNN(save_path);
+                } else if (file_path.extension() == ".axh") {
+                    std::cout << "Saving partitioned hypergraph to: " << save_path << " (AXH format) ...\n";
+                    partitioned_hg.saveAXH(save_path);
+                } else {
+                    throw std::runtime_error("Failed to save partitioned hypergraph, unsupported file format (supported: '.hgr', '.snn', '.axh').");
+                }
                 std::cout << "Partitioned hypergraph saved to " << save_path << "\n";
+                std::cout << "Partitioned hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
             } catch (const std::exception& e) {
                 std::cerr << "Error saving file: " << e.what() << "\n";
                 return 1;

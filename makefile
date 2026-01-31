@@ -62,7 +62,7 @@ run: $(TARGET)
 
 #   make run8k
 run8k: $(TARGET)
-	./$(TARGET) -r hgraphs/8k_model_ordered_processed
+	./$(TARGET) -r hgraphs/8k_model_ordered_processed.snn
 
 # Profile:
 #   make profile <input_file>
