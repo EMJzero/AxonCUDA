@@ -23,7 +23,7 @@
 #include </home/mronzani/cuda/include/cub/cub.cuh>
 
 #include "hgraph.hpp"
-#include "nmhardware.hpp"
+#include "constr.hpp"
 #include "utils.cuh"
 
 #define DEVICE_ID 0
@@ -416,7 +416,7 @@ int main(int argc, char** argv) {
         std::cout << "  Total pins: " << hg.hedgesFlat().size() << "\n";
         std::cout << "  Total connections weight: " << std::fixed << std::setprecision(3) << hg.connectivity() << "\n";
     } else {
-        std::cout << "WARNING, no hypergraph provided (-r), performing a dry-run !!\n";
+        std::cerr << "WARNING, no hypergraph provided (-r), performing a dry-run !!\n";
     }
 
     // setup constraints
@@ -436,7 +436,7 @@ int main(int argc, char** argv) {
     }
     Constraints &constr = *constr_tmp;
     
-    std::cout << "Using hardware model \"" << constr.name() << "\":\n";
+    std::cout << "Using constraints \"" << constr.name() << "\":\n";
     std::cout << "  Nodes per partition:         " << constr.nodesPerPart() << "\n";
     std::cout << "  Inbound hedge per partition: " << constr.inboundPerPart() << "\n";
     std::cout << "  Maximum partitions:          " << constr.maxParts() << "\n";
@@ -718,10 +718,10 @@ int main(int argc, char** argv) {
         uint32_t*& d_hedges,
         dim_t*& d_hedges_offsets,
         uint32_t*& d_srcs_count,
-        dim_t hedges_size,
+        const dim_t hedges_size,
         uint32_t*& d_touching,
         dim_t*& d_touching_offsets,
-        dim_t touching_size,
+        const dim_t touching_size,
         uint32_t*& d_inbound_count,
         uint32_t*& d_nodes_sizes
     ) { // this is a lambda
@@ -841,7 +841,7 @@ int main(int argc, char** argv) {
                 if (target == UINT32_MAX) continue;
                 // check the symmetry invariant: mutual pairs or the other has found a higher score pair (or one with lower id - tiebreaker) [easy for j = 0, for j > 0 check first that the target wasn't already used at a lower j]
                 if (pairs_tmp[target * MAX_CANDIDATES + j] != i && pairs_tmp[target * MAX_CANDIDATES + j] != UINT32_MAX && std::find(pairs_tmp.begin() + target * MAX_CANDIDATES, pairs_tmp.begin() + target * MAX_CANDIDATES + j, i) == pairs_tmp.begin() + target * MAX_CANDIDATES + j && !(scores_tmp[target * MAX_CANDIDATES + j] > score || scores_tmp[target * MAX_CANDIDATES + j] == score && pairs_tmp[target * MAX_CANDIDATES + j] < i))
-                    std::cout << "\n  WARNING, symmetry violated: node " << i << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ") AND node " << target << " (" << j << " target=" << pairs_tmp[target * MAX_CANDIDATES + j] << " score=" << std::fixed << std::setprecision(3) << scores_tmp[target * MAX_CANDIDATES + j] << ") !!";
+                    std::cerr << "\n  WARNING, symmetry violated: node " << i << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ") AND node " << target << " (" << j << " target=" << pairs_tmp[target * MAX_CANDIDATES + j] << " score=" << std::fixed << std::setprecision(3) << scores_tmp[target * MAX_CANDIDATES + j] << ") !!";
             }
         }
         std::cout << "\n";
@@ -969,10 +969,10 @@ int main(int argc, char** argv) {
                 std::cout << "Minimal initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
             } else if (new_num_nodes <= max_parts) {
                 std::cout << "Initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
-                std::cout << "WARNING: the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ")...\n";
+                std::cerr << "WARNING: the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ")...\n";
             } else { // base case, failure to coarsen further
-                std::cout << "FAILED TO COARSEN FURTHER at level " << level_idx << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << new_num_nodes << " max allowed partitions=" << max_parts << "\n";
-                std::cout << "WARNING: falling back to returning current groups as individual partitions...\n";
+                std::cerr << "FAILED TO COARSEN FURTHER at level " << level_idx << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << new_num_nodes << " max allowed partitions=" << max_parts << "\n";
+                std::cerr << "WARNING: falling back to returning current groups as individual partitions...\n";
             }
 
             return std::make_tuple(new_num_nodes, d_groups);
@@ -1030,10 +1030,14 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < new_num_nodes; ++i) {
             uint32_t group_size = groups_sizes_tmp[i];
             if (group_size > h_max_nodes_per_part)
-                std::cout << "  WARNING, max group size constraint (" << h_max_nodes_per_part << ") violated by group=" << i << " with group_size=" << group_size << " !!\n";
+                std::cerr << "  WARNING, max group size constraint (" << h_max_nodes_per_part << ") violated by group=" << i << " with group_size=" << group_size << " !!\n";
         }
-        int max_gs = groups_count.empty() ? 0 : std::max_element(groups_count.begin(), groups_count.end(), [](auto &a, auto &b){ return a.second < b.second; })->second;
-        std::cout << "Groups count: " << groups_count.size() << ", Max group size: " << max_gs << "\n";
+        long long max_gs = 0, sum_gs = 0;
+        for (const auto& [group, count] : groups_count) {
+            sum_gs += count;
+            if (count > max_gs) max_gs = count;
+        }
+        std::cout << "Groups count: " << groups_count.size() << ", Max group size: " << max_gs << ", Avg group size: " << std::fixed << std::setprecision(2) << (float)sum_gs/groups_count.size() << "\n";
         std::vector<uint32_t>().swap(pairs_tmp);
         std::vector<uint32_t>().swap(groups_tmp);
         std::unordered_map<uint32_t, int>().swap(groups_count);
@@ -1439,7 +1443,7 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < num_partitions; ++i) {
             uint32_t part_size = partitions_sizes_tmp[i];
             if (part_size > h_max_nodes_per_part)
-                std::cout << "  WARNING, max partition size constraint (" << h_max_nodes_per_part << ") violated by part=" << i << " with part_size=" << part_size << " !!\n";
+                std::cerr << "  WARNING, max partition size constraint (" << h_max_nodes_per_part << ") violated by part=" << i << " with part_size=" << part_size << " !!\n";
         }
         int max_ps = part_count.empty() ? 0 : std::max_element(part_count.begin(), part_count.end(), [](auto &a, auto &b){ return a.second < b.second; })->second;
         std::cout << "Non-empty partitions count: " << part_count.size() << ", Max partition size: " << max_ps << "\n";
@@ -1539,7 +1543,7 @@ int main(int argc, char** argv) {
         thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks); // invert the permutation such that: ranks[original_index] = sorted_position
         // free up thrust vectors
         thrust::device_vector<uint32_t>().swap(t_indices);
-        // launch configuration - fm-ref cascade kernel => same as "fm-ref gains kernel"
+        // launch configuration - fm-ref cascade kernel - same as fm-ref gains kernel
         // compute shared memory per block (bytes)
         bytes_per_warp = 0; //TODO
         shared_bytes = warps_per_block * bytes_per_warp;
@@ -1801,7 +1805,7 @@ int main(int argc, char** argv) {
         auto idx_begin = thrust::make_counting_iterator<uint32_t>(0);
         // functor masking invalid endpoints in the sequence => invalid moves get a -inf score
         // NOTE: valid_moves => the move is valid when the counter is 0!
-        masked_value_functor masked_scores { thrust::raw_pointer_cast(t_scores), thrust::raw_pointer_cast(t_valid_moves), thrust::raw_pointer_cast(t_inbound_valid_moves) };
+        masked_twin_value_functor masked_scores { thrust::raw_pointer_cast(t_scores), thrust::raw_pointer_cast(t_valid_moves), thrust::raw_pointer_cast(t_inbound_valid_moves) };
         auto masked_begin = thrust::make_transform_iterator(idx_begin, masked_scores);
         auto masked_end = masked_begin + curr_num_nodes;
         // max over valid endpoints only, find the point in the sequence of moves where applying them further never nets a higher gain in a valid state
@@ -1836,7 +1840,7 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
         } else {
-            std::cout << "WARNING: no valid refinement move found on level " << level_idx << " !!\n";
+            std::cerr << "WARNING: no valid refinement move found on level " << level_idx << " !!\n";
         }
         CUDA_CHECK(cudaFree(d_ranks));
         CUDA_CHECK(cudaFree(d_valid_moves));
@@ -1933,7 +1937,7 @@ int main(int argc, char** argv) {
     }
     std::cout << "Partitions count: " << part_count.size() << " (plus " << num_partitions - part_count.size() << " empty ones)" << "\n";
     if (new_num_partitions != part_count.size())
-        std::cout << "WARNING, distinct partitions count (" << part_count.size() << ") does not match the computed number of partitions when zero-ing their ids (" << new_num_partitions << ") !!\n";
+        std::cerr << "WARNING, distinct partitions count (" << part_count.size() << ") does not match the computed number of partitions when zero-ing their ids (" << new_num_partitions << ") !!\n";
     std::set<uint32_t>().swap(part_count);
     #endif
     // =============================
@@ -1977,7 +1981,7 @@ int main(int argc, char** argv) {
     // === CUDA STUFF ENDS HERE ===
     // ============================
 
-    std::cerr << "CUDA section: complete; proceeding with partitioning results validation and evalution...\n";
+    std::cout << "CUDA section: complete; proceeding with partitioning results validation and evalution...\n";
 
     double total_ms = std::chrono::duration<double, std::milli>(time_end - time_start).count();
     std::cout << "Total device execution time: " << std::fixed << std::setprecision(3) << d_total_ms << " ms\n";

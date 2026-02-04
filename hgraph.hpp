@@ -121,7 +121,7 @@ namespace hgraph {
                 if (he.first.size() < 1) no_src_warning++;
                 total_pins += he.first.size() + he.second.size();
             }
-            if (no_src_warning) std::cout << "WARNING: found " << no_src_warning << " hyperedges with zero sources (make sure this is intended - e.g. you loaded an hypergraph in hMETIS format) !!\n";
+            if (no_src_warning) std::cerr << "WARNING: found " << no_src_warning << " hyperedges with zero sources (make sure this is intended - e.g. you loaded an hypergraph in hMETIS format) !!\n";
 
             hedges_flat_.reserve(total_pins);
             hedges_.reserve(hedges.size());
@@ -473,7 +473,7 @@ namespace hgraph {
 
         // builds all neighborhoods (in- and outbound to each node)
         void buildNeighborhoods() {
-            std::cout << "WARNING: building neighborhoods will take a while...\n";
+            std::cerr << "WARNING: building neighborhoods will take a while...\n";
 
             neighborhoods_.clear();
             neighborhood_offsets_.clear();
@@ -658,7 +658,7 @@ namespace hgraph {
                 WF(he.weight());
             }
 
-            if (multiple_srcs_warning) std::cout << "WARNING: the partitioned hypergraph had hedge with multiple sources, a feature unsupported in '.snn' format, every source after the first was converted to a destination !!\n";
+            if (multiple_srcs_warning) std::cerr << "WARNING: the partitioned hypergraph had hedge with multiple sources, a feature unsupported in '.snn' format, every source after the first was converted to a destination !!\n";
         }
 
         /**

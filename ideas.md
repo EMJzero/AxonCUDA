@@ -541,3 +541,20 @@ Candidates kernel:
 
 Another upgrade that could have been:
 When a neighbor fails constraint checks during candidate selection, delete it from neighbors by setting it to UINT32_MAX, and the pack will do the rest. Never retry an invalid neighbor at the coarser level. Sure, node merges may bring it back, but that it’s acceptable…
+
+----
+
+Initial partitioning for k-way:
+
+- random init:
+  - thrust fill partitions array with |N|/k entries for the numbers 0..k-1
+  - thrust random (with see) scramble of the array
+- build pins per partition
+- propose in-isolation move (FM gain style)
+
+- in-isolation moves and gains
+- sort by (target partition, gain) in lex order
+- segmented scan by target partition
+- apply moves up to the one, for each partition, reaching its size limit (on thread per move / node) (atomics to update partition size…)
+- even allow negative gain moves, all applied in parallel, just to scramble things up
+- after T rounds of the above, switch to a best improving subsequence FM style like normal -> only this phase respects monotonically improving connectivity

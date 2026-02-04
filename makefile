@@ -26,14 +26,14 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(NVCC) $(LINKFLAGS) -o $@ $^
 
-%.o: %.cpp hgraph.hpp nmhardware.hpp
+%.o: %.cpp hgraph.hpp constr.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-%.o: %.cu hgraph.hpp nmhardware.hpp utils.cuh
+%.o: %.cu hgraph.hpp constr.hpp utils.cuh
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 # ==========================================
-# Argument extraction (for run and profile)
+# Argument extraction (for run, profile, and memcheck)
 # ==========================================
 RUN_ARG_1     := $(word 2, $(MAKECMDGOALS))
 RUN_ARG_2     := $(word 3, $(MAKECMDGOALS))
@@ -81,8 +81,23 @@ profile: $(TARGET)
 			./$(TARGET) -r $(PROFILE_ARG_1) -c $(PROFILE_ARG_2); \
 	fi
 
+# Memcheck:
+#   make memcheck <input_file>
+#   make memcheck <input_file> <config_name>
+memcheck: $(TARGET)
+	@if [ -z "$(PROFILE_ARG_1)" ]; then \
+		echo "Usage: make memcheck <input_file> [cache_string]"; \
+		exit 1; \
+	elif [ -z "$(PROFILE_ARG_2)" ]; then \
+		compute-sanitizer --tool memcheck \
+			./$(TARGET) -r $(PROFILE_ARG_1); \
+	else \
+		compute-sanitizer --tool memcheck \
+			./$(TARGET) -r $(PROFILE_ARG_1) -c $(PROFILE_ARG_2); \
+	fi
+
 # ==========================================
 clean:
 	rm -f $(TARGET) *.o *.qdrep *.nsys-rep *.sqlite
 
-.PHONY: all run run8k profile clean
+.PHONY: all run run8k profile memcheck clean

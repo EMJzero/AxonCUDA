@@ -21,8 +21,8 @@
 #include </home/mronzani/cuda/include/thrust/iterator/permutation_iterator.h>
 
 #include "../hgraph.hpp"
-#include "../nmhardware.hpp"
 #include "../utils.cuh"
+#include "nmhardware.hpp"
 #include "utils.cuh"
 
 #define DEVICE_ID 0
@@ -267,7 +267,7 @@ int main(int argc, char** argv) {
             std::cout << "Loading hypergraph from: " << load_path << " ...\n";
             if (!std::filesystem::is_regular_file(load_path)) throw std::runtime_error("The provided path is not a file.");
             std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
-            HyperGraph hg_tmp = HyperGraph::load(load_path);
+            HyperGraph hg_tmp = HyperGraph::loadSNN(load_path);
             std::cout << "Loading complete, ordering nodes ...\n";
             hg = hg_tmp.feedForwardOrder();
             loaded = true;
@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
         std::cout << "  Nodes:       " << hg.nodes() << "\n";
         std::cout << "  Hyperedges:  " << hg.hedges().size() << "\n";
         std::cout << "  Total pins:  " << hg.hedgesFlat().size() << "\n";
-        std::cout << "  Total Spike Frequency: " << std::fixed << std::setprecision(3) << hg.totalSpikeFrequency() << "\n";
+        std::cout << "  Total Spike Frequency: " << std::fixed << std::setprecision(3) << hg.connectivity() << "\n";
     } else {
         std::cout << "WARNING, no hypergraph provided (-r), performing a dry-run !!\n";
     }
@@ -335,6 +335,10 @@ int main(int argc, char** argv) {
     
     std::cout << "Starting timer...\n";
     auto time_start = std::chrono::high_resolution_clock::now();
+    cudaEvent_t d_time_start, d_time_stop;
+    CUDA_CHECK(cudaEventCreate(&d_time_start));
+    CUDA_CHECK(cudaEventCreate(&d_time_stop));
+    CUDA_CHECK(cudaEventRecord(d_time_start));
 
     std::cout << "Setting up GPU memory...\n";
 
@@ -870,6 +874,12 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
+    CUDA_CHECK(cudaEventRecord(d_time_stop));
+    CUDA_CHECK(cudaEventSynchronize(d_time_stop));
+    float d_total_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&d_total_ms, d_time_start, d_time_stop));
+    CUDA_CHECK(cudaEventDestroy(d_time_start));
+    CUDA_CHECK(cudaEventDestroy(d_time_stop));
     auto time_end = std::chrono::high_resolution_clock::now();
     std::cout << "Stopping timer...\n";
 
@@ -879,7 +889,8 @@ int main(int argc, char** argv) {
     std::cerr << "CUDA section: complete; proceeding with placement results validation and evalution...\n";
 
     double total_ms = std::chrono::duration<double, std::milli>(time_end - time_start).count();
-    std::cout << "Total execution time: " << std::fixed << std::setprecision(3) << total_ms << " ms\n";
+    std::cout << "Total device execution time: " << std::fixed << std::setprecision(3) << d_total_ms << " ms\n";
+    std::cout << "Total host execution time: " << std::fixed << std::setprecision(3) << total_ms << " ms\n";
 
     std::vector<Coord2D> h_placement(num_nodes);
     for (uint32_t i = 0; i < num_nodes; i++) {

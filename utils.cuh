@@ -222,7 +222,7 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* __restrict__ s, uin
 // USED BY: refinement constraints checks
 
 // valid values filtering functor
-struct masked_value_functor {
+struct masked_twin_value_functor {
     const float* value;
     const uint32_t* valid_1;
     const uint32_t* valid_2;

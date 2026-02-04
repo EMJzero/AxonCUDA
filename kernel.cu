@@ -1286,6 +1286,8 @@ void fm_refinement_gains_kernel(
     *          per thread where each bin is then reduced! Just each thread in the warp is in charge of num_partitions/warp_size partitions!
     *
     * TODO: this kernel could undergo the same multi-candidate upgrade as "pairs"! Tho here it would be much harder with the moves sorting mechanism...
+    * 
+    * TODO: full conversion to shared memory histogram...
     *
     * TODO: like in HyperG, we could repurpose neighbors to keep a list of neighboring hedges to each node (maybe one-hot encoded), and thus
     *       not build the full histogram, but build it only for those neighboring partitions...
@@ -1300,26 +1302,36 @@ void fm_refinement_gains_kernel(
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
     //uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
-    float histogram[PART_HIST_SIZE]; // make sure this fits in registers (no spill) !! Store here only the score, the partition id can be inferred!
-    // each thread handles, at once, min(PART_HIST_SIZE, partitions_per_thread) partitions, each partition is handled by exactly one thread per warp
-    uint32_t partitions_per_thread = min((num_partitions + WARP_SIZE - 1) / WARP_SIZE, PART_HIST_SIZE); // ceiled
-
+    float loss[PART_HIST_SIZE]; // make sure this fits in registers (no spill) !! Store here only the score, the partition id can be inferred!
+    float saving = 0.0f;
+    
     // all threads in the warp should agree on those...
-    float best_score = 0.0f;
+    float best_gain = -FLT_MAX;
     uint32_t best_move = UINT32_MAX;
 
+    // handle the current partition first with its own scan of touching hyperedges
+    for (const uint32_t* hedge_idx = my_touching + lane_id; hedge_idx < not_my_touching; hedge_idx += WARP_SIZE) {
+        const uint32_t actual_hedge_idx = *hedge_idx;
+        const uint32_t* my_pin_per_partition = pins_per_partitions + actual_hedge_idx * num_partitions;
+        const float my_hedge_weight = hedge_weights[actual_hedge_idx];
+        // hedge connected to my partition: gain the hedge's weight iff moving would disconnect it from my partition (I am its last pin left there)
+        if (my_pin_per_partition[my_partition] == 1)
+            saving += my_hedge_weight;
+    }
+
+    saving = warpReduceSum<float>(saving);
+    
     // handle PART_HIST_SIZE*WARP_SIZE partitions at a time, that is partitions_per_thread per thread in the warp
     for (uint32_t curr_base_part = 0; curr_base_part < num_partitions; curr_base_part += PART_HIST_SIZE*WARP_SIZE) {
-        // TODO: could make threads that have 0 partitions left (my_initial_part >= num_partitions) skip the iterations
-        partitions_per_thread = min((num_partitions - curr_base_part + WARP_SIZE - 1) / WARP_SIZE, PART_HIST_SIZE);
-        const uint32_t my_initial_part = curr_base_part + lane_id * partitions_per_thread;
-        const uint32_t my_final_part = min(curr_base_part + (lane_id + 1) * partitions_per_thread, num_partitions);
+        // each thread handles, at once, min(PART_HIST_SIZE, partitions_per_thread) partitions, each partition is handled by exactly one thread per warp
+        const uint32_t partitions_to_handle = min(num_partitions - curr_base_part, PART_HIST_SIZE*WARP_SIZE); // ... to handle over the whole warp
+        const uint32_t partitions_per_thread = (partitions_to_handle + WARP_SIZE - 1) / WARP_SIZE; // ceiled
+        const uint32_t threads_with_one_less_partition = partitions_per_thread*WARP_SIZE - partitions_to_handle;
+        const uint32_t my_part_count = partitions_per_thread - (lane_id >= WARP_SIZE - threads_with_one_less_partition ? 1 : 0);
 
         // clear per-thread local histograms
-        for (uint32_t p = 0; p < partitions_per_thread; p++)
-            histogram[p] = 0.0f;
-
-        // TODO: shared memory caching of pins_per_partitions!! (maybe not worth it if PART_HIST_SIZE is large enough...)
+        for (uint32_t p = 0; p < my_part_count; p++)
+            loss[p] = 0.0f;
 
         // scan touching hyperedges
         // NOTE: interpret this as "for each hedge, see if you moving to a certain partition is something that they like or not"
@@ -1328,51 +1340,35 @@ void fm_refinement_gains_kernel(
             const uint32_t* my_pin_per_partition = pins_per_partitions + actual_hedge_idx * num_partitions;
             const float my_hedge_weight = hedge_weights[actual_hedge_idx];
             // each thread in the warp reads partitions_per_thread counters
-            for (uint32_t p = 0; p < partitions_per_thread; p++) {
-                const uint32_t part = p + my_initial_part;
-                if (my_initial_part + p < my_final_part) {
-                    // Option 1: the gain is the weighted connections count with another partition <minus> the weighted connections count with the current one
-                    /*uint32_t counter = my_pin_per_partition[my_initial_part + p];
-                    if (my_initial_part + p == my_partition)
-                        counter--; // exclude your presence in the hyperedge from the count for your partition
-                    // update local histogram
-                    histogram[p] += counter*my_hedge_weight;*/
-                    // Option 2: the gain is the sum the weights of hedges such that moving to a certain partition the hedge (same as HyperG)
-                    uint32_t counter = my_pin_per_partition[part];
-                    float gain = 0.0f;
-                    // hedge connected to my partition: gain the hedge's weight iff moving would disconnect it from my partition (I am its last pin left there)
-                    if (counter == 1 && part == my_partition)
-                        gain = my_hedge_weight;
-                    // hedge not yet connected to the partition: pay the hedge's weight iff moving there connects it to the new partition (I would become its first pin there)
-                    else if (counter == 0 && part != my_partition)
-                        gain = -my_hedge_weight;
-                    // update local histogram
-                    histogram[p] += gain;
-                }
+            for (uint32_t p = 0; p < my_part_count; p++) {
+                const uint32_t part = curr_base_part + lane_id + p * WARP_SIZE;
+                // hedge not yet connected to the partition: pay the hedge's weight iff moving there connects it to the new partition (I would become its first pin there)
+                if (my_pin_per_partition[part] == 0) loss[p] += my_hedge_weight;
             }
         }
 
         // reduce max inside each threads
-        for (uint32_t p = 0; p < partitions_per_thread; p++) {
-            const float score = histogram[p];
-            const uint32_t part = my_initial_part + p;
-            // TODO: could anticipate the constraint check! E.g. at the beginning of the iteration, entirely removing some partitions from the histogram,
-            //       but this will require keeping a list of active partitions, since the initial-final indices won't suffice anymore...
-            if (my_initial_part + p < my_final_part && partitions_sizes[part] + my_size <= max_nodes_per_part && (score > best_score || score == best_score && part < best_move)) {
-                best_score = score;
+        for (uint32_t p = 0; p < my_part_count; p++) {
+            const float gain = saving - loss[p];
+            const uint32_t part = curr_base_part + lane_id + p * WARP_SIZE;
+            // MAYBE: could anticipate the constraint check! E.g. at the beginning of the iteration, entirely removing some partitions from the histogram,
+            //        but this will require keeping a list of active partitions, since the indices won't suffice anymore...
+            // TODO: change the tie-break to pseudo-random?
+            if (part != my_partition && partitions_sizes[part] + my_size <= max_nodes_per_part && (gain > best_gain || gain == best_gain && part > best_move)) {
+                best_gain = gain;
                 best_move = part;
             }
         }
 
         // reduce max between threads
-        bin max = warpReduceMax(best_score, best_move);
-        best_score = max.score;
+        bin max = warpReduceMax(best_gain, best_move);
+        best_gain = max.score;
         best_move = max.node; // yeah, "node" should be called "partition" here, but this way we repurpose the struct...
     }
 
-    if (lane_id == 0 && my_partition != best_move) { // move to where I already am -> no move
+    if (lane_id == 0) {
         moves[warp_id] = best_move;
-        scores[warp_id] = best_score; // write even if negative since scores are uninitialized, we filter later!
+        scores[warp_id] = best_gain; // write even if negative since scores are uninitialized, we filter later!
     }
 }
 
