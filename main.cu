@@ -334,13 +334,6 @@ extern __constant__ uint32_t max_inbound_per_part;
 using namespace hgraph;
 using namespace constraints;
 
-#define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
-    if (code != cudaSuccess) {
-        fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-        if (abort) exit(code);
-    }
-}
 
 void printHelp() {
     std::cout <<
@@ -902,11 +895,11 @@ int main(int argc, char** argv) {
         // order groups kernel (parallel label compression)
         // TODO: custom kernel for this?
         // as of now "d_groups" contains the new non-zero-based group id for every node
-        thrust::device_vector<uint32_t> t_indices(curr_num_nodes);
-        thrust::sequence(t_indices.begin(), t_indices.end());
-        // sort by groups, carrying node indices (represented by the sequence) along; after d_groups is sorted, t_indices tells where each sorted element came from
+        thrust::device_vector<uint32_t> t_nodes(curr_num_nodes);
+        thrust::sequence(t_nodes.begin(), t_nodes.end());
+        // sort by groups, carrying node indices (represented by the sequence) along; after d_groups is sorted, t_nodes tells where each sorted element came from
         thrust::device_ptr<uint32_t> t_groups(d_groups);
-        thrust::sort_by_key(t_groups, t_groups + curr_num_nodes, t_indices.begin()); // sort groups and carry indices along for a ride
+        thrust::sort_by_key(t_groups, t_groups + curr_num_nodes, t_nodes.begin()); // sort groups and carry indices along for a ride
         // build "head of group flags": 1 at first occurrence of each group in the sorted array, 0 otherwise ( flags[i] = 1 if i == 0 or d_groups[i] != d_groups[i-1] )
         thrust::device_vector<uint32_t> t_headflags(curr_num_nodes);
         // the first element is part of groups zero (the initial default)
@@ -924,14 +917,14 @@ int main(int argc, char** argv) {
         // extra step: compute cumulative group sizes
         thrust::device_ptr<uint32_t> t_groups_sizes(d_groups_sizes);
         thrust::device_ptr<const uint32_t> t_nodes_sizes(d_nodes_sizes);
-        // premute node sizes in "sorted-by-group" order, using indices that already reflect such ordering ( t_indices[i] tells which original idx got sorted in position i )
-        auto nodes_sizes_values_begin = thrust::make_permutation_iterator(t_nodes_sizes, t_indices.begin());
+        // premute node sizes in "sorted-by-group" order, using indices that already reflect such ordering ( t_nodes[i] tells which original idx got sorted in position i )
+        auto nodes_sizes_values_begin = thrust::make_permutation_iterator(t_nodes_sizes, t_nodes.begin());
         // reduce (sum) nodes_sizes inside each group (group = key, marked by having the same headflag, that by now corresponds to the zero-based group id) ( headflags[i] is the new group ID for sorted position i )
         thrust::reduce_by_key(t_headflags.begin(), t_headflags.end(), nodes_sizes_values_begin, thrust::make_discard_iterator(), t_groups_sizes);
         // => now "d_groups_sizes[idx]" holds the sum of nodes_size over all nodes in group idx, for idx in [0, new_num_nodes)
         // ======================================
-        // scatter the new ids back to original positions using the sequence; for sorted position i, original index is t_indices[i]; we want: d_groups[t_indices[i]] = t_headflags[i]
-        thrust::scatter(t_headflags.begin(), t_headflags.end(), t_indices.begin(), t_groups);
+        // scatter the new ids back to original positions using the sequence; for sorted position i, original index is t_nodes[i]; we want: d_groups[t_nodes[i]] = t_headflags[i]
+        thrust::scatter(t_headflags.begin(), t_headflags.end(), t_nodes.begin(), t_groups);
         // if the number of groups has reached the required threshold, they become the partitions
         // => now "d_groups[idx]" contains the new zero-based group ID for every node
 
@@ -986,8 +979,8 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMalloc(&d_ungroups_offsets, (1 + new_num_nodes) * sizeof(dim_t))); // ungroups_offsets[node idx] -> node's group id (zero-based)
         
         // build reverse multifunction from groups to their original nodes
-        // from above, t_indices is the list of node idxs sorted by their group id, hence, the reverse list is simply t_indices, we just need to compute the offsets to reach, from each group id, its original nodes
-        CUDA_CHECK(cudaMemcpy(d_ungroups, thrust::raw_pointer_cast(t_indices.data()), curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+        // from above, t_nodes is the list of node idxs sorted by their group id, hence, the reverse list is simply t_nodes, we just need to compute the offsets to reach, from each group id, its original nodes
+        CUDA_CHECK(cudaMemcpy(d_ungroups, thrust::raw_pointer_cast(t_nodes.data()), curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
         thrust::device_ptr<dim_t> t_ungroups_offsets(d_ungroups_offsets);
         // predicate to detect group starts: is_group_start(i) = (i == 0) || (headflags[i] != headflags[i-1])
         auto is_group_start = [heads = t_headflags.begin()] __device__ (uint32_t i) { return (i == 0) || (heads[i] != heads[i - 1]); };
@@ -1000,7 +993,7 @@ int main(int argc, char** argv) {
         dim_t dim_t_curr_num_nodes = (dim_t)curr_num_nodes;
         CUDA_CHECK(cudaMemcpy(d_ungroups_offsets + new_num_nodes, &dim_t_curr_num_nodes, sizeof(dim_t), cudaMemcpyHostToDevice));
         // free up thrust vectors
-        //thrust::device_vector<uint32_t>().swap(t_indices); // DO NOT FREE THIS UP! We need it later for REFINEMENT!
+        thrust::device_vector<uint32_t>().swap(t_nodes);
         thrust::device_vector<uint32_t>().swap(t_headflags);
 
         // =============================
@@ -1027,19 +1020,24 @@ int main(int argc, char** argv) {
                 std::cout << " group=" << group << " group_size=" << group_size << "\n";
             }
         }
+        long long max_gs = 0, sum_gs = 0;
         for (uint32_t i = 0; i < new_num_nodes; ++i) {
             uint32_t group_size = groups_sizes_tmp[i];
+            sum_gs += group_size;
+            if (group_size > max_gs) max_gs = group_size;
             if (group_size > h_max_nodes_per_part)
                 std::cerr << "  WARNING, max group size constraint (" << h_max_nodes_per_part << ") violated by group=" << i << " with group_size=" << group_size << " !!\n";
         }
-        long long max_gs = 0, sum_gs = 0;
+        long long max_cgs = 0, sum_cgs = 0;
         for (const auto& [group, count] : groups_count) {
-            sum_gs += count;
-            if (count > max_gs) max_gs = count;
+            sum_cgs += count;
+            if (count > max_cgs) max_cgs = count;
         }
-        std::cout << "Groups count: " << groups_count.size() << ", Max group size: " << max_gs << ", Avg group size: " << std::fixed << std::setprecision(2) << (float)sum_gs/groups_count.size() << "\n";
+        std::cout << "Groups count: " << groups_count.size() << "\n  Max coarse group size: " << max_cgs << ", Avg coarse group size: " << std::fixed << std::setprecision(2) << (float)sum_cgs/groups_count.size() << "\n";
+        std::cout << "  Max nodes group size: " << max_gs << ", Avg nodes group size: " << std::fixed << std::setprecision(2) << (float)sum_gs/groups_count.size() << "\n";
         std::vector<uint32_t>().swap(pairs_tmp);
         std::vector<uint32_t>().swap(groups_tmp);
+        std::vector<uint32_t>().swap(groups_sizes_tmp);
         std::unordered_map<uint32_t, int>().swap(groups_count);
         #endif
         // =============================
@@ -1437,8 +1435,11 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < curr_num_nodes; ++i) {
             uint32_t part = partitions_tmp[i];
             part_count[part]++;
-            if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH))
-                std::cout << "  node " << i << " -> " << part << "\n";
+            if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
+                if (part == UINT32_MAX) std::cout << "node " << i << " -> part=none";
+                else std::cout << "  node " << i << " -> " << part;
+                std::cout << ((i + 1) % 4 == 0 ? "\n" : "\t");
+            }
         }
         for (uint32_t i = 0; i < num_partitions; ++i) {
             uint32_t part_size = partitions_sizes_tmp[i];
@@ -1523,8 +1524,35 @@ int main(int argc, char** argv) {
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
+
+        // =============================
+        // print some temporary results
+        #if VERBOSE
+        std::vector<uint32_t> moves_tmp(curr_num_nodes);
+        std::vector<float> gains_tmp(curr_num_nodes);
+        std::vector<uint32_t> src_partitions_tmp(curr_num_nodes);
+        CUDA_CHECK(cudaMemcpy(moves_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(gains_tmp.data(), d_f_scores, curr_num_nodes * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(src_partitions_tmp.data(), d_partitions, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        std::cout << "Proposed moves:\n";
+        for (uint32_t i = 0; i < curr_num_nodes; ++i) {
+            if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
+                std::cout << "  node " << i << " : ";
+                uint32_t move = moves_tmp[i];
+                if (move == UINT32_MAX) std::cout << "stay " << src_partitions_tmp[i];
+                else std::cout << src_partitions_tmp[i] << " -> " << move;
+                std::cout << " gain=" << std::fixed << std::setprecision(3) << gains_tmp[i];
+                std::cout << ((i + 1) % 2 == 0 ? "\n" : "\t");
+            }
+        }
+        std::vector<uint32_t>().swap(pairs_tmp);
+        std::vector<float>().swap(gains_tmp);
+        std::vector<uint32_t>().swap(src_partitions_tmp);
+        #endif
+        // =============================
+
         // sort scores and build an array of ranks (node id -> his move's idx in sorted scores)
-        //thrust::device_vector<int> t_indices(curr_num_nodes); // temporary sequence sorted alongside scores -> ALREADY DECLARED FOR COARSEING, reuse!
+        thrust::device_vector<uint32_t> t_indices(curr_num_nodes); // temporary sequence sorted alongside scores -> ALREADY DECLARED FOR COARSEING, reuse!
         thrust::sequence(t_indices.begin(), t_indices.end());
         uint32_t *d_ranks = nullptr;
         CUDA_CHECK(cudaMalloc(&d_ranks, curr_num_nodes * sizeof(uint32_t))); // node -> number of touching hedges seen as of now
@@ -1814,8 +1842,10 @@ int main(int argc, char** argv) {
         const uint32_t num_good_moves = best_rank + 1; // "+1" to make this the improving moves count, rather than the last improving move's idx
         // validity double-check (if there were no valid moves...)
         uint32_t size_validity, inbounds_validity;
+        float acquired_gain;
         CUDA_CHECK(cudaMemcpy(&size_validity, d_valid_moves + best_rank, sizeof(uint32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(&inbounds_validity, d_inbound_valid_moves + best_rank, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&acquired_gain, d_f_scores + best_rank, sizeof(uint32_t), cudaMemcpyDeviceToHost));
         if (size_validity == 0 && inbounds_validity == 0) {
             // launch configuration - fm-ref apply kernel
             threads_per_block = 128;
@@ -1839,8 +1869,9 @@ int main(int argc, char** argv) {
             );
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
+            if (acquired_gain < 0) std::cerr << "WARNING: applied a refinement move with negative gain " << acquired_gain << " on level " << level_idx << " !!\n";
         } else {
-            std::cerr << "WARNING: no valid refinement move found on level " << level_idx << " !!\n";
+            std::cerr << "WARNING: no valid refinement move found on level " << level_idx << " (best-move-rank=" << best_rank << " reason: " << (size_validity != 0 ? (inbounds_validity != 0 ? "both size and inbounds validities" : "size validity") : "inbounds validity") << ") !!\n";
         }
         CUDA_CHECK(cudaFree(d_ranks));
         CUDA_CHECK(cudaFree(d_valid_moves));
@@ -1987,6 +2018,11 @@ int main(int argc, char** argv) {
     std::cout << "Total device execution time: " << std::fixed << std::setprecision(3) << d_total_ms << " ms\n";
     std::cout << "Total host execution time: " << std::fixed << std::setprecision(3) << total_ms << " ms\n";
 
+    /*DEBUG: check the metrics calculation!
+    float dbg_conn = hg.connectivityFromPart(partitions);
+    float dbg_cutn = hg.cutnetFromPart(partitions);
+    */
+
     if (constr.checkPartitionValidity(hg, partitions, true)) {
         auto partitioned_hg = hg.getPartitionsHypergraph(partitions, 2, true); // remove the destination if self-cycles happen
         auto hedge_overlap = constr.hedgeOverlap(hg, partitions);
@@ -1994,8 +2030,11 @@ int main(int argc, char** argv) {
         std::cout << "  Nodes:         " << partitioned_hg.nodes() << "\n";
         std::cout << "  Hyperedges:    " << partitioned_hg.hedges().size() << "\n";
         std::cout << "  Total pins:    " << partitioned_hg.hedgesFlat().size() << "\n";
+        std::cout << "  Cut-net:       " << partitioned_hg.cutnet() << "\n";
         std::cout << "  Connectivity:  " << partitioned_hg.connectivity() << "\n";
         std::cout << "  Hedge overlap: " << std::fixed << std::setprecision(3) << hedge_overlap.ar_mean << " ar. mean, " << hedge_overlap.geo_mean << " geo. mean\n";
+        //if (dbg_conn != partitioned_hg.connectivity()) std::cerr << "ERROR, incorrect metric calculation for connectivity: " << dbg_conn << " vs " << partitioned_hg.connectivity() << " !!\n";
+        //if (dbg_cutn != partitioned_hg.cutnet()) std::cerr << "ERROR, incorrect metric calculation for cut-net: " << dbg_cutn << " vs " << partitioned_hg.cutnet() << " !!\n";
         
         // save hypergraph
         if (!save_path.empty()) {
@@ -2018,7 +2057,7 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("Failed to save partitioned hypergraph, unsupported file format (supported: '.hgr', '.snn', '.axh').");
                 }
                 std::cout << "Partitioned hypergraph saved to " << save_path << "\n";
-                std::cout << "Partitioned hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
+                std::cout << "Partitioned hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(save_path)) / (1 << 20) << " MB\n";
             } catch (const std::exception& e) {
                 std::cerr << "Error saving file: " << e.what() << "\n";
                 return 1;

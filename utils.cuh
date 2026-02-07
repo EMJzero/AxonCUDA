@@ -5,6 +5,14 @@
 
 // USED BY: everyone
 
+#define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
+    if (code != cudaSuccess) {
+        fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
+}
+
 // absolute replacement for "size_t"
 using dim_t = unsigned long long; // aka uint64_t
 
@@ -121,7 +129,9 @@ __forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
 }
 
 // symmetric and deterministic pseudo-random hash
+template <uint32_t MAX_NOISE>
 __device__ __forceinline__ uint32_t deterministic_noise(uint32_t a, uint32_t b) {
+    static_assert((MAX_NOISE & (MAX_NOISE - 1)) == 0, "MAX_NOISE must be power-of-two");
     uint32_t lo = min(a, b), hi = max(a, b);
     uint32_t x = lo * 0x9E3779B1u; // golden-ratio :)
     x ^= hi + 0x85EBCA6Bu + (x << 6) + (x >> 2);
@@ -130,7 +140,7 @@ __device__ __forceinline__ uint32_t deterministic_noise(uint32_t a, uint32_t b) 
     x ^= x >> 13;
     x *= 0x9E3779B1u;
     x ^= x >> 16;
-    return x & (DETERMINISTIC_SCORE_NOISE - 1);
+    return x & (MAX_NOISE - 1);
 }
 
 // USED BY: grouping kernel

@@ -260,7 +260,7 @@ void candidates_kernel(
         for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
             uint32_t curr_neighbor = histogram_node[nb];
             if (curr_neighbor != UINT32_MAX) {
-                histogram_score[nb] = deterministic_noise(curr_neighbor, warp_id);
+                histogram_score[nb] = deterministic_noise<DETERMINISTIC_SCORE_NOISE>(curr_neighbor, warp_id);
                 histogram_inbound[nb] = inbound_count[curr_neighbor];
             } else {
                 histogram_score[nb] = 0u;
@@ -303,12 +303,17 @@ void candidates_kernel(
         __syncwarp();
 
         // delete candidates that would lead to invalid clusters
-        // MAYBE: do this after sorting, only on the extracted neighbor!
+        // and penalize neighbors by your combined size (symmetric)
         for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
             if (histogram_inbound[nb] + my_inbound_count > max_inbound_per_part) {
                 histogram_node[nb] = UINT32_MAX;
                 histogram_score[nb] = 0u;
-            }
+            } /*else if (histogram_node[nb] != UINT32_MAX) {
+                uint32_t neigh_size = nodes_sizes[histogram_node[nb]];
+                //histogram_score[nb] /= my_size + neigh_size;
+                histogram_score[nb] -= min(my_size + neigh_size, DETERMINISTIC_SCORE_NOISE);
+                //if (histogram_score[nb] == 0) histogram_score[nb] = deterministic_noise<DETERMINISTIC_SCORE_NOISE>(histogram_node[nb], warp_id);
+            }*/
         }
 
         // sort the histogram by lowest score first (empty bins have score = 0), highest id first as a tiebreaker
@@ -1315,8 +1320,11 @@ void fm_refinement_gains_kernel(
         const uint32_t* my_pin_per_partition = pins_per_partitions + actual_hedge_idx * num_partitions;
         const float my_hedge_weight = hedge_weights[actual_hedge_idx];
         // hedge connected to my partition: gain the hedge's weight iff moving would disconnect it from my partition (I am its last pin left there)
-        if (my_pin_per_partition[my_partition] == 1)
-            saving += my_hedge_weight;
+        //if (my_pin_per_partition[my_partition] == 1)
+        //    saving += my_hedge_weight;
+        // VARIANT: give a little push to nodes leaving a partition with not just one, but few pins left for an hedge
+        if (my_pin_per_partition[my_partition] >= 1)
+            saving += my_hedge_weight / (my_pin_per_partition[my_partition] * my_pin_per_partition[my_partition]);
     }
 
     saving = warpReduceSum<float>(saving);
@@ -1353,8 +1361,8 @@ void fm_refinement_gains_kernel(
             const uint32_t part = curr_base_part + lane_id + p * WARP_SIZE;
             // MAYBE: could anticipate the constraint check! E.g. at the beginning of the iteration, entirely removing some partitions from the histogram,
             //        but this will require keeping a list of active partitions, since the indices won't suffice anymore...
-            // TODO: change the tie-break to pseudo-random?
-            if (part != my_partition && partitions_sizes[part] + my_size <= max_nodes_per_part && (gain > best_gain || gain == best_gain && part > best_move)) {
+            // => pseudo-random tie-break via hashes
+            if (part != my_partition && partitions_sizes[part] + my_size <= max_nodes_per_part && (gain > best_gain || gain == best_gain && hash_uint32(part) > hash_uint32(best_move))) {
                 best_gain = gain;
                 best_move = part;
             }
@@ -1448,11 +1456,7 @@ void fm_refinement_cascade_kernel(
         int32_t my_move_part_counter_delta = 0;
         for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
             uint32_t pin = *my_hedge;
-            // Option 1: sorting scores to build and pass the ranking of moves
             if (move_ranks[pin] < my_move_rank) { // speculation: better-ranked move -> applied
-            // Option 2: compare scores on the fly and tie-break with the node ids
-            //if (scores[pin] > my_move_score || scores[pin] == my_move_score && pin < warp_id) { // speculation: better-ranked move -> applied
-            // NOTE: MUST use option (1) because we need to keep the original sorting of the scores even after updating them!
                 // NOTE: invalid moves should all have a lower score and thus a higher rank than all others, never being see here
                 uint32_t new_pin_partition = moves[pin];
                 uint32_t prev_pin_partition = partitions[pin];
@@ -1466,19 +1470,19 @@ void fm_refinement_cascade_kernel(
                     my_move_part_counter_delta--;
             }
         }
-        // Option 1: the gain is the weighted connections count with another partition <minus> the weighted connections count with the current one
-        //score -= my_hedge_weight*(my_curr_part_counter + warpReduceSumLN0<uint32_t>(my_curr_part_counter_delta));
-        //score += my_hedge_weight*(my_move_part_counter + warpReduceSumLN0<uint32_t>(my_move_part_counter_delta));
-        // Option 2: the gain is the sum the weights of hedges such that moving to a certain partition the hedge (same as HyperG)
         // gain the hedge's weight iff moving would disconnect the hedge from my partition (I am its last pin left there)
-        if (my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta) == 1)
-            score += my_hedge_weight;
+        //if (my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta) == 1)
+        //    score += my_hedge_weight;
+        // VARIANT: give a little push to nodes leaving a partition with not just one, but few pins left for an hedge
+        const uint32_t my_true_part_counter = my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta);
+        if (my_true_part_counter >= 1)
+            score += my_hedge_weight / (my_true_part_counter * my_true_part_counter);
         // pay the hedge's weight iff moving there connects the hedge to the new partition (I would become its first pin there)
         if (my_move_part_counter + warpReduceSumLN0<int32_t>(my_move_part_counter_delta) == 0)
             score -= my_hedge_weight;
     }
 
-    if (lane_id == 0 && score > 0)
+    if (lane_id == 0)
         scores[my_move_rank] = score;
 }
 
@@ -1785,12 +1789,12 @@ void flag_inbound_events_kernel(
         return;
     }
 
-    const int32_t base_size = static_cast<int32_t>(partitions_inbound_sizes[part]);
-    const int32_t curr_size = base_size + ev_delta[tid];
-    const bool is_valid = curr_size <= static_cast<int32_t>(max_inbound_per_part); // true iff after this event the partition's inbound set size is valid
+    const uint32_t base_size = partitions_inbound_sizes[part];
+    const uint32_t curr_size = base_size + ev_delta[tid];
+    const bool is_valid = curr_size <= max_inbound_per_part; // true iff after this event the partition's inbound set size is valid
 
     const uint32_t pred_part = tid > 0 ? ev_partition[tid - 1] : UINT32_MAX; // partition acted upon by the event before this one
-    const bool was_valid = pred_part != part || base_size + ev_delta[tid - 1] <= static_cast<int32_t>(max_inbound_per_part); // true iff before this event the partition's inbound set size is valid
+    const bool was_valid = pred_part != part || base_size + ev_delta[tid - 1] <= max_inbound_per_part; // true iff before this event the partition's inbound set size is valid
 
     if (was_valid && !is_valid) // this event made the partition invalid -> track a +1 in invalid partitions as of this event
         atomicAdd(&valid_moves[rank], 1);

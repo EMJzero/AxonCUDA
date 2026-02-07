@@ -31,7 +31,7 @@ namespace hgraph {
 
         private:
         uint32_t offset_; // offset inside HyperGraph::hedges_flat_
-        uint32_t length_; // total nodes = 1 + destinations
+        uint32_t length_; // total nodes = |sources| + |destinations|
         uint32_t src_count_; // how many pins are sources (stored at the start of each segment)
         float weight_;
         const uint32_t* hedges_flat_; // pointer to the owning hypergraph's hedges_flat_ array
@@ -205,15 +205,52 @@ namespace hgraph {
             return total;
         }
         // aliases for compatibility
+        // => lambda - 1 metric (computed assuming this to be a partitioned hgraph)
         float connectivity() const { return totalWeight(); }
+
+        // => cut-net metric (computed assuming this to be a partitioned hgraph)
+        float cutnet() const {
+            float total = 0.0f;
+            for (auto& he : hedges_) {
+                if (he.length() > 1)
+                    total += he.weight();
+            }
+            return total;
+        }
+
+        // => lambda - 1 metric (computed for a given permutation)
+        float connectivityFromPart(const std::vector<uint32_t>& part) const {
+            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch");
+            float total = 0.0f;
+            for (auto& he : hedges_) {
+                std::set<uint32_t> parts;
+                for (uint32_t node : he.nodes())
+                    parts.insert(part[node]);
+                total += he.weight()*(parts.size() - 1);
+            }
+            return total;
+        }
+
+        // => cut-net metric (computed for a given permutation)
+        float cutnetFromPart(const std::vector<uint32_t>& part) const {
+            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch");
+            float total = 0.0f;
+            for (auto& he : hedges_) {
+                std::set<uint32_t> parts;
+                for (uint32_t node : he.nodes())
+                    parts.insert(part[node]);
+                if (parts.size() > 1)
+                    total += he.weight();
+            }
+            return total;
+        }
 
         // remove_self_cycles can be:
         // 0 : do not remove
         // 1 : remove the source of the cycle
         // 2 : remove the destination of the cycle
         HyperGraph getPartitionsHypergraph(const std::vector<uint32_t>& part, uint8_t remove_self_cycles, bool squish_hyperedges) const {
-            if (part.size() != node_count_)
-                throw std::runtime_error("Partition size mismatch");
+            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch");
 
             uint32_t new_nodes = 0;
             for (uint32_t p : part) new_nodes = std::max(new_nodes, p + 1);
@@ -254,7 +291,7 @@ namespace hgraph {
                     }
                 }
             } else {
-                std::unordered_map<uint64_t, float> freq_acc;
+                std::unordered_map<uint64_t, float> weight_acc;
                 std::unordered_map<uint64_t, std::vector<uint32_t>> src_map;
                 std::unordered_map<uint64_t, std::vector<uint32_t>> dst_map;
 
@@ -282,12 +319,12 @@ namespace hgraph {
                     for (auto s : srcp) key ^= std::hash<uint32_t>()(s) + 0x9e3779b97f4a7c15ULL + (key << 6) + (key >> 2);
                     for (auto d : dstp) key ^= std::hash<uint32_t>()(d) + 0x9e3779b97f4a7c15ULL + (key << 6) + (key >> 2);
 
-                    freq_acc[key] += he.weight();
+                    weight_acc[key] += he.weight();
                     src_map[key] = std::vector<uint32_t>(srcp.begin(), srcp.end());;
                     dst_map[key] = std::vector<uint32_t>(dstp.begin(), dstp.end());
                 }
 
-                for (auto& it : freq_acc) {
+                for (auto& it : weight_acc) {
                     uint64_t k = it.first;
                     float w = it.second;
 
