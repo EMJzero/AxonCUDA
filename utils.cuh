@@ -110,22 +110,25 @@ __forceinline__ __device__ T warpExclusiveScan(T val) {
 
 #define DETERMINISTIC_SCORE_NOISE 64u // => adds a +[0, DETERMINISTIC_SCORE_NOISE - 1]/FIXED_POINT_SCALE symmetric noise while calculating pairing scores; set to 0 to disable; keep it a power of 2 otherwise
 
-typedef struct __align__(8) {
-    uint32_t node;
-    uint32_t score;
-} bin;
+template <typename T>
+struct __align__(8) bin {
+    uint32_t payload;
+    T val;
+};
 
-__forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
+template <typename T>
+__forceinline__ __device__ bin<T> warpReduceMax(T val, uint32_t payload) {
+    static_assert(sizeof(T) == 4, "T (val) must be 32-bit");
     #pragma unroll
     for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-        uint32_t other_val = __shfl_xor_sync(0xffffffff, val, offset);
+        T other_val = __shfl_xor_sync(0xffffffff, val, offset);
         uint32_t other_payload = __shfl_xor_sync(0xffffffff, payload, offset);
         if (other_val > val || other_val == val && other_payload > payload) {
             val = other_val;
             payload = other_payload;
         }
     }
-    return {.node = payload, .score = val};
+    return {.payload = payload, .val = val};
 }
 
 // symmetric and deterministic pseudo-random hash
@@ -226,6 +229,8 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* __restrict__ s, uin
 
 // USED BY: fm refinement kernel
 
+#define REFINE_REPEATS 32u // repetitions of FM refinement per uncoarsening level
+
 #define PART_HIST_SIZE 64u // best if it is a multiple of WARP_SIZE, best if partitions_per_thread * WARP_SIZE <= num_partitions
 
 
@@ -234,11 +239,43 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* __restrict__ s, uin
 // valid values filtering functor
 struct masked_twin_value_functor {
     const float* value;
-    const uint32_t* valid_1;
-    const uint32_t* valid_2;
+    const int32_t* valid_1;
+    const int32_t* valid_2;
     __host__ __device__ float operator()(uint32_t i) const { return valid_1[i] == 0 && valid_2[i] == 0 ? value[i] : -FLT_MAX; }
 };
 
+// valid values filtering functor - one validity entry only
+struct masked_value_functor {
+    const float* value;
+    const int32_t* valid;
+    __host__ __device__ float operator()(uint32_t i) const { return valid[i] == 0 ? value[i] : -FLT_MAX; }
+};
+
+// custom comparison logic between size and inbound events
+struct best_move_functor {
+    const float* gain;
+    const int32_t* valid_moves;
+    const int32_t* inbound_valid_moves;
+    __host__ __device__ bool operator()(uint32_t a, uint32_t b) const { // return true -> choose b
+        // satisfying the inbound constraint is mandatory
+        const bool a_inbound_ok = (inbound_valid_moves[a] == 0);
+        const bool b_inbound_ok = (inbound_valid_moves[b] == 0);
+        // if only one is valid, choose it
+        if (a_inbound_ok != b_inbound_ok) return b_inbound_ok;
+        // if neither is valid, keep the earlier one
+        if (!a_inbound_ok && !b_inbound_ok) return a > b;
+        // minimize size constraint violations
+        const int32_t va = valid_moves[a];
+        const int32_t vb = valid_moves[b];
+        if (va != vb) return va > vb; // fewer violations wins
+        // maximize gain
+        const float sa = gain[a];
+        const float sb = gain[b];
+        if (sa != sb) return sa < sb;
+        // tie, earlier index wins
+        return a > b;
+    }
+};
 
 // USED BY: final small partitions merging
 
@@ -256,6 +293,16 @@ struct constraints_state {
 
 #define HASH_EMPTY 0xFFFFFFFFu
 #define MAX_HASH_PROBE_LENGTH 32u
+
+// simple 64-bit hash, should be good enough for a small shared-memory hash-set
+__device__ __forceinline__ uint64_t hash_uint64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
 
 // simple 32-bit hash, should be good enough for a small shared-memory hash-set
 __device__ __forceinline__ uint32_t hash_uint32(uint32_t x) {

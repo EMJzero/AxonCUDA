@@ -11,7 +11,7 @@ NVCCFLAGS   := -O1 --std=c++20 -arch=native -dc -allow-unsupported-compiler --ex
 LINKFLAGS   := --std=c++20 -arch=native -allow-unsupported-compiler --extended-lambda
 
 SRC_CPPS    := #main.cpp
-SRC_CUS     := main.cu kernel.cu
+SRC_CUS     := main.cu kernel.cu chaining.cu
 
 OBJ_CPPS    := $(SRC_CPPS:.cpp=.o)
 OBJ_CUS     := $(SRC_CUS:.cu=.o)
