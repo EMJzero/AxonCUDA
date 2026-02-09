@@ -33,6 +33,40 @@ For convenience, we discuss algorithmic complexity using the following variables
 - $h$ : average connections per node (node degree), $(\sum_{v \in V} |\{(s, D) \in E | v = s \vee v \in D\}|) / |V| = e \cdot d / n$
 - $p$ : number of achieved partitions, $|P|$
 
+# Hypergraph Partitioning Metrics
+
+Let $G = (N, E, \omega)$ be a hypergraph with $N$ nodes and $E \subseteq \mathcal{P}(N)$ hyperedges each with weight $\omega(e)$, where $\omega : E \rightarrow \mathbb{R}$.
+Let $P \subseteq \mathcal{P}(N)$ a partition of $N$.
+For a hyperedge $e \in E$, define its **connectivity** as
+$$
+\lambda(e) = \left|\{\, i \mid e \cap V_i \neq \emptyset \,\}\right|.
+$$
+Then a partition's quality metrics are:
+
+**Cut Size (Hyperedge Cut)**  
+Counts the number of hyperedges that span more than one block:
+$$
+\text{CutSize} = \sum_{e \in E} \omega(e) \cdot \mathbf{1}\{\lambda(e) > 1\}.
+$$
+
+---
+
+**km1 (Connectivity–1)**  
+Sums the excess connectivity of each hyperedge:
+$$
+\text{km1} = \sum_{e \in E} \omega(e) \cdot \bigl(\lambda(e) - 1\bigr).
+$$
+
+---
+
+**SOED (Sum of External Degrees)**  
+Weights excess connectivity by hyperedge size:
+$$
+\text{SOED} = \sum_{e \in E} \omega(e) \cdot |e| \cdot \bigl(\lambda(e) - 1\bigr),
+$$
+where $|e|$ is the number of nodes in hyperedge $e$.
+
+
 # Some Terminology
 
 - *in-isolation*: gain calculated for a move applied by itself

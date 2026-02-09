@@ -26,12 +26,6 @@ using dim_t = unsigned long long; // aka uint64_t
 
 #define SMALL_PART_MERGE_SIZE_THRESHOLD 15 // number of nodes below which partitions are considered "small" and an attempt is done at merging them with one-another
 
-#define KWAY_INIT_UPPER_THREASHOLD 2500 // number of coarse nodes below which to run the initial partitioning algorithm (KWAY model only)
-#define KWAY_INIT_LOWER_THREASHOLD 800 // number of coarse nodes below which to undo the last coarsening round and run the initial partitioning algorithm (KWAY model only)
-#define KWAY_INIT_SHRINK_RATIO_LIMIT 0.95f // coarsening ratio between levels above which to run the initial partitioning algorithm (KWAY model only)
-
-#define INIT_SEED 86 // seed for random initialization (KWAY mode only)
-
 // NOTE: everything tagged as "wrp" or "warp" assumes that all lanes are active, unless otherwise specified!
 
 // initialize memory for a block of threads: one consecutive chunk per warp

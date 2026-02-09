@@ -1,5 +1,4 @@
 #include <stdint.h>
-#include <algorithm>
 
 #include </home/mronzani/cuda/include/cuda_runtime.h>
 
@@ -8,7 +7,6 @@
 #include </home/mronzani/cuda/include/thrust/sort.h>
 #include </home/mronzani/cuda/include/thrust/sequence.h>
 #include </home/mronzani/cuda/include/thrust/iterator/zip_iterator.h>
-#include </home/mronzani/cuda/include/thrust/iterator/counting_iterator.h>
 #include </home/mronzani/cuda/include/thrust/tuple.h>
 #include </home/mronzani/cuda/include/thrust/gather.h>
 #include </home/mronzani/cuda/include/thrust/scatter.h>
@@ -16,7 +14,6 @@
 #include </home/mronzani/cuda/include/thrust/transform.h>
 #include </home/mronzani/cuda/include/thrust/binary_search.h>
 #include </home/mronzani/cuda/include/thrust/copy.h>
-#include </home/mronzani/cuda/include/thrust/functional.h>
 
 #include "utils.cuh"
 
@@ -312,10 +309,6 @@ void scatter_sequence_idx(
 // WARNING: NOT DETERMINISTIC
 // !!!!!!!!!!!!!!!!!!!!!!!!!!
 
-// Given a set of src->dst pairs, each with a size and a weight, try to construct
-// subsequences of pairs with similar size and highest total weight such that each's dst is
-// the src of the next pair, stopping upon forming a cycle. The concatenation of subsequences
-// by descending weight is then the final sequence returned.
 void chaining(
     const uint32_t* srcs,
     const uint32_t* dsts,
@@ -350,17 +343,17 @@ void chaining(
     thrust::sequence(exec, d_orig.begin(), d_orig.end());
 
     // sort edges by (src, -weight) so OUT[v] is a contiguous range and heavier edges come first
-    thrust::device_vector<SrcNegWKey> t_keys(n);
+    thrust::device_vector<SrcNegWKey> d_keys(n);
     build_src_keys<<<blocks, threads, 0, stream>>>(
         n,
         thrust::raw_pointer_cast(d_src.data()),
         thrust::raw_pointer_cast(d_w.data()),
-        thrust::raw_pointer_cast(t_keys.data())
+        thrust::raw_pointer_cast(d_keys.data())
     );
 
     auto zipped = thrust::make_zip_iterator(thrust::make_tuple(d_src.begin(), d_dst.begin(), d_size.begin(), d_w.begin(), d_orig.begin()));
 
-    thrust::sort_by_key(exec, t_keys.begin(), t_keys.end(), zipped, SrcNegWLess());
+    thrust::sort_by_key(exec, d_keys.begin(), d_keys.end(), zipped, SrcNegWLess());
 
     // for each edge i, its outgoing candidate list is OUT[dst[i]] = edges whose src == dst[i]
     thrust::device_vector<int> d_out_begin(n), d_out_end(n);
@@ -507,119 +500,4 @@ void chaining(
         thrust::raw_pointer_cast(d_orig.data()),
         sequence_idx
     );
-}
-
-// try to pair k-th smallest with k-th largest in parallel
-__global__
-void pair_kth_smallest_with_kth_largest(
-    const uint32_t* __restrict__ sorted_indices, // length = K
-    uint32_t K,
-    const uint32_t* __restrict__ d_nodes_sizes,
-    const uint32_t* __restrict__ d_inbound_count,
-    uint32_t h_max_nodes_per_part,
-    uint32_t h_max_inbound_per_part,
-    uint32_t* __restrict__ d_groups
-) {
-    uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t half = K / 2;
-    if (k >= half) return;
-
-    uint32_t idxL = sorted_indices[k];
-    uint32_t idxR = sorted_indices[K - 1 - k];
-
-    // Read sizes and inbound counts
-    uint32_t sL = d_nodes_sizes[idxL];
-    uint32_t sR = d_nodes_sizes[idxR];
-
-    // quickly check sizes constraint
-    if ((uint64_t)sL + (uint64_t)sR >= (uint64_t)h_max_nodes_per_part) return;
-
-    uint32_t inL = d_inbound_count[idxL];
-    uint32_t inR = d_inbound_count[idxR];
-
-    if ((uint64_t)inL + (uint64_t)inR >= (uint64_t)h_max_inbound_per_part) return;
-
-    // both constraints satisfied — write group id
-    uint32_t gid = (idxL < idxR) ? idxL : idxR;
-    d_groups[idxL] = gid;
-    d_groups[idxR] = gid;
-}
-
-// ================================================================
-// d_nodes_sizes, d_inbound_count, d_pairs, d_groups are device pointers
-// h_max_nodes_per_part, h_max_inbound_per_part are the constraints
-// NOTE: d_groups should be pre-initialized; this routine writes group ids for paired nodes only.
-// ================================================================
-
-// Given a set of pairs proposed between nodes (d_pairs), isolate nodes without a pair,
-// try to force them into a pair with another node in the same condition such that their
-// combined size and inbound set cardinality are within constraints. The objective is an
-// almost-maximal number of formed pairs.
-void build_orphan_pairs(
-    const uint32_t* d_nodes_sizes,
-    const uint32_t* d_inbound_count,
-    const uint32_t* d_pairs,
-    const uint32_t curr_num_nodes,
-    const uint32_t h_max_nodes_per_part,
-    const uint32_t h_max_inbound_per_part,
-    uint32_t* d_groups
-) {
-    thrust::device_ptr<const uint32_t> t_pairs(d_pairs);
-
-    // gather indices i where d_pairs[i] == UINT32_MAX
-    thrust::device_vector<uint32_t> t_free_indices(curr_num_nodes);
-
-    auto idx_begin = thrust::counting_iterator<uint32_t>(0);
-    auto idx_end = thrust::counting_iterator<uint32_t>(curr_num_nodes);
-
-    // copy_if from 0..curr_num_nodes into t_free_indices
-    auto out_it = thrust::copy_if(
-        idx_begin, idx_end,
-        t_free_indices.begin(),
-        [t_pairs] __device__ (uint32_t i) {
-            return t_pairs[i] == UINT32_MAX;
-        }
-    );
-
-    uint32_t num_free = (uint32_t)(out_it - t_free_indices.begin());
-    if (num_free < 2) return; // nothing to do 
-
-    // resize the vector to actual size
-    t_free_indices.resize(num_free);
-
-    // build 64-bit keys = (nodes_size << 32) | index for deterministic sort by size then index
-    thrust::device_vector<uint64_t> t_keys(num_free);
-
-    // transform each free index to key
-    thrust::transform(
-        t_free_indices.begin(), t_free_indices.end(),
-        t_keys.begin(),
-        [d_nodes_sizes] __device__ (uint32_t idx) -> uint64_t {
-            uint64_t s = (uint64_t)d_nodes_sizes[idx];
-            uint64_t key = (s << 32) | (uint64_t)idx;
-            return key;
-        }
-    );
-
-    // sort-by-key (ascending by size then index) while permuting index array
-    thrust::sort_by_key(t_keys.begin(), t_keys.end(), t_free_indices.begin());
-
-    // at this point t_free_indices[0..num_free-1] is sorted ascending by nodes_size (tie: index)
-    // => launch pairing kernel: each thread pairs k-th smallest with k-th largest
-    const uint32_t threads = 256;
-    uint32_t pairs_to_try = num_free / 2;
-    uint32_t blocks = (pairs_to_try + threads - 1) / threads;
-
-    pair_kth_smallest_with_kth_largest<<<blocks, threads>>>(
-        thrust::raw_pointer_cast(t_free_indices.data()),
-        num_free,
-        d_nodes_sizes,
-        d_inbound_count,
-        h_max_nodes_per_part,
-        h_max_inbound_per_part,
-        d_groups
-    );
-
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
 }

@@ -1552,34 +1552,21 @@ void build_size_events_kernel(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_nodes) return;
 
-    const int32_t size = static_cast<int32_t>(nodes_sizes[tid]);
-    const uint32_t dst_part = moves[tid];
-    const uint32_t rank = ranks[tid];
-    
+    const uint32_t size = nodes_sizes[tid];
+
+    // TODO: create no events when moves[tid] == UINT32_MAX, or set for both the ev_partition to UINT32_MAX
+
     // first event: node leaves its current partition
     const uint32_t e0 = 2 * tid;
+    ev_partition[e0] = partitions[tid];
+    ev_index[e0] = ranks[tid];
+    ev_delta[e0] = -static_cast<int32_t>(size);
+
     // second event: node enters its destination partition
     const uint32_t e1 = e0 + 1;
-    
-    // create no events for invalid moves
-    if (dst_part == UINT32_MAX) {
-        ev_partition[e0] = UINT32_MAX;
-        ev_index[e0] = rank;
-        ev_delta[e0] = 0;
-
-        ev_partition[e1] = UINT32_MAX;
-        ev_index[e1] = rank;
-        ev_delta[e1] = 0;
-        return;
-    }
-
-    ev_partition[e0] = partitions[tid];
-    ev_index[e0] = rank;
-    ev_delta[e0] = -size;
-
-    ev_partition[e1] = dst_part;
-    ev_index[e1] = rank;
-    ev_delta[e1] = size;
+    ev_partition[e1] = moves[tid];
+    ev_index[e1] = ranks[tid];
+    ev_delta[e1] = static_cast<int32_t>(size);
 }
 
 // mark moves that are valid points in the sequence w.r.t. size constraints

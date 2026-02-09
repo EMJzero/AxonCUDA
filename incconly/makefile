@@ -6,12 +6,12 @@ CXX         := g++
 NVCC        := nvcc
 
 # TODO: change to -O3 for the final version, keep -O1 for fast compilation during development
-CXXFLAGS    := -O1 --std=c++20 -Wall -Wextra -fopenmp -I .
-NVCCFLAGS   := -O1 --std=c++20 -arch=native -dc -allow-unsupported-compiler --extended-lambda -Xcompiler "-Wall -Wextra -Wno-maybe-uninitialized -Wno-unused-function -fopenmp" -I .
-LINKFLAGS   := --std=c++20 -arch=native -allow-unsupported-compiler --extended-lambda -lgomp
+CXXFLAGS    := -O1 --std=c++20 -Wall -Wextra -I.
+NVCCFLAGS   := -O1 --std=c++20 -arch=native -dc -allow-unsupported-compiler --extended-lambda -Xcompiler "-Wall -Wextra -Wno-maybe-uninitialized -Wno-unused-function" -I .
+LINKFLAGS   := --std=c++20 -arch=native -allow-unsupported-compiler --extended-lambda
 
 SRC_CPPS    := #main.cpp
-SRC_CUS     := main.cu kernel.cu init_part.cu chaining.cu
+SRC_CUS     := main.cu kernel.cu chaining.cu
 
 OBJ_CPPS    := $(SRC_CPPS:.cpp=.o)
 OBJ_CUS     := $(SRC_CUS:.cu=.o)

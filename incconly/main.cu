@@ -329,20 +329,6 @@ extern __global__ void pack_segments_varsize(
     uint32_t* out
 );
 
-extern std::tuple<uint32_t*, uint32_t*> initial_partitioning(
-    const uint32_t num_nodes,
-    const uint32_t num_hedges,
-    const uint32_t* d_hedges,
-    const dim_t* d_hedges_offsets,
-    const float* d_hedge_weights,
-    const dim_t hedges_size,
-    const uint32_t* d_touching,
-    const dim_t* d_touching_offsets,
-    const uint32_t* d_nodes_sizes,
-    const uint32_t max_parts,
-    const uint32_t h_max_nodes_per_part
-);
-
 extern void chaining(
     const uint32_t *srcs,
     const uint32_t *dsts,
@@ -351,16 +337,6 @@ extern void chaining(
     const uint32_t num,
     uint32_t *sequence_idx,
     cudaStream_t stream = 0
-);
-
-extern void build_orphan_pairs(
-    const uint32_t* d_nodes_sizes,
-    const uint32_t* d_inbound_count,
-    const uint32_t* d_pairs,
-    const uint32_t curr_num_nodes,
-    const uint32_t h_max_nodes_per_part,
-    const uint32_t h_max_inbound_per_part,
-    uint32_t* d_groups
 );
 
 extern __constant__ uint32_t max_nodes_per_part;
@@ -380,14 +356,8 @@ void printHelp() {
         "  -r <file>   Reload hypergraph from file\n"
         "  -s <file>   Save partitioned hypergraph to file\n"
         "  -c <name>   Constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024 - default is loihi64)\n"
-        "  -k <k> <ε>  K-way balanced constraints set to use (overrides '-c')\n"
         "  -h          Show this help\n";
 }
-
-enum class Mode {
-    INCC, // incidence constraints
-    KWAY  // k-way balanced
-};
 
 int main(int argc, char** argv) {
     if (argc == 1) {
@@ -397,10 +367,7 @@ int main(int argc, char** argv) {
 
     std::string load_path;
     std::string save_path;
-    Mode mode = Mode::INCC;
     std::string constraints;
-    uint32_t kway = UINT32_MAX;
-    float epsi = FLT_MAX;
 
     // CLI handling
     for (int i = 1; i < argc; ++i) {
@@ -415,12 +382,6 @@ int main(int argc, char** argv) {
         } else if (arg == "-c") {
             if (i + 1 >= argc) { std::cerr << "Error: -c requires a config name\n"; return 1; }
             constraints = argv[++i];
-            mode = Mode::INCC;
-        } else if (arg == "-k") {
-            if (i + 2 >= argc) { std::cerr << "Error: -k requires values for 'k' and 'ε'\n"; return 1; }
-            kway = std::stoul(argv[++i]);
-            epsi = std::stof(argv[++i]);
-            mode = Mode::KWAY;
         } else { std::cerr << "Unknown option: " << arg << "\n"; return 1; }
     }
 
@@ -472,17 +433,8 @@ int main(int argc, char** argv) {
         { "truenorth", Constraints::createTrueNorth }
     };
     auto constr_it = configurations.find(constraints);
-    if (mode == Mode::KWAY) {
-        ConstraintsConfig constr_config;
-        std::ostringstream epsistr;
-        epsistr << std::fixed << std::setprecision(3) << epsi;
-        constr_config.name = std::to_string(kway) + "-way " + epsistr.str() + " balanced";
-        constr_config.nodes_per_part = (uint32_t)std::ceil((1 + epsi)*(float)hg.nodes()/kway);
-        constr_config.inbound_per_part = INT32_MAX;
-        constr_config.max_parts = kway;
-        constr_tmp = Constraints(constr_config);
-    } else if (constr_it == configurations.end()) {
-        std::cerr << "WARNING, no constraints provided (-c, -k), using loihi64 !!\n";
+    if (constr_it == configurations.end()) {
+        std::cerr << "WARNING, no constraints provided (-c), using loihi64 !!\n";
         constr_tmp = Constraints::createLoihiLarge();
     } else {
         constr_tmp = constr_it->second();
@@ -585,9 +537,6 @@ int main(int argc, char** argv) {
     const uint32_t h_max_inbound_per_part = constr.inboundPerPart();
     const uint32_t max_parts = constr.maxParts(); // not needed in kernels
     const uint32_t target_parts = min(max_parts, (num_nodes + h_max_nodes_per_part - 1) / h_max_nodes_per_part);
-    assert(h_max_nodes_per_part <= INT32_MAX);
-    assert(h_max_inbound_per_part <= INT32_MAX);
-    assert(max_parts <= INT32_MAX);
 
     std::cout << "Starting timer...\n";
     auto time_start = std::chrono::high_resolution_clock::now();
@@ -788,9 +737,7 @@ int main(int argc, char** argv) {
         * 1) coarsen
         *   - propose valid candidate node pairs
         *   - group nodes w.r.t. strongest pairs
-        *   => if groups are less than the threshold
-        *       -> return them as the initial partitions (INCC - inbound constrained case)
-        *       -> run the initial partitioning routine (KWAY - k-way balanced case)
+        *   => if groups are less than the threshold -> return them as the initial partitions
         *   - coarsen all data structures
         * 2) recursive call to the next coarsening level
         *   - returns the coarse partitions
@@ -840,30 +787,6 @@ int main(int argc, char** argv) {
         * - refinement proposes moves that do not violated constraints if applied in isolation
         * - refinement selects the best subsequence of moves that ends on a valid state
         */
-
-        // ======================================
-        // k-way base case, build inital partitioning
-        // => condition: passed the nodes threshold
-        if (mode == Mode::KWAY && curr_num_nodes < KWAY_INIT_UPPER_THREASHOLD) {
-            auto [d_init_partitions, d_init_partitions_sizes] = initial_partitioning(
-                curr_num_nodes,
-                num_hedges,
-                d_hedges,
-                d_hedges_offsets,
-                d_hedge_weights,
-                hedges_size,
-                d_touching,
-                d_touching_offsets,
-                d_nodes_sizes,
-                max_parts,
-                h_max_nodes_per_part // -> rely on 'max_inbound_per_part' on the device for this
-            );
-            d_partitions_sizes = d_init_partitions_sizes;
-            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, num_hedges * max_parts * sizeof(uint32_t))); // hedge * num_partitions + partition -> count of pins of "hedge" in that "partition"
-            CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, max_parts * sizeof(uint32_t))); // TODO: remove, not needed in KWAY mode
-            return std::make_tuple(max_parts, d_init_partitions);
-        }
-        // ======================================
 
         // zero-out candidates kernel's outputs
         // TODO: could just init. up to curr_num_nodes
@@ -981,19 +904,6 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // for nodes that have no candidate and are left alone (no -valid- neighbors), try to pair them up with each other as to create as many groups as possible
-        // => impose the sum of sizes and the sum of inbound set sizes < constraints
-        // => the idea is to try pairs among non-neighbors, therefore the inbound set size intersection can already be taken as empty (hence, sum set sizes)
-        build_orphan_pairs(
-            d_nodes_sizes,
-            d_inbound_count,
-            d_pairs,
-            curr_num_nodes,
-            h_max_nodes_per_part,
-            h_max_inbound_per_part,
-            d_groups
-        );
-
         // order groups kernel (parallel label compression)
         // TODO: custom kernel for this?
         // as of now "d_groups" contains the new non-zero-based group id for every node
@@ -1029,30 +939,6 @@ int main(int argc, char** argv) {
         thrust::scatter(t_headflags.begin(), t_headflags.end(), t_nodes.begin(), t_groups);
         // if the number of groups has reached the required threshold, they become the partitions
         // => now "d_groups[idx]" contains the new zero-based group ID for every node
-
-        // ======================================
-        // k-way base case, build inital partitioning
-        // => condition: too little shrinking to justify further coarsening
-        if (mode == Mode::KWAY && ((float)new_num_nodes / (float)curr_num_nodes > KWAY_INIT_SHRINK_RATIO_LIMIT || new_num_nodes < KWAY_INIT_LOWER_THREASHOLD)) {
-            auto [d_init_partitions, d_init_partitions_sizes] = initial_partitioning(
-                curr_num_nodes,
-                num_hedges,
-                d_hedges,
-                d_hedges_offsets,
-                d_hedge_weights,
-                hedges_size,
-                d_touching,
-                d_touching_offsets,
-                d_nodes_sizes,
-                max_parts,
-                h_max_nodes_per_part // -> rely on 'max_inbound_per_part' on the device for this
-            );
-            d_partitions_sizes = d_init_partitions_sizes;
-            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, num_hedges * max_parts * sizeof(uint32_t))); // hedge * num_partitions + partition -> count of pins of "hedge" in that "partition"
-            CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, max_parts * sizeof(uint32_t))); // TODO: remove, not needed in KWAY mode
-            return std::make_tuple(max_parts, d_init_partitions);
-        }
-        // ======================================
 
         // ======================================
         // base case, return inital partitioning
@@ -2060,44 +1946,42 @@ int main(int argc, char** argv) {
     thrust::device_ptr<uint32_t> t_partitions_sizes(d_partitions_sizes);
     thrust::device_ptr<uint32_t> t_partitions_inbound_sizes(d_partitions_inbound_sizes);
 
-    if (mode == Mode::INCC) {
-        // greedily merge small partitions
-        // => checking inbound constraints w/out deduping, with a straight sum, to make it fast
-        thrust::device_vector<uint32_t> t_part_index(num_partitions);
-        thrust::sequence(t_part_index.begin(), t_part_index.end());
-        // extract small partitions (size < K)
-        thrust::device_vector<uint32_t> t_small_parts(num_partitions);
-        auto small_end = thrust::copy_if(t_part_index.begin(), t_part_index.end(), t_small_parts.begin(), [=] __host__ __device__ (uint32_t p) { return t_partitions_sizes[p] < SMALL_PART_MERGE_SIZE_THRESHOLD; });
-        t_small_parts.resize(small_end - t_small_parts.begin());
-        uint32_t smallest_part_size = thrust::reduce(t_partitions_sizes, t_partitions_sizes + num_partitions, UINT32_MAX, thrust::minimum<uint32_t>());
-        std::cout << "Smallest partition size: " << smallest_part_size << "\n";
-        if (!t_small_parts.empty()) {
-            std::cout << "Partitions compression over " << t_small_parts.size() << " partitions ...\n";
-            // stable sort small partitions with key (size, inbound, id)
-            thrust::stable_sort(t_small_parts.begin(), t_small_parts.end(), [=] __host__ __device__ (uint32_t a, uint32_t b) { uint32_t sa = t_partitions_sizes[a]; uint32_t sb = t_partitions_sizes[b]; if (sa != sb) return sa < sb; uint32_t ia = t_partitions_inbound_sizes[a]; uint32_t ib = t_partitions_inbound_sizes[b]; if (ia != ib) return ia < ib; return a < b; });
-            // greedy grouping scan for constraints
-            thrust::device_vector<constraints_state> t_constraints_states(t_small_parts.size());
-            thrust::transform(t_small_parts.begin(), t_small_parts.end(), t_constraints_states.begin(), [=] __host__ __device__ (uint32_t p) { return constraints_state{ t_partitions_sizes[p], t_partitions_inbound_sizes[p], 0u }; });
-            thrust::inclusive_scan(t_constraints_states.begin(), t_constraints_states.end(), t_constraints_states.begin(), [=] __host__ __device__ (const constraints_state& a, const constraints_state& b) { if (a.s + b.s <= h_max_nodes_per_part && a.i + b.i <= h_max_inbound_per_part) return constraints_state{ a.s + b.s, a.i + b.i, a.g }; return constraints_state{ b.s, b.i, a.g + 1 }; });
-            // get the id of each node of a group
-            thrust::device_vector<uint32_t> t_groups(t_constraints_states.size());
-            thrust::transform(t_constraints_states.begin(), t_constraints_states.end(), t_groups.begin(), [] __host__ __device__ (const constraints_state& s) { return s.g; });
-            // map groups to a representative partition id (lowest id in the group); groups are already contiguous, a single reduce-by-key is enough
-            thrust::device_vector<uint32_t> t_rep_ids(t_groups.size());
-            auto rep_end = thrust::reduce_by_key(t_groups.begin(), t_groups.end(), t_small_parts.begin(), thrust::make_discard_iterator(), t_rep_ids.begin(), thrust::equal_to<uint32_t>(), thrust::minimum<uint32_t>());
-            t_rep_ids.resize(rep_end.second - t_rep_ids.begin());
-            // build the map from partition id to the representative node
-            thrust::device_vector<uint32_t> pid_map(num_partitions);
-            thrust::sequence(pid_map.begin(), pid_map.end());
-            thrust::device_vector<uint32_t> new_pids(t_small_parts.size());
-            thrust::gather(t_groups.begin(), t_groups.end(), t_rep_ids.begin(), new_pids.begin());
-            thrust::scatter(new_pids.begin(), new_pids.end(), t_small_parts.begin(), pid_map.begin());
-            // update partitions
-            uint32_t* pid_map_ptr = thrust::raw_pointer_cast(pid_map.data());
-            thrust::transform(t_partitions, t_partitions + num_nodes, t_partitions, [pid_map_ptr] __host__ __device__ (uint32_t p) { return pid_map_ptr[p]; });
-        } else
-            std::cout << "Partitions compression not performed ...\n";
-    }
+    // greedily merge small partitions
+    // => checking inbound constraints w/out deduping, with a straight sum, to make it fast
+    thrust::device_vector<uint32_t> t_part_index(num_partitions);
+    thrust::sequence(t_part_index.begin(), t_part_index.end());
+    // extract small partitions (size < K)
+    thrust::device_vector<uint32_t> t_small_parts(num_partitions);
+    auto small_end = thrust::copy_if(t_part_index.begin(), t_part_index.end(), t_small_parts.begin(), [=] __host__ __device__ (uint32_t p) { return t_partitions_sizes[p] < SMALL_PART_MERGE_SIZE_THRESHOLD; });
+    t_small_parts.resize(small_end - t_small_parts.begin());
+    uint32_t smallest_part_size = thrust::reduce(t_partitions_sizes, t_partitions_sizes + num_partitions, UINT32_MAX, thrust::minimum<uint32_t>());
+    std::cout << "Smallest partition size: " << smallest_part_size << "\n";
+    if (!t_small_parts.empty()) {
+        std::cout << "Partitions compression over " << t_small_parts.size() << " partitions ...\n";
+        // stable sort small partitions with key (size, inbound, id)
+        thrust::stable_sort(t_small_parts.begin(), t_small_parts.end(), [=] __host__ __device__ (uint32_t a, uint32_t b) { uint32_t sa = t_partitions_sizes[a]; uint32_t sb = t_partitions_sizes[b]; if (sa != sb) return sa < sb; uint32_t ia = t_partitions_inbound_sizes[a]; uint32_t ib = t_partitions_inbound_sizes[b]; if (ia != ib) return ia < ib; return a < b; });
+        // greedy grouping scan for constraints
+        thrust::device_vector<constraints_state> t_constraints_states(t_small_parts.size());
+        thrust::transform(t_small_parts.begin(), t_small_parts.end(), t_constraints_states.begin(), [=] __host__ __device__ (uint32_t p) { return constraints_state{ t_partitions_sizes[p], t_partitions_inbound_sizes[p], 0u }; });
+        thrust::inclusive_scan(t_constraints_states.begin(), t_constraints_states.end(), t_constraints_states.begin(), [=] __host__ __device__ (const constraints_state& a, const constraints_state& b) { if (a.s + b.s <= h_max_nodes_per_part && a.i + b.i <= h_max_inbound_per_part) return constraints_state{ a.s + b.s, a.i + b.i, a.g }; return constraints_state{ b.s, b.i, a.g + 1 }; });
+        // get the id of each node of a group
+        thrust::device_vector<uint32_t> t_groups(t_constraints_states.size());
+        thrust::transform(t_constraints_states.begin(), t_constraints_states.end(), t_groups.begin(), [] __host__ __device__ (const constraints_state& s) { return s.g; });
+        // map groups to a representative partition id (lowest id in the group); groups are already contiguous, a single reduce-by-key is enough
+        thrust::device_vector<uint32_t> t_rep_ids(t_groups.size());
+        auto rep_end = thrust::reduce_by_key(t_groups.begin(), t_groups.end(), t_small_parts.begin(), thrust::make_discard_iterator(), t_rep_ids.begin(), thrust::equal_to<uint32_t>(), thrust::minimum<uint32_t>());
+        t_rep_ids.resize(rep_end.second - t_rep_ids.begin());
+        // build the map from partition id to the representative node
+        thrust::device_vector<uint32_t> pid_map(num_partitions);
+        thrust::sequence(pid_map.begin(), pid_map.end());
+        thrust::device_vector<uint32_t> new_pids(t_small_parts.size());
+        thrust::gather(t_groups.begin(), t_groups.end(), t_rep_ids.begin(), new_pids.begin());
+        thrust::scatter(new_pids.begin(), new_pids.end(), t_small_parts.begin(), pid_map.begin());
+        // update partitions
+        uint32_t* pid_map_ptr = thrust::raw_pointer_cast(pid_map.data());
+        thrust::transform(t_partitions, t_partitions + num_nodes, t_partitions, [pid_map_ptr] __host__ __device__ (uint32_t p) { return pid_map_ptr[p]; });
+    } else
+        std::cout << "Partitions compression not performed ...\n";
 
     // make d_partitions zero-based again, if we emptied some partitions... (same logic as that used for d_groups)
     thrust::device_vector<uint32_t> t_indices(num_nodes);
