@@ -1475,13 +1475,15 @@ void fm_refinement_cascade_kernel(
         // gain the hedge's weight iff moving would disconnect the hedge from my partition (I am its last pin left there)
         //if (my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta) == 1)
         //    score += my_hedge_weight;
-        // VARIANT: give a little push to nodes leaving a partition with not just one, but few pins left for an hedge
-        const uint32_t my_true_part_counter = my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta);
-        if (my_true_part_counter >= 1)
-            score += my_hedge_weight / (my_true_part_counter * my_true_part_counter);
         // pay the hedge's weight iff moving there connects the hedge to the new partition (I would become its first pin there)
         if (my_move_part_counter + warpReduceSumLN0<int32_t>(my_move_part_counter_delta) == 0)
             score -= my_hedge_weight;
+        // VARIANT: give a little push to nodes leaving a partition with not just one, but few pins left for an hedge
+        const uint32_t true_curr_part_counter = my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta);
+        if (true_curr_part_counter >= 1)
+            score += my_hedge_weight / (true_curr_part_counter * true_curr_part_counter);
+        //const uint32_t true_move_part_counter = my_move_part_counter + warpReduceSumLN0<int32_t>(my_move_part_counter_delta);
+        //score -= my_hedge_weight / ((true_move_part_counter + 1) * (true_move_part_counter + 1));
     }
 
     if (lane_id == 0)

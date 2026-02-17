@@ -343,6 +343,19 @@ extern std::tuple<uint32_t*, uint32_t*> initial_partitioning(
     const uint32_t h_max_nodes_per_part
 );
 
+extern std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
+    const uint32_t num_nodes,
+    const uint32_t num_hedges,
+    const uint32_t* d_hedges,
+    const dim_t* d_hedges_offsets,
+    const float* d_hedge_weights,
+    const dim_t hedges_size,
+    const uint32_t* d_nodes_sizes,
+    const uint32_t k,
+    const float epsilon,
+    const uint32_t h_max_nodes_per_part
+);
+
 extern void chaining(
     const uint32_t *srcs,
     const uint32_t *dsts,
@@ -505,7 +518,7 @@ int main(int argc, char** argv) {
     std::cout << "  Found " << device_cnt << " devices: using device " << DEVICE_ID << "\n";
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, DEVICE_ID);
-    std::cout << "  Dev. name " << props.name << "\n";
+    std::cout << "  Device name: " << props.name << "\n";
     std::cout << "  Available VRAM: " << std::fixed << std::setprecision(1) << (float)(props.totalGlobalMem) / (1 << 30) << " GB\n";
     std::cout << "  Shared mem. per block: " << std::fixed << std::setprecision(1) << (float)(props.sharedMemPerBlock) / (1 << 10) << " KB\n";
     std::cout << "  Max. grid size: " << props.maxGridSize[0] << " x " << props.maxGridSize[1] << " x " << props.maxGridSize[2] << "\n";
@@ -845,7 +858,7 @@ int main(int argc, char** argv) {
         // k-way base case, build inital partitioning
         // => condition: passed the nodes threshold
         if (mode == Mode::KWAY && curr_num_nodes < KWAY_INIT_UPPER_THREASHOLD) {
-            auto [d_init_partitions, d_init_partitions_sizes] = initial_partitioning(
+            /*auto [d_init_partitions, d_init_partitions_sizes] = initial_partitioning(
                 curr_num_nodes,
                 num_hedges,
                 d_hedges,
@@ -857,6 +870,18 @@ int main(int argc, char** argv) {
                 d_nodes_sizes,
                 max_parts,
                 h_max_nodes_per_part // -> rely on 'max_inbound_per_part' on the device for this
+            );*/
+            auto [d_init_partitions, d_init_partitions_sizes] = initial_partitioning_kahypar(
+                curr_num_nodes,
+                num_hedges,
+                d_hedges,
+                d_hedges_offsets,
+                d_hedge_weights,
+                hedges_size,
+                d_nodes_sizes,
+                kway,
+                epsi,
+                h_max_nodes_per_part
             );
             d_partitions_sizes = d_init_partitions_sizes;
             CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, num_hedges * max_parts * sizeof(uint32_t))); // hedge * num_partitions + partition -> count of pins of "hedge" in that "partition"
@@ -1034,7 +1059,7 @@ int main(int argc, char** argv) {
         // k-way base case, build inital partitioning
         // => condition: too little shrinking to justify further coarsening
         if (mode == Mode::KWAY && ((float)new_num_nodes / (float)curr_num_nodes > KWAY_INIT_SHRINK_RATIO_LIMIT || new_num_nodes < KWAY_INIT_LOWER_THREASHOLD)) {
-            auto [d_init_partitions, d_init_partitions_sizes] = initial_partitioning(
+            /*auto [d_init_partitions, d_init_partitions_sizes] = initial_partitioning(
                 curr_num_nodes,
                 num_hedges,
                 d_hedges,
@@ -1046,6 +1071,18 @@ int main(int argc, char** argv) {
                 d_nodes_sizes,
                 max_parts,
                 h_max_nodes_per_part // -> rely on 'max_inbound_per_part' on the device for this
+            );*/
+            auto [d_init_partitions, d_init_partitions_sizes] = initial_partitioning_kahypar(
+                curr_num_nodes,
+                num_hedges,
+                d_hedges,
+                d_hedges_offsets,
+                d_hedge_weights,
+                hedges_size,
+                d_nodes_sizes,
+                kway,
+                epsi,
+                h_max_nodes_per_part
             );
             d_partitions_sizes = d_init_partitions_sizes;
             CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, num_hedges * max_parts * sizeof(uint32_t))); // hedge * num_partitions + partition -> count of pins of "hedge" in that "partition"
@@ -2194,6 +2231,7 @@ int main(int argc, char** argv) {
         std::cout << "  Total pins:    " << partitioned_hg.hedgesFlat().size() << "\n";
         std::cout << "  Cut-net:       " << partitioned_hg.cutnet() << "\n";
         std::cout << "  Connectivity:  " << partitioned_hg.connectivity() << "\n";
+        std::cout << "  SOED:          " << hg.soedFromPart(partitions) << "\n";
         std::cout << "  Hedge overlap: " << std::fixed << std::setprecision(3) << hedge_overlap.ar_mean << " ar. mean, " << hedge_overlap.geo_mean << " geo. mean\n";
         //if (dbg_conn != partitioned_hg.connectivity()) std::cerr << "ERROR, incorrect metric calculation for connectivity: " << dbg_conn << " vs " << partitioned_hg.connectivity() << " !!\n";
         //if (dbg_cutn != partitioned_hg.cutnet()) std::cerr << "ERROR, incorrect metric calculation for cut-net: " << dbg_cutn << " vs " << partitioned_hg.cutnet() << " !!\n";

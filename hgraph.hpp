@@ -245,6 +245,19 @@ namespace hgraph {
             return total;
         }
 
+        // => sum of external degrees (can only be computed from a given permutation)
+        float soedFromPart(const std::vector<uint32_t>& part) const {
+            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch");
+            float total = 0.0f;
+            for (auto& he : hedges_) {
+                std::set<uint32_t> parts;
+                for (uint32_t node : he.nodes())
+                    parts.insert(part[node]);
+                total += he.weight()*(parts.size() - 1)*he.length();
+            }
+            return total;
+        }
+
         // remove_self_cycles can be:
         // 0 : do not remove
         // 1 : remove the source of the cycle
@@ -936,7 +949,7 @@ namespace hgraph {
         }
 
         // HP: export undirected hyperedge, no vertex weights, only on hypredges
-        void savehMETIS(const std::string& path) const {
+        void savehMETIS(const std::string& path, const float fixed_point_weights_scale = 1024.0f) const {
             std::ofstream f(path);
             if (!f) throw std::runtime_error("Cannot open output .hgr file");
 
@@ -953,14 +966,14 @@ namespace hgraph {
 
             // header
             if (emit_weights)
-                f << E << " " << V << " 1\n";
+                f << E << " " << V << " 01\n";
             else
                 f << E << " " << V << "\n";
 
             // hyperedges
             for (const auto& he : hedges_) {
                 if (emit_weights)
-                    f << static_cast<uint32_t>(std::round(he.weight())) << " ";
+                    f << static_cast<uint32_t>(he.weight() * fixed_point_weights_scale) << " ";
 
                 // write all pins (sources first, then destinations)
                 for (uint32_t i = 0; i < he.length(); ++i) {

@@ -4,6 +4,9 @@ Installed CUDA (driverless) from https://developer.nvidia.com/cuda-downloads?tar
 Did first `wget https://developer.download.nvidia.com/compute/cuda/12.4.0/local_installers/cuda_12.4.0_550.54.14_linux.run`.
 Then `sh cuda_<version>_linux.run --silent --toolkit --override --installpath=$HOME/cuda`.
 
+If using Mt-KaHyPar for the initial partitioning, install it from here and make sure `mtkahypar` is a valid shell executable/command:
+https://github.com/kahypar/mt-kahypar.git
+
 ## Requirements
 
 Tested with:

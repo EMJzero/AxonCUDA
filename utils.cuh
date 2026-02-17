@@ -156,7 +156,7 @@ __device__ __forceinline__ uint32_t deterministic_noise(uint32_t a, uint32_t b) 
 
 #define MAX_GROUP_SIZE 1u // => MAX_GROUP_SIZE - 1 slots per node; 2 means pairs
 #define PATH_SIZE 192u // initial slots for nodes to see while traversing the pairs tree, TODO: automatically extend if needed (costly...)
-#define MAX_REPEATS 4u // maximum number of nodes a single thread can handle, must be less than 32 (due to using one-hot anti-repeat encoding)
+#define MAX_REPEATS 64u // maximum number of nodes a single thread can handle, must be less than 32 (due to using one-hot anti-repeat encoding)
 
 typedef struct __align__(8) {
     uint32_t id; // lower 32 bits (Nvidia GPUs are little-endian)
