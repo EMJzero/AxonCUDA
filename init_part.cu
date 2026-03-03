@@ -14,21 +14,24 @@
 #include <optional>
 #include <algorithm>
 #include <filesystem>
+#include <unordered_map>
 
-#include </home/mronzani/cuda/include/cuda_runtime.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
 
-#include </home/mronzani/cuda/include/thrust/sort.h>
-#include </home/mronzani/cuda/include/thrust/scan.h>
-#include </home/mronzani/cuda/include/thrust/gather.h>
-#include </home/mronzani/cuda/include/thrust/scatter.h>
-#include </home/mronzani/cuda/include/thrust/sequence.h>
-#include </home/mronzani/cuda/include/thrust/transform.h>
-#include </home/mronzani/cuda/include/thrust/device_ptr.h>
-#include </home/mronzani/cuda/include/thrust/device_vector.h>
-#include </home/mronzani/cuda/include/thrust/iterator/discard_iterator.h>
-#include </home/mronzani/cuda/include/thrust/iterator/permutation_iterator.h>
+#include <thrust/sort.h>
+#include <thrust/scan.h>
+#include <thrust/reduce.h>
+#include <thrust/gather.h>
+#include <thrust/scatter.h>
+#include <thrust/sequence.h>
+#include <thrust/transform.h>
+#include <thrust/device_ptr.h>
+#include <thrust/device_vector.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/iterator/permutation_iterator.h>
 
-#include </home/mronzani/cuda/include/cub/cub.cuh>
+#include <cub/cub.cuh>
 
 #include <omp.h>
 
@@ -324,7 +327,75 @@ void fm_refinement_apply_update_kernel(
     if (threadIdx.x == 0) atomicXor((unsigned long long*)partitions_hash, (unsigned long long)blk_partitions_hash);
 }
 
-// find the best move of each node from its partition to another
+// compute for each hedge a score proportional to how "rare" are its nodes:
+// score(e) = w(e) / (\sum_{n \in e} 1/deg(n))
+// SEQUENTIAL COMPLEXITY: e*d
+// PARALLEL OVER: e
+// WARPS OVER: d
+__global__
+void armonic_degree_score_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ touching_offsets,
+    const float* __restrict__ hedge_weights,
+    const uint32_t num_hedges,
+    float* __restrict__ hedge_ratio
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the hedge to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    const dim_t hedge_start_idx = hedges_offsets[warp_id], hedge_end_idx = hedges_offsets[warp_id + 1];
+    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
+
+    float score = 0.0f;
+
+    for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_end; curr += WARP_SIZE) {
+        const uint32_t pin = *curr;
+        const uint32_t deg = touching_offsets[pin + 1] - touching_offsets[pin];
+        score += 1/(float)deg;
+    }
+
+    score = warpReduceSumLN0<float>(score);
+    
+    if (lane_id == 0)
+        hedge_ratio[warp_id] = hedge_weights[warp_id] / score;
+        //hedge_score[warp_id] = 1/score;
+}
+
+// flag each hedge as 'keep' or 'prune' with a probability conditioned on its weight and score
+// SEQUENTIAL COMPLEXITY: e
+// PARALLEL OVER: e
+__global__
+void prune_hedges_kernel(
+    const float* __restrict__ hedge_weights,
+    const float* __restrict__ hedge_ratio,
+    const uint32_t num_hedges,
+    const float threshold,
+    const uint32_t seed,
+    float* __restrict__ hedge_scaled_weights,
+    uint8_t* __restrict__ keep
+) {
+    // STYLE: one hedge per thread!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_hedges) return;
+
+    // probability of keeping the hedge: p(e) = min(1, threshold * w(e) / score(e))
+
+    const float keep_prob = min(1.0f, threshold * hedge_ratio[tid]);
+
+    // sample random float in (0, 1]
+    curandStatePhilox4_32_10_t state;
+    curand_init(seed, tid, 0, &state);
+    const float rand = curand_uniform(&state);
+
+    keep[tid] = keep_prob >= rand;
+    hedge_scaled_weights[tid] = hedge_weights[tid] / keep_prob; // rescale weights (lower probability -> higher weight)
+}
+
+// quickly compute the connectivity resulting from a given partitioning
 // SEQUENTIAL COMPLEXITY: e*p
 // PARALLEL OVER: e
 __global__
@@ -335,7 +406,7 @@ void compute_connectivity_kernel(
     const uint32_t num_partitions,
     float* __restrict__ connectivity // connectivity[idx] -> total cut cost paid by the idx-th group of block-size hedges
 ) {
-    // STYLE: one node (move) per thread!
+    // STYLE: one hedge per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_hedges) return;
 
@@ -1131,6 +1202,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     const uint32_t* d_hedges,
     const dim_t* d_hedges_offsets,
     const float* d_hedge_weights,
+    const dim_t* d_touching_offsets,
     const dim_t hedges_size,
     const uint32_t* d_nodes_sizes,
     const uint32_t k,
@@ -1139,14 +1211,75 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
 ) {
     std::cout << "Building initial partitioning via Mt-KaHyPar, remaining nodes=" << num_nodes << ", remaining pins=" << hedges_size << "\n";
     
+    // target: keep n*d hyperedges
+    const uint32_t target_keep_hedges = num_nodes * (hedges_size / num_hedges);
+
+    float *d_hedge_ratio;
+    CUDA_CHECK(cudaMalloc(&d_hedge_ratio, num_hedges * sizeof(float))); // hedge_ratio[hedge idx] -> hedge's weight/score ratio based on the degree of its pins (higher => higher degrees)
+    
+    // launch configuration - armonic score kernel
+    int threads_per_block = 128; // 128/32 -> 4 warps per block
+    int warps_per_block = threads_per_block / WARP_SIZE;
+    int num_warps_needed = num_hedges; // 1 warp per hedge
+    int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+    // launch - armonic score kernel
+    std::cout << "Running armonic score kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    armonic_degree_score_kernel<<<blocks, threads_per_block>>>(
+        d_hedges,
+        d_hedges_offsets,
+        d_touching_offsets,
+        d_hedge_weights,
+        num_hedges,
+        d_hedge_ratio
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // find the total score
+    thrust::device_ptr<float> t_hedge_ratio(d_hedge_ratio);
+    const float total_score = thrust::reduce(t_hedge_ratio, t_hedge_ratio + num_hedges);
+    // with this, the expected number of hedges kept is ~~ target_keep_hedges
+    const float threshold = target_keep_hedges / total_score;
+    
+    uint8_t *d_keep;
+    float *d_hedge_scaled_weights;
+    CUDA_CHECK(cudaMalloc(&d_keep, num_hedges * sizeof(uint8_t))); // keep[hedge idx] -> keep hedge if true
+    CUDA_CHECK(cudaMalloc(&d_hedge_scaled_weights, num_hedges * sizeof(float))); // hedge_scaled_weights[hedge idx] -> new hedge weight scaled by its retention probability
+
+    // launch configuration - prune hedges kernel
+    threads_per_block = 256;
+    int num_threads_needed = num_hedges; // 1 thread per hedge
+    blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+    // launch - prune hedges kernel
+    std::cout << "Running prune hedges kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    prune_hedges_kernel<<<blocks, threads_per_block>>>(
+        d_hedge_weights,
+        d_hedge_ratio,
+        num_hedges,
+        threshold,
+        INIT_SEED,
+        d_hedge_scaled_weights,
+        d_keep
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFree(d_hedge_ratio));
+
+    // TODO: apply the hedge filter (keep) on the DEVICE with a copy-if!
+
+    // copy hgraph to host
     std::vector<uint32_t> h_hedges(hedges_size);
     std::vector<dim_t> h_hedges_offsets(num_hedges + 1);
     std::vector<float> h_hedge_weights(num_hedges);
     std::vector<uint32_t> h_nodes_sizes(num_nodes);
+    std::vector<uint8_t> h_keep(num_hedges);
     CUDA_CHECK(cudaMemcpy(h_hedges.data(), d_hedges, hedges_size * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_hedges_offsets.data(), d_hedges_offsets, (num_hedges + 1) * sizeof(dim_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_hedge_weights.data(), d_hedge_weights, num_hedges * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_hedge_weights.data(), d_hedge_scaled_weights, num_hedges * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_nodes_sizes.data(), d_nodes_sizes, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_keep.data(), d_keep, num_hedges * sizeof(uint8_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_hedge_scaled_weights));
+    CUDA_CHECK(cudaFree(d_keep));
 
     auto time_start = std::chrono::high_resolution_clock::now();
 
@@ -1156,20 +1289,52 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     constexpr int HEADER_WIDTH = 64;
     f_coarse_hg << std::setw(HEADER_WIDTH) << std::left << " " << "\n";
   
-    const bool all_weighs_one = std::all_of(h_hedge_weights.begin(), h_hedge_weights.end(), [](float x) { return x == 1.0f; });
+    struct HedgeView { uint32_t* data; uint32_t size; };
 
-    uint32_t  true_num_hedges = 0u;
+    struct HedgeHash {
+        size_t operator()(const HedgeView& h) const noexcept {
+            size_t x = 1469598103934665603ull;
+            for (uint32_t i = 0; i < h.size; ++i) {
+                x ^= h.data[i];
+                x *= 1099511628211ull;
+            }
+            return x;
+        }
+    };
+
+    struct HedgeEq {
+        bool operator()(const HedgeView& a, const HedgeView& b) const noexcept {
+            if (a.size != b.size) return false;
+            return std::equal(a.data, a.data + a.size, b.data);
+        }
+    };
+
+    std::unordered_map<HedgeView, uint64_t, HedgeHash, HedgeEq> map;
+    map.reserve(num_hedges);
+
+    // deduplicate hedges
     for (uint32_t i = 0; i < num_hedges; i++) {
-        if (h_hedges_offsets[i + 1] - h_hedges_offsets[i] <= 1) continue;
-        f_coarse_hg << (all_weighs_one ? 1 : static_cast<uint32_t>(h_hedge_weights[i] * FIXED_POINT_SCALE)) << " ";
-        for (uint32_t j = h_hedges_offsets[i]; j < h_hedges_offsets[i + 1]; j++) {
-            uint32_t v = h_hedges[j];
-            f_coarse_hg << (v + 1); // convert 0-based -> 1-based idxs
-            if (j + 1 < h_hedges_offsets[i + 1])
+        if (!h_keep[i]) continue;
+        uint32_t begin = h_hedges_offsets[i];
+        uint32_t end = h_hedges_offsets[i + 1];
+        uint32_t sz = end - begin;
+        if (sz <= 1) continue;
+        std::sort(h_hedges.begin() + begin, h_hedges.begin() + end);
+        HedgeView key{ h_hedges.data() + begin, sz };
+        uint64_t w = static_cast<uint32_t>(h_hedge_weights[i] * FIXED_POINT_SCALE);
+        map[key] += w;
+    }
+
+    uint32_t true_num_hedges = 0u;
+    for (auto& [key, weight] : map) {
+        f_coarse_hg << static_cast<uint32_t>(weight) << " ";
+        for (uint32_t j = 0; j < key.size; ++j) {
+            f_coarse_hg << (key.data[j] + 1);
+            if (j + 1 < key.size)
                 f_coarse_hg << " ";
         }
         f_coarse_hg << "\n";
-        true_num_hedges++;
+        ++true_num_hedges;
     }
 
     for (uint32_t i = 0; i < num_nodes; i++)
@@ -1182,12 +1347,12 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     
     f_coarse_hg.close();
 
-    std::cout << "Non-degenerate hedges count: " << true_num_hedges << "\n";
+    std::cout << "Preserved unique non-degenerate hedges count: " << true_num_hedges << "\n";
 
     // invoke Mt-KaHyPar
     std::ostringstream command;
-    //command << "mtkahypar -h coarse_tmp.hgr -k " << k << " -e " << std::format("{}", epsilon) << " -o km1 -v 0 --write-partition-file 1 --partition-output-folder . --preset-type deterministic_quality --seed " << INIT_SEED;
-    command << "mtkahypar -h coarse_tmp.hgr -k " << k << " -e " << std::format("{}", epsilon) << " -o km1 -v 0 --write-partition-file 1 --partition-output-folder . --preset-type default --seed " << INIT_SEED;
+    //command << "mtkahypar -h coarse_tmp.hgr -k " << k << " -e " << std::format("{}", epsilon) << " -t " << MAX_THREADS << " -o km1 -v 0 --write-partition-file 1 --partition-output-folder . --preset-type deterministic_quality --seed " << INIT_SEED;
+    command << "mtkahypar -h coarse_tmp.hgr -k " << k << " -e " << std::format("{}", epsilon) << " -t " << MAX_THREADS << " -o km1 -v 0 -m direct --write-partition-file 1 --partition-output-folder . --preset-type default --seed " << INIT_SEED;
     std::cout << "Running Mt-KaHyPar: " << command.str().c_str() << "\n";
     int command_result = std::system(command.str().c_str());
     std::ostringstream out_filename;

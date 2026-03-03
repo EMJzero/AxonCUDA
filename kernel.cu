@@ -1354,6 +1354,7 @@ void fm_refinement_gains_kernel(
                 const uint32_t part = curr_base_part + lane_id + p * WARP_SIZE;
                 // hedge not yet connected to the partition: pay the hedge's weight iff moving there connects it to the new partition (I would become its first pin there)
                 if (my_pin_per_partition[part] == 0) loss[p] += my_hedge_weight;
+                //loss[p] += my_hedge_weight / ((my_pin_per_partition[part] + 1) * (my_pin_per_partition[part] + 1));
             }
         }
 
@@ -1361,6 +1362,7 @@ void fm_refinement_gains_kernel(
         for (uint32_t p = 0; p < my_part_count; p++) {
             const float gain = saving - loss[p];
             const uint32_t part = curr_base_part + lane_id + p * WARP_SIZE;
+            //const float gain = (saving - loss[p]) * (partitions_sizes[part] + my_size <= max_nodes_per_part ? 1.0f : 0.8f);
             // MAYBE: could anticipate the constraint check! E.g. at the beginning of the iteration, entirely removing some partitions from the histogram,
             //        but this will require keeping a list of active partitions, since the indices won't suffice anymore...
             // => pseudo-random tie-break via hashes

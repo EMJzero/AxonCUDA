@@ -1,22 +1,22 @@
 #include <stdint.h>
 #include <algorithm>
 
-#include </home/mronzani/cuda/include/cuda_runtime.h>
+#include <cuda_runtime.h>
 
-#include </home/mronzani/cuda/include/thrust/device_vector.h>
-#include </home/mronzani/cuda/include/thrust/host_vector.h>
-#include </home/mronzani/cuda/include/thrust/sort.h>
-#include </home/mronzani/cuda/include/thrust/sequence.h>
-#include </home/mronzani/cuda/include/thrust/iterator/zip_iterator.h>
-#include </home/mronzani/cuda/include/thrust/iterator/counting_iterator.h>
-#include </home/mronzani/cuda/include/thrust/tuple.h>
-#include </home/mronzani/cuda/include/thrust/gather.h>
-#include </home/mronzani/cuda/include/thrust/scatter.h>
-#include </home/mronzani/cuda/include/thrust/reduce.h>
-#include </home/mronzani/cuda/include/thrust/transform.h>
-#include </home/mronzani/cuda/include/thrust/binary_search.h>
-#include </home/mronzani/cuda/include/thrust/copy.h>
-#include </home/mronzani/cuda/include/thrust/functional.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/sort.h>
+#include <thrust/sequence.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/gather.h>
+#include <thrust/scatter.h>
+#include <thrust/reduce.h>
+#include <thrust/transform.h>
+#include <thrust/binary_search.h>
+#include <thrust/copy.h>
+#include <thrust/functional.h>
 
 #include "utils.cuh"
 
@@ -577,7 +577,7 @@ void build_orphan_pairs(
         idx_begin, idx_end,
         t_free_indices.begin(),
         [t_pairs] __device__ (uint32_t i) {
-            return t_pairs[i] == UINT32_MAX;
+            return t_pairs[i * MAX_CANDIDATES] == UINT32_MAX;
         }
     );
 

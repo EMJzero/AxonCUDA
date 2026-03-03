@@ -218,6 +218,14 @@ namespace hgraph {
             return total;
         }
 
+        // => sum of external degrees
+        float soed() const {
+            float total = 0.0f;
+            for (auto& he : hedges_)
+                total += he.weight()*he.length();
+            return total;
+        }
+
         // => lambda - 1 metric (computed for a given permutation)
         float connectivityFromPart(const std::vector<uint32_t>& part) const {
             if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch");
@@ -245,7 +253,7 @@ namespace hgraph {
             return total;
         }
 
-        // => sum of external degrees (can only be computed from a given permutation)
+        // => sum of external degrees (computed from a given permutation)
         float soedFromPart(const std::vector<uint32_t>& part) const {
             if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch");
             float total = 0.0f;

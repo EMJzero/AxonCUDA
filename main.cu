@@ -7,20 +7,20 @@
 #include <optional>
 #include <filesystem>
 
-#include </home/mronzani/cuda/include/cuda_runtime.h>
+#include <cuda_runtime.h>
 
-#include </home/mronzani/cuda/include/thrust/sort.h>
-#include </home/mronzani/cuda/include/thrust/scan.h>
-#include </home/mronzani/cuda/include/thrust/gather.h>
-#include </home/mronzani/cuda/include/thrust/scatter.h>
-#include </home/mronzani/cuda/include/thrust/sequence.h>
-#include </home/mronzani/cuda/include/thrust/transform.h>
-#include </home/mronzani/cuda/include/thrust/device_ptr.h>
-#include </home/mronzani/cuda/include/thrust/device_vector.h>
-#include </home/mronzani/cuda/include/thrust/iterator/discard_iterator.h>
-#include </home/mronzani/cuda/include/thrust/iterator/permutation_iterator.h>
+#include <thrust/sort.h>
+#include <thrust/scan.h>
+#include <thrust/gather.h>
+#include <thrust/scatter.h>
+#include <thrust/sequence.h>
+#include <thrust/transform.h>
+#include <thrust/device_ptr.h>
+#include <thrust/device_vector.h>
+#include <thrust/iterator/discard_iterator.h>
+#include <thrust/iterator/permutation_iterator.h>
 
-#include </home/mronzani/cuda/include/cub/cub.cuh>
+#include <cub/cub.cuh>
 
 #include "hgraph.hpp"
 #include "constr.hpp"
@@ -349,6 +349,7 @@ extern std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     const uint32_t* d_hedges,
     const dim_t* d_hedges_offsets,
     const float* d_hedge_weights,
+    const dim_t* d_touching_offsets,
     const dim_t hedges_size,
     const uint32_t* d_nodes_sizes,
     const uint32_t k,
@@ -387,11 +388,13 @@ using namespace constraints;
 void printHelp() {
     std::cout <<
         "Usage:\n"
-        "  prog -r <input_file> [-s <output_file>]\n"
+        "  prog -r <input_file> [-c <constr>] [-s <output_file>] [-p <part_file>]\n"
+        "  prog -r <input_file> [-k <k> <ε>] [-s <output_file>] [-p <part_file>]\n"
         "  prog -h\n\n"
         "Options:\n"
         "  -r <file>   Reload hypergraph from file\n"
         "  -s <file>   Save partitioned hypergraph to file\n"
+        "  -p <file>   Save the partitioning to file (one line per node, containing its partition id)\n"
         "  -c <name>   Constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024 - default is loihi64)\n"
         "  -k <k> <ε>  K-way balanced constraints set to use (overrides '-c')\n"
         "  -h          Show this help\n";
@@ -410,6 +413,7 @@ int main(int argc, char** argv) {
 
     std::string load_path;
     std::string save_path;
+    std::string part_path;
     Mode mode = Mode::INCC;
     std::string constraints;
     uint32_t kway = UINT32_MAX;
@@ -425,6 +429,9 @@ int main(int argc, char** argv) {
         } else if (arg == "-s") {
             if (i + 1 >= argc) { std::cerr << "Error: -s requires a file path\n"; return 1; }
             save_path = argv[++i];
+        } else if (arg == "-p") {
+            if (i + 1 >= argc) { std::cerr << "Error: -p requires a file path\n"; return 1; }
+            part_path = argv[++i];
         } else if (arg == "-c") {
             if (i + 1 >= argc) { std::cerr << "Error: -c requires a config name\n"; return 1; }
             constraints = argv[++i];
@@ -877,6 +884,7 @@ int main(int argc, char** argv) {
                 d_hedges,
                 d_hedges_offsets,
                 d_hedge_weights,
+                d_touching_offsets,
                 hedges_size,
                 d_nodes_sizes,
                 kway,
@@ -1078,6 +1086,7 @@ int main(int argc, char** argv) {
                 d_hedges,
                 d_hedges_offsets,
                 d_hedge_weights,
+                d_touching_offsets,
                 hedges_size,
                 d_nodes_sizes,
                 kway,
@@ -2258,6 +2267,22 @@ int main(int argc, char** argv) {
                 }
                 std::cout << "Partitioned hypergraph saved to " << save_path << "\n";
                 std::cout << "Partitioned hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(save_path)) / (1 << 20) << " MB\n";
+            } catch (const std::exception& e) {
+                std::cerr << "Error saving file: " << e.what() << "\n";
+                return 1;
+            }
+        }
+
+        // save partitioning
+        if (!part_path.empty()) {
+            try {
+                std::cout << "Saving partitioning to: " << part_path << " (each node's partition id on its line by node idx) ...\n";
+                std::ofstream f(part_path);
+                if (!f) throw std::runtime_error("Cannot open output file");
+                for (const auto& p : partitions)
+                    f << p << "\n";
+                std::cout << "Partitioning saved to " << part_path << "\n";
+                std::cout << "Partitioning file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(part_path)) / (1 << 20) << " MB\n";
             } catch (const std::exception& e) {
                 std::cerr << "Error saving file: " << e.what() << "\n";
                 return 1;
