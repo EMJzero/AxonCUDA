@@ -65,6 +65,7 @@ extern __global__ void candidates_kernel(
     const float* hedge_weights,
     const uint32_t* nodes_sizes,
     const uint32_t num_nodes,
+    const uint32_t candidates_count,
     uint32_t* pairs,
     uint32_t* scores
 );
@@ -75,6 +76,7 @@ extern __global__ void grouping_kernel(
     const uint32_t* nodes_sizes,
     const uint32_t num_nodes,
     const uint32_t num_repeats,
+    const uint32_t candidates_count,
     slot* group_slots,
     dp_score* d_dp_scores,
     uint32_t* groups
@@ -209,6 +211,7 @@ extern __global__ void fm_refinement_gains_kernel(
     const uint32_t num_partitions,
     const uint32_t randomizer,
     const uint32_t discount,
+    const bool encourage_all_moves,
     uint32_t* moves,
     float* scores
 );
@@ -226,6 +229,7 @@ extern __global__ void fm_refinement_cascade_kernel(
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
+    const bool encourage_all_moves,
     float* scores
 );
 
@@ -397,6 +401,9 @@ void printHelp() {
         "  -p <file>   Save the partitioning to file (one line per node, containing its partition id)\n"
         "  -c <name>   Constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024 - default is loihi64)\n"
         "  -k <k> <ε>  K-way balanced constraints set to use (overrides '-c')\n"
+        "  -om <mult>  Set the deduplication oversized segment size multiplier (increase to avoid the 'GM hash-set full!' assert)\n"
+        "  -cnc <num>  Set the count of candidates proposed per node during coarsening\n"
+        "  -rfr <num>  Set the number of refinement repetitions per level\n"
         "  -h          Show this help\n";
 }
 
@@ -418,6 +425,9 @@ int main(int argc, char** argv) {
     std::string constraints;
     uint32_t kway = UINT32_MAX;
     float epsi = FLT_MAX;
+    float oversized_multiplier = OVERSIZED_SIZE_MULTIPLIER;
+    uint32_t candidates_count = MAX_CANDIDATES;
+    uint32_t refine_repeats = REFINE_REPEATS;
 
     // CLI handling
     for (int i = 1; i < argc; ++i) {
@@ -441,6 +451,16 @@ int main(int argc, char** argv) {
             kway = std::stoul(argv[++i]);
             epsi = std::stof(argv[++i]);
             mode = Mode::KWAY;
+        } else if (arg == "-om") {
+            if (i + 1 >= argc) { std::cerr << "Error: -om requires a float value\n"; return 1; }
+            oversized_multiplier = std::stof(argv[++i]);
+        } else if (arg == "-cnc") {
+            if (i + 1 >= argc) { std::cerr << "Error: -cnc requires a positive integer value\n"; return 1; }
+            candidates_count = std::stoul(argv[++i]);
+            if (candidates_count > MAX_CANDIDATES) { std::cerr << "Error: -cnc must be less or equal to " << MAX_CANDIDATES << "\n"; return 1; }
+        } else if (arg == "-rfr") {
+            if (i + 1 >= argc) { std::cerr << "Error: -rfr requires a positive integer value\n"; return 1; }
+            refine_repeats = std::stoul(argv[++i]);
         } else { std::cerr << "Unknown option: " << arg << "\n"; return 1; }
     }
 
@@ -670,9 +690,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_touching_offsets, (num_nodes + 1) * sizeof(dim_t))); // touching_offsets[node idx] -> touching set start idx in d_touching
     CUDA_CHECK(cudaMalloc(&d_inbound_count, num_nodes * sizeof(uint32_t))); // inbound_count[node idx] -> how many hedge of touching[node idx] are inbound (inbound hedges are before inbound_count[node idx], then outbound)
     CUDA_CHECK(cudaMalloc(&d_hedge_weights, num_hedges * sizeof(float))); // hedge_weights[hedge idx] -> weight
-    CUDA_CHECK(cudaMalloc(&d_pairs, num_nodes * sizeof(uint32_t) * MAX_CANDIDATES)); // partitions[node idx] -> best neighbor
+    CUDA_CHECK(cudaMalloc(&d_pairs, num_nodes * sizeof(uint32_t) * candidates_count)); // partitions[node idx] -> best neighbor
     CUDA_CHECK(cudaMalloc(&d_f_scores, num_nodes * sizeof(float))); // connection streght for each pair, used during refinement
-    CUDA_CHECK(cudaMalloc(&d_u_scores, num_nodes * sizeof(uint32_t) * MAX_CANDIDATES)); // fixed point version of the above, used for the multi-candidates kernel
+    CUDA_CHECK(cudaMalloc(&d_u_scores, num_nodes * sizeof(uint32_t) * candidates_count)); // fixed point version of the above, used for the multi-candidates kernel
     CUDA_CHECK(cudaMalloc(&d_slots, num_nodes * sizeof(slot) * MAX_GROUP_SIZE)); // slot to finalize node pairs during grouping (true dtype: "slot")
     CUDA_CHECK(cudaMalloc(&d_dp_scores, num_nodes * sizeof(dp_score))); // dynamic programming score for each node in the tree assuming it connected (with) or not (w/out) to its target
     CUDA_CHECK(cudaMalloc(&d_nodes_sizes, num_nodes * sizeof(uint32_t))); // nodes_size[node idx] -> how many pins the node counts as towards the partition size limit
@@ -708,7 +728,7 @@ int main(int argc, char** argv) {
     // uses a two-step method, first just counting, then writing, to allocate exactly the amount of memory needed, since neighborhoods can explode quickly...
     // if there is enough memory, a speedier version is used, that replaced the scatter with a direct pack from the initial oversized allocation!
     uint32_t *d_oversized_neighbors = nullptr;
-    dim_t init_max_neighbors = (dim_t)std::ceil(OVERSIZED_SIZE_MULTIPLIER * (float)max_neighbors);
+    dim_t init_max_neighbors = (dim_t)std::ceil(oversized_multiplier * (float)max_neighbors);
     cudaMemGetInfo(&free_bytes, &total_bytes);
     // check if there could be space to allocate both oversized neighbors and final neighbors at once; with no better guess, use 'max_neighbors' to estimate the final neighbors size...
     bool direct_scatter_neighbors = (num_nodes * init_max_neighbors /*oversized*/ + num_nodes * max_neighbors /*final upper bound*/) * sizeof(uint32_t) + num_nodes * sizeof(dim_t) /*offsets*/ < free_bytes;
@@ -900,7 +920,7 @@ int main(int argc, char** argv) {
 
         // zero-out candidates kernel's outputs
         // TODO: could just init. up to curr_num_nodes
-        CUDA_CHECK(cudaMemset(d_pairs, 0xFF, num_nodes * sizeof(uint32_t) * MAX_CANDIDATES)); // 0xFF -> UINT32_MAX
+        CUDA_CHECK(cudaMemset(d_pairs, 0xFF, num_nodes * sizeof(uint32_t) * candidates_count)); // 0xFF -> UINT32_MAX
         // NOTE: no need to init. "d_u_scores" if we use "d_pairs" to see which locations are valid
         
         // launch configuration - candidates kernel
@@ -926,6 +946,7 @@ int main(int argc, char** argv) {
             d_hedge_weights,
             d_nodes_sizes,
             curr_num_nodes,
+            candidates_count,
             d_pairs,
             d_u_scores
         );
@@ -935,18 +956,18 @@ int main(int argc, char** argv) {
         // =============================
         // print some temporary results
         #if VERBOSE
-        std::vector<uint32_t> pairs_tmp(curr_num_nodes * MAX_CANDIDATES);
-        std::vector<uint32_t> scores_tmp(curr_num_nodes * MAX_CANDIDATES);
-        std::vector<std::set<uint32_t>> candidates_count(MAX_CANDIDATES);
-        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * MAX_CANDIDATES, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_u_scores, curr_num_nodes * sizeof(uint32_t) * MAX_CANDIDATES, cudaMemcpyDeviceToHost));
+        std::vector<uint32_t> pairs_tmp(curr_num_nodes * candidates_count);
+        std::vector<uint32_t> scores_tmp(curr_num_nodes * candidates_count);
+        std::vector<std::set<uint32_t>> candidates_count(candidates_count);
+        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * candidates_count, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_u_scores, curr_num_nodes * sizeof(uint32_t) * candidates_count, cudaMemcpyDeviceToHost));
         std::cout << "Pairing results:";
         for (uint32_t i = 0; i < curr_num_nodes; ++i) {
             if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH))
                 std::cout << "\n  node " << i << " ->";
-            for (uint32_t j = 0; j < MAX_CANDIDATES; ++j) {
-                float score = ((float)scores_tmp[i * MAX_CANDIDATES + j])/FIXED_POINT_SCALE;
-                uint32_t target = pairs_tmp[i * MAX_CANDIDATES + j];
+            for (uint32_t j = 0; j < candidates_count; ++j) {
+                float score = ((float)scores_tmp[i * candidates_count + j])/FIXED_POINT_SCALE;
+                uint32_t target = pairs_tmp[i * candidates_count + j];
                 candidates_count[j].insert(target);
                 if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
                     if (target == UINT32_MAX) std::cout << " (" << j << " target=none score=none)";
@@ -955,12 +976,12 @@ int main(int argc, char** argv) {
                 }
                 if (target == UINT32_MAX) continue;
                 // check the symmetry invariant: mutual pairs or the other has found a higher score pair (or one with lower id - tiebreaker) [easy for j = 0, for j > 0 check first that the target wasn't already used at a lower j]
-                if (pairs_tmp[target * MAX_CANDIDATES + j] != i && pairs_tmp[target * MAX_CANDIDATES + j] != UINT32_MAX && std::find(pairs_tmp.begin() + target * MAX_CANDIDATES, pairs_tmp.begin() + target * MAX_CANDIDATES + j, i) == pairs_tmp.begin() + target * MAX_CANDIDATES + j && !(scores_tmp[target * MAX_CANDIDATES + j] > score || scores_tmp[target * MAX_CANDIDATES + j] == score && pairs_tmp[target * MAX_CANDIDATES + j] < i))
-                    std::cerr << "\n  WARNING, symmetry violated: node " << i << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ") AND node " << target << " (" << j << " target=" << pairs_tmp[target * MAX_CANDIDATES + j] << " score=" << std::fixed << std::setprecision(3) << scores_tmp[target * MAX_CANDIDATES + j] << ") !!";
+                if (pairs_tmp[target * candidates_count + j] != i && pairs_tmp[target * candidates_count + j] != UINT32_MAX && std::find(pairs_tmp.begin() + target * candidates_count, pairs_tmp.begin() + target * candidates_count + j, i) == pairs_tmp.begin() + target * candidates_count + j && !(scores_tmp[target * candidates_count + j] > score || scores_tmp[target * candidates_count + j] == score && pairs_tmp[target * candidates_count + j] < i))
+                    std::cerr << "\n  WARNING, symmetry violated: node " << i << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ") AND node " << target << " (" << j << " target=" << pairs_tmp[target * candidates_count + j] << " score=" << std::fixed << std::setprecision(3) << scores_tmp[target * candidates_count + j] << ") !!";
             }
         }
         std::cout << "\n";
-        for (uint32_t j = 0; j < MAX_CANDIDATES; ++j)
+        for (uint32_t j = 0; j < candidates_count; ++j)
             std::cout << "Candidates count (" << j << "): " << candidates_count[j].size() << "\n";
         std::vector<uint32_t>().swap(scores_tmp);
         std::vector<std::set<uint32_t>>().swap(candidates_count);
@@ -1006,6 +1027,7 @@ int main(int argc, char** argv) {
             (void*)&d_nodes_sizes,
             (void*)&curr_num_nodes,
             (void*)&num_repeats,
+            (void*)&candidates_count,
             (void*)&d_slots,
             (void*)&d_dp_scores,
             (void*)&d_groups
@@ -1173,7 +1195,7 @@ int main(int argc, char** argv) {
         #if VERBOSE
         std::vector<uint32_t> groups_tmp(curr_num_nodes);
         std::vector<uint32_t> groups_sizes_tmp(new_num_nodes);
-        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * MAX_CANDIDATES, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * candidates_count, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(groups_tmp.data(), d_groups, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(groups_sizes_tmp.data(), d_groups_sizes, new_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         std::unordered_map<uint32_t, int> groups_count;
@@ -1184,8 +1206,8 @@ int main(int argc, char** argv) {
             groups_count[group]++;
             if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
                 std::cout << "  node " << i << " ->";
-                for (uint32_t j = 0; j < MAX_CANDIDATES; ++j) {
-                    uint32_t target = pairs_tmp[i * MAX_CANDIDATES + j];
+                for (uint32_t j = 0; j < candidates_count; ++j) {
+                    uint32_t target = pairs_tmp[i * candidates_count + j];
                     if (target == UINT32_MAX) std::cout << " (" << j << " target=none)";
                     else std::cout << " (" << j << " target=" << target << ")";
                 }
@@ -1224,7 +1246,7 @@ int main(int argc, char** argv) {
         uint32_t *d_coarse_neighbors = nullptr;
         uint32_t *d_coarse_oversized_neighbors = nullptr;
         dim_t *d_coarse_neighbors_offsets = nullptr;
-        dim_t curr_max_neighbors = (dim_t)(OVERSIZED_SIZE_MULTIPLIER * (float)max_neighbors); // add a bit of safety-room to compensate for the flat scaling by 'new_num_nodes / curr_num_nodes'
+        dim_t curr_max_neighbors = (dim_t)(oversized_multiplier * (float)max_neighbors); // add a bit of safety-room to compensate for the flat scaling by 'new_num_nodes / curr_num_nodes'
         // if there is enough memory for the full oversized buffer, SM dischard included, a speedier version is used, that replaced the scatter with a direct pack from the initial oversized allocation!
         cudaMemGetInfo(&free_bytes, &total_bytes);
         // NOTE: no need to check if there could be space to allocate both oversized neighbors and final neighbors at once, if the oversized fits, then the new neighbors are allocated either after the oversized is freed, or after the original neighbors are freed
@@ -1329,7 +1351,7 @@ int main(int argc, char** argv) {
         uint32_t *d_coarse_oversized_hedges = nullptr;
         dim_t *d_coarse_hedges_offsets = nullptr;
         uint32_t* d_coarse_srcs_count = nullptr;
-        dim_t curr_max_hedge_size = (dim_t)(OVERSIZED_SIZE_MULTIPLIER * (float)max_hedge_size);
+        dim_t curr_max_hedge_size = (dim_t)(oversized_multiplier * (float)max_hedge_size);
         curr_max_hedge_size = curr_max_hedge_size > MAX_SM_WARP_DEDUPE_BUFFER_SIZE ? curr_max_hedge_size - MAX_SM_WARP_DEDUPE_BUFFER_SIZE : 0;
         curr_max_hedge_size = max(curr_max_hedge_size, (dim_t)MIN_GM_WARP_DEDUPE_BUFFER_SIZE);
         if (num_hedges * curr_max_hedge_size * sizeof(uint32_t) > (1ull << 32))
@@ -1640,11 +1662,11 @@ int main(int argc, char** argv) {
         #endif
         // =============================
 
-        for (uint32_t fm_repeat = 0u; fm_repeat < REFINE_REPEATS; fm_repeat++) {
+        for (uint32_t fm_repeat = 0u; fm_repeat < refine_repeats; fm_repeat++) {
             std::cout << "Refining level " << level_idx << " repeat " << fm_repeat << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << num_partitions << "\n";
 
             // by how much of a node's size to allow an invalid move to be proposed (but filtered later by events - if still invalid)
-            uint32_t discount = fm_repeat < REFINE_REPEATS / 3 ? 1u : (fm_repeat < 2 * REFINE_REPEATS / 3 ? 2u : UINT32_MAX);
+            uint32_t discount = fm_repeat < refine_repeats / 3 ? 1u : (fm_repeat < 2 * refine_repeats / 3 ? 2u : UINT32_MAX);
 
             // prepare this level's pins per partition
             CUDA_CHECK(cudaMemset(d_pins_per_partitions, 0x00, num_hedges * num_partitions * sizeof(uint32_t)));
@@ -1710,6 +1732,7 @@ int main(int argc, char** argv) {
                 num_partitions,
                 fm_repeat,
                 discount,
+                mode == Mode::INCC, // encourage all moves only when not doing k-way partitioning
                 // NOTE: repurposing those from the candidates kernel!
                 d_pairs, // -> moves: pairs[node] -> partition the node wants to join
                 d_f_scores
@@ -1794,6 +1817,7 @@ int main(int argc, char** argv) {
                 num_hedges,
                 curr_num_nodes,
                 num_partitions,
+                mode == Mode::INCC,
                 d_f_scores
             );
             CUDA_CHECK(cudaGetLastError());
@@ -2074,8 +2098,10 @@ int main(int argc, char** argv) {
                 CUDA_CHECK(cudaDeviceSynchronize());
                 //if (acquired_gain < 0) std::cerr << "WARNING: applied a refinement move with negative gain on level " << level_idx << " !!\n";
             } else {
-                std::cerr << "WARNING: no valid refinement move found on level " << level_idx << " (reason: " << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : "negative gain")) << ") !!\n";
-                if (inbounds_validity > 0) break;
+                std::cout << "No valid refinement move found on level " << level_idx << " (reason: " << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : "negative gain")) << ") ...\n";
+                if (fm_repeat < refine_repeats / 3) fm_repeat = refine_repeats / 2;
+                else if (fm_repeat < 2 * refine_repeats / 3) fm_repeat = 2 * refine_repeats / 3;
+                else fm_repeat = refine_repeats; // aka break!
             }
             CUDA_CHECK(cudaFree(d_ranks));
             CUDA_CHECK(cudaFree(d_valid_moves));
@@ -2195,6 +2221,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_f_scores));
     CUDA_CHECK(cudaFree(d_u_scores));
     CUDA_CHECK(cudaFree(d_slots));
+    CUDA_CHECK(cudaFree(d_dp_scores));
     CUDA_CHECK(cudaFree(d_nodes_sizes));
     CUDA_CHECK(cudaFree(d_partitions));
     CUDA_CHECK(cudaFree(d_partitions_sizes));

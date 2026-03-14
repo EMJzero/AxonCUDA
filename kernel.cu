@@ -181,6 +181,7 @@ void candidates_kernel(
     const float* __restrict__ hedge_weights,
     const uint32_t* __restrict__ nodes_sizes,
     const uint32_t num_nodes,
+    const uint32_t candidates_count,
     uint32_t* __restrict__ pairs,
     uint32_t* __restrict__ scores
 ) {
@@ -237,35 +238,33 @@ void candidates_kernel(
     for (; my_neighbors < not_my_neighbors; my_neighbors += HIST_SIZE) {
         // load the first HIST_SIZE neighbors and setup per-thread local histograms, each thread reads and prepares a neighbor
         // TODO: maybe if you have an invalid node, sample another one to fill its place in the histogram?
+        uint32_t inserted = 0;
         for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
             uint32_t curr_neighbor = UINT32_MAX;
             if (nb < neighbors_count) {
                 curr_neighbor = my_neighbors[nb];
                  // skip incompatible neighbors due to size constraints
-                if (my_size + nodes_sizes[curr_neighbor] <= max_nodes_per_part)
+                if (my_size + nodes_sizes[curr_neighbor] <= max_nodes_per_part) {
                     histogram_node[nb] = curr_neighbor;
-                else
+                    inserted++;
+                } else
                     histogram_node[nb] = UINT32_MAX;
             } else
                 histogram_node[nb] = UINT32_MAX;
         }
-        // warp sync after filling histograms
-        __syncwarp();
+        // reduce and sync warp after filling histograms
+        inserted = warpReduceSum<uint32_t>(inserted);
 
         // sort the histogram by node-id to then rely on binary search
         wrp_bitonic_sort<uint32_t, HIST_SIZE>(histogram_node);
         __syncwarp();
 
         // add a little bit of symmetric deterministic noise
-        for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
+        for (uint32_t nb = lane_id; nb < inserted; nb += WARP_SIZE) {
+            // NOTE: 'inserted' and the sort already ensure that we only see valid histogram entries
             uint32_t curr_neighbor = histogram_node[nb];
-            if (curr_neighbor != UINT32_MAX) {
-                histogram_score[nb] = deterministic_noise<DETERMINISTIC_SCORE_NOISE>(curr_neighbor, warp_id);
-                histogram_inbound[nb] = inbound_count[curr_neighbor];
-            } else {
-                histogram_score[nb] = 0u;
-                histogram_inbound[nb] = 0u;
-            }
+            histogram_score[nb] = deterministic_noise<DETERMINISTIC_SCORE_NOISE>(curr_neighbor, warp_id);
+            histogram_inbound[nb] = inbound_count[curr_neighbor];
         }
 
         // iterate over touching hyperedges
@@ -289,7 +288,7 @@ void candidates_kernel(
             for (uint32_t i = lane_id; i < my_hedge_size; i += WARP_SIZE) {
                 uint32_t pin = my_hedge[i];
                 // update local histogram
-                const uint32_t hist_idx = binary_search<uint32_t, true>(histogram_node, HIST_SIZE, pin);
+                const uint32_t hist_idx = binary_search<uint32_t, true>(histogram_node, inserted, pin);
                 // NOTE: no atomic needed => all threads in the warp advance in sync and there are not duplicates in hedges, no two threads will ever write the same bin!
                 if (hist_idx != UINT32_MAX) {
                     // normalize hedge weight over size
@@ -305,16 +304,17 @@ void candidates_kernel(
 
         // delete candidates that would lead to invalid clusters
         // and penalize neighbors by your combined size (symmetric)
-        for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
+        for (uint32_t nb = lane_id; nb < inserted; nb += WARP_SIZE) {
             if (histogram_inbound[nb] + my_inbound_count > max_inbound_per_part) {
                 histogram_node[nb] = UINT32_MAX;
                 histogram_score[nb] = 0u;
-            } /*else if (histogram_node[nb] != UINT32_MAX) {
+            } /* else if (histogram_node[nb] != UINT32_MAX) {
                 uint32_t neigh_size = nodes_sizes[histogram_node[nb]];
                 //histogram_score[nb] /= my_size + neigh_size;
-                histogram_score[nb] -= min(my_size + neigh_size, DETERMINISTIC_SCORE_NOISE);
+                histogram_score[nb] = (uint32_t)((float)histogram_score[nb] * (1 + 1/(float)(my_size + neigh_size)));
+                //histogram_score[nb] -= min(my_size + neigh_size, DETERMINISTIC_SCORE_NOISE);
                 //if (histogram_score[nb] == 0) histogram_score[nb] = deterministic_noise<DETERMINISTIC_SCORE_NOISE>(histogram_node[nb], warp_id);
-            }*/
+            } */
         }
 
         // sort the histogram by lowest score first (empty bins have score = 0), highest id first as a tiebreaker
@@ -323,13 +323,13 @@ void candidates_kernel(
         //__syncwarp();
 
         // extract the global maximum(s)
-        for (int32_t candidate = HIST_SIZE - 1; candidate >= 0; candidate--) {
+        for (int32_t candidate = inserted - 1; candidate >= 0; candidate--) {
             // warp sync on updated histogram (after removing invalid candidates and after removing the last extracted max)
             __syncwarp();
             uint32_t curr_neighbor = UINT32_MAX;
             uint32_t curr_score = 0u;
             uint32_t best_hist_idx = 0u;
-            for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
+            for (uint32_t nb = lane_id; nb < inserted; nb += WARP_SIZE) {
                 const uint32_t nb_neighbor = histogram_node[nb];
                 const uint32_t nb_score = histogram_score[nb];
                 if (nb_score > curr_score || nb_score == curr_score && nb_neighbor > curr_neighbor) { // tie-breaking here too
@@ -346,13 +346,13 @@ void candidates_kernel(
             curr_neighbor = max_neighbor.payload;
             if (curr_neighbor == UINT32_MAX) break;
             curr_score = max_neighbor.val;
-            if (curr_score < best_score[MAX_CANDIDATES - 1]) break;
+            if (curr_score < best_score[candidates_count - 1]) break;
 
-            // get the best MAX_CANDIDATES candidates out of the histogram
-            for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
+            // get the best 'candidates_count' candidates out of the histogram
+            for (uint32_t i = 0; i < candidates_count; i++) {
                 // tie-breaker: higher id node wins; invariant: partial neighbors order
                 if (curr_score > best_score[i] || curr_score == best_score[i] && curr_neighbor > best_neighbor[i]) {
-                    for (uint32_t j = MAX_CANDIDATES - 1; j > i; j--) {
+                    for (uint32_t j = candidates_count - 1; j > i; j--) {
                         best_score[j] = best_score[j - 1];
                         best_neighbor[j] = best_neighbor[j - 1];
                     }
@@ -367,9 +367,9 @@ void candidates_kernel(
     }
 
     if (lane_id == 0) {
-        for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
-            pairs[warp_id * MAX_CANDIDATES + i] = best_neighbor[i];
-            scores[warp_id * MAX_CANDIDATES + i] = best_score[i]; // stay fixed point for now!
+        for (uint32_t i = 0; i < candidates_count; i++) {
+            pairs[warp_id * candidates_count + i] = best_neighbor[i];
+            scores[warp_id * candidates_count + i] = best_score[i]; // stay fixed point for now!
         }
     }
 }
@@ -384,6 +384,7 @@ void grouping_kernel(
     const uint32_t* __restrict__ nodes_sizes,
     const uint32_t num_nodes,
     const uint32_t num_repeats,
+    const uint32_t candidates_count,
     slot* __restrict__ group_slots, // initialized with -1 on the id
     dp_score* __restrict__ dp_scores, // dynamic programming alternating scores, initialize to 0s
     uint32_t* __restrict__ groups // uninitialized, final group id of each node (non-zero based for now)
@@ -500,7 +501,7 @@ void grouping_kernel(
         if (curr_tid < num_nodes) atomicCAS(&reinterpret_cast<unsigned long long*>(group_slots)[curr_tid*MAX_GROUP_SIZE], pack_slot(0u, UINT32_MAX), pack_slot(0u, curr_tid));
     }
 
-    for (uint32_t i = 0; i < MAX_CANDIDATES; i++) {
+    for (uint32_t i = 0; i < candidates_count; i++) {
         // repeat for every node that you need to handle
         for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
             const uint32_t curr_tid = tid + repeat * tcount;
@@ -514,10 +515,10 @@ void grouping_kernel(
             int32_t curr_path_length = 0;
 
             uint32_t current = curr_tid; // current node in the tree of pairs
-            uint32_t target = pairs[curr_tid * MAX_CANDIDATES + i]; // target node of "current"
+            uint32_t target = pairs[curr_tid * candidates_count + i]; // target node of "current"
             // total score in the traversed subtree assuming the current node will be paired with its targed
             // initialized to the value with which "current" points to "target"
-            uint32_t score_with = scores[curr_tid * MAX_CANDIDATES + i];
+            uint32_t score_with = scores[curr_tid * candidates_count + i];
             // total score in the traversed subtree assuming the current node will NOT be paired with its targed
             uint32_t score_wout = 0u;
 
@@ -525,7 +526,7 @@ void grouping_kernel(
             bool outcome = false;
             if (target != UINT32_MAX) {
                 outcome = true;
-                uint32_t target_target = pairs[target * MAX_CANDIDATES + i]; // target node of "target"
+                uint32_t target_target = pairs[target * candidates_count + i]; // target node of "target"
                 while (current != target_target || current > target) { // break the two-cycle, always go up to the node of lowest id in the root pair
                     const uint32_t prev_target_score_wout_sum = atomicAdd(&dp_scores[target].with, score_wout); // dp_scores[...].with contains the sum of childrens' wouts!
                     const uint32_t target_score_wout_sum = prev_target_score_wout_sum + score_wout;
@@ -550,9 +551,9 @@ void grouping_kernel(
                     current = target;
                     target = target_target;
                     if (target == UINT32_MAX) break; // alternative root: a node with no target
-                    target_target = pairs[target_target * MAX_CANDIDATES + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
+                    target_target = pairs[target_target * candidates_count + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
                     score_wout = target_score_wout_sum + /* + with[holder] - wout[holder] */ holder_with_minus_wout; // if the next node up the tree won't get paired, then his score is that of the best children's "with", and the other "w/out"
-                    score_with = target_score_wout_sum + scores[current * MAX_CANDIDATES + i]; // if the next node up the tree will get paired, then his score is his own candidate score, and all children's "w/out"
+                    score_with = target_score_wout_sum + scores[current * candidates_count + i]; // if the next node up the tree will get paired, then his score is his own candidate score, and all children's "w/out"
                 }
                 // no need to handle root pair, since we already broke the pair and made the lower-id node the sole root
                 // => the result does not change, since the lower-id node will be contended between the gains of the two subtrees
@@ -1271,6 +1272,7 @@ void fm_refinement_gains_kernel(
     const uint32_t num_partitions,
     const uint32_t randomizer,
     const uint32_t discount, // by how much to overshoot the size constraint when proposing moves
+    const bool encourage_all_moves, // if true, even moves that don't fully disconnect an hyperedge receive a gain inversely proportional to how many pins remain
     // NOTE: we repurpose the arrays allocated for the "candidates kernel" for those!
     uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx
     float* __restrict__ scores // scores[idx] -> gain for move in position idx
@@ -1322,10 +1324,10 @@ void fm_refinement_gains_kernel(
         const uint32_t* my_pin_per_partition = pins_per_partitions + actual_hedge_idx * num_partitions;
         const float my_hedge_weight = hedge_weights[actual_hedge_idx];
         // hedge connected to my partition: gain the hedge's weight iff moving would disconnect it from my partition (I am its last pin left there)
-        //if (my_pin_per_partition[my_partition] == 1)
-        //    saving += my_hedge_weight;
+        if (!encourage_all_moves && my_pin_per_partition[my_partition] == 1)
+            saving += my_hedge_weight;
         // VARIANT: give a little push to nodes leaving a partition with not just one, but few pins left for an hedge
-        if (my_pin_per_partition[my_partition] >= 1)
+        if (encourage_all_moves && my_pin_per_partition[my_partition] >= 1)
             saving += my_hedge_weight / (my_pin_per_partition[my_partition] * my_pin_per_partition[my_partition]);
     }
 
@@ -1354,6 +1356,7 @@ void fm_refinement_gains_kernel(
                 const uint32_t part = curr_base_part + lane_id + p * WARP_SIZE;
                 // hedge not yet connected to the partition: pay the hedge's weight iff moving there connects it to the new partition (I would become its first pin there)
                 if (my_pin_per_partition[part] == 0) loss[p] += my_hedge_weight;
+                // VARIANT: pt2
                 //loss[p] += my_hedge_weight / ((my_pin_per_partition[part] + 1) * (my_pin_per_partition[part] + 1));
             }
         }
@@ -1404,6 +1407,7 @@ void fm_refinement_cascade_kernel(
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
+    const bool encourage_all_moves,
     float* __restrict__ scores // scores[move_ranks[node_idx]] -> gain for node idx's move
 ) {
     // STYLE: one node (move) per warp!
@@ -1474,15 +1478,18 @@ void fm_refinement_cascade_kernel(
                     my_move_part_counter_delta--;
             }
         }
+        // VVVV
+        // NOTE: do not use the variant AT ALL when you work on k-way !!
+        // ^^^^
         // gain the hedge's weight iff moving would disconnect the hedge from my partition (I am its last pin left there)
-        //if (my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta) == 1)
-        //    score += my_hedge_weight;
+        const uint32_t true_curr_part_counter = my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta);
+        if (!encourage_all_moves && true_curr_part_counter == 1)
+            score += my_hedge_weight;
         // pay the hedge's weight iff moving there connects the hedge to the new partition (I would become its first pin there)
         if (my_move_part_counter + warpReduceSumLN0<int32_t>(my_move_part_counter_delta) == 0)
             score -= my_hedge_weight;
         // VARIANT: give a little push to nodes leaving a partition with not just one, but few pins left for an hedge
-        const uint32_t true_curr_part_counter = my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta);
-        if (true_curr_part_counter >= 1)
+        if (encourage_all_moves && true_curr_part_counter >= 1)
             score += my_hedge_weight / (true_curr_part_counter * true_curr_part_counter);
         //const uint32_t true_move_part_counter = my_move_part_counter + warpReduceSumLN0<int32_t>(my_move_part_counter_delta);
         //score -= my_hedge_weight / ((true_move_part_counter + 1) * (true_move_part_counter + 1));

@@ -64,6 +64,7 @@ extern __global__ void fm_refinement_gains_kernel(
     const uint32_t num_partitions,
     const uint32_t randomizer,
     const uint32_t discount,
+    const bool encourage_all_moves,
     uint32_t* moves,
     float* scores
 );
@@ -81,6 +82,7 @@ extern __global__ void fm_refinement_cascade_kernel(
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
+    const bool encourage_all_moves,
     float* scores
 );
 
@@ -861,6 +863,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     max_parts,
                     jacobi,
                     UINT32_MAX,
+                    true, // TODO: maybe should be 'false'? Do we want moves to simply attempt to disconnect multi-pinned hyperedge here?
                     d_moves,
                     d_gains
                 );
@@ -974,6 +977,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     max_parts,
                     fm,
                     discount,
+                    false,
                     d_moves,
                     d_gains
                 );
@@ -1019,6 +1023,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     num_hedges,
                     num_nodes,
                     max_parts,
+                    false,
                     d_gains
                 );
                 CUDA_CHECK(cudaGetLastError());
@@ -1325,6 +1330,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
         map[key] += w;
     }
 
+    // write hedges to file
     uint32_t true_num_hedges = 0u;
     for (auto& [key, weight] : map) {
         f_coarse_hg << static_cast<uint32_t>(weight) << " ";
@@ -1337,9 +1343,11 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
         ++true_num_hedges;
     }
 
+    // write nodes to file
     for (uint32_t i = 0; i < num_nodes; i++)
         f_coarse_hg << h_nodes_sizes[i] << "\n";
 
+    // update file header retroactively
     f_coarse_hg.seekp(0);
     std::ostringstream header;
     header << true_num_hedges << " " << num_nodes << " 11";
@@ -1373,21 +1381,28 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     std::cout << "Reading temporary file '" << out_filename.str().c_str() << "' ...\n";
 
     for (uint32_t i = 0; i < num_nodes; i++) {
-        if (!(f_parts >> h_partitions[i])) // already with 0-based idxs
+        if (!(f_parts >> h_partitions[i])) {// already with 0-based idxs
+            std::cout << "ERROR, invalid partitioning returned with " << i << " nodes instead of " << num_nodes << ", inspect '" << out_filename.str().c_str() << "' for possible bugs !!\n";
             throw std::runtime_error("Unexpected partitions file format or too few lines");
-        if (h_partitions[i] >= k)
+        }
+        if (h_partitions[i] >= k) {
+            std::cout << "ERROR, partitioning out of range: " << h_partitions[i] << ", inspect '" << out_filename.str().c_str() << "' for possible bugs !!\n";
             throw std::runtime_error("Partition id out of range");
+        }
         h_partitions_sizes[h_partitions[i]] += h_nodes_sizes[i];
     }
 
     f_parts.close();
 
-    std::filesystem::remove_all(out_filename.str().c_str());
-
     for (uint32_t i = 0; i < k; i++) {
-        if (h_partitions_sizes[i] > h_max_nodes_per_part) // already with 0-based idxs
+        if (h_partitions_sizes[i] > h_max_nodes_per_part) { // already with 0-based idxs
+            std::cout << "ERROR, invalid size for partition " << i << " : " << h_partitions_sizes[i] << " > " << h_max_nodes_per_part << ", inspect '" << out_filename.str().c_str() << "' for possible bugs !!\n";
             throw std::runtime_error("Invalid partition size");
+            // TODO: try rerunning KaHyPar a few times...
+        }
     }
+
+    std::filesystem::remove_all(out_filename.str().c_str());
 
     auto time_end = std::chrono::high_resolution_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(time_end - time_start).count();

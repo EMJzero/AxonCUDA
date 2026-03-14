@@ -2,20 +2,55 @@
 # Project settings
 # ==========================================
 TARGET      := hgraph_gpu.exe
+
 CXX         := g++
 NVCC        := nvcc
 
-CXXFLAGS    := -O3 --std=c++20 -Wall -Wextra -fopenmp -I .
-NVCCFLAGS   := -O3 --std=c++20 -arch=native -dc -allow-unsupported-compiler --extended-lambda -Xcompiler "-Wall -Wextra -Wno-maybe-uninitialized -Wno-unused-function -fopenmp" -I .
-LINKFLAGS   := --std=c++20 -arch=native -allow-unsupported-compiler --extended-lambda -lgomp
+# ------------------------------------------
+# Architecture support (RTX 2080Ti + A100)
+# ------------------------------------------
+GENCODE := \
+	-gencode arch=compute_75,code=sm_75 \
+	-gencode arch=compute_80,code=sm_80 \
+	-gencode arch=compute_75,code=compute_75
 
-SRC_CPPS    := #main.cpp
-SRC_CUS     := main.cu kernel.cu init_part.cu chaining.cu
+# ------------------------------------------
+# Compiler flags
+# ------------------------------------------
+CXXFLAGS := -O3 --std=c++20 -Wall -Wextra -fopenmp -I .
 
-OBJ_CPPS    := $(SRC_CPPS:.cpp=.o)
-OBJ_CUS     := $(SRC_CUS:.cu=.o)
+NVCCFLAGS := -O3 --std=c++20 \
+             $(GENCODE) \
+             -dc \
+             -cudart static \
+             -allow-unsupported-compiler \
+             --extended-lambda \
+             -Xcompiler "-Wall -Wextra -Wno-maybe-uninitialized -Wno-unused-function -fopenmp" \
+             -I .
 
-OBJS        := $(OBJ_CPPS) $(OBJ_CUS)
+# ------------------------------------------
+# Linker flags
+# ------------------------------------------
+LINKFLAGS := --std=c++20 \
+             $(GENCODE) \
+             -cudart static \
+             -allow-unsupported-compiler \
+             --extended-lambda \
+             -Xcompiler -fopenmp \
+             -Xcompiler -static-libstdc++ \
+             -Xcompiler -static-libgcc \
+             -lgomp
+
+# ------------------------------------------
+# Sources
+# ------------------------------------------
+SRC_CPPS := #main.cpp
+SRC_CUS  := main.cu kernel.cu init_part.cu chaining.cu
+
+OBJ_CPPS := $(SRC_CPPS:.cpp=.o)
+OBJ_CUS  := $(SRC_CUS:.cu=.o)
+
+OBJS := $(OBJ_CPPS) $(OBJ_CUS)
 
 # ==========================================
 # Build rules

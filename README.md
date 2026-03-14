@@ -5,7 +5,7 @@ Did first `wget https://developer.download.nvidia.com/compute/cuda/12.4.0/local_
 Then `sh cuda_<version>_linux.run --silent --toolkit --override --installpath=$HOME/cuda`.
 Finally, put a link to cuda in this project's path `ln -s $HOME/cuda/include cuda-include`.
 
-If using Mt-KaHyPar for the initial partitioning, install it from here and make sure `mtkahypar` is a valid shell executable/command:
+If using Mt-KaHyPar for the initial partitioning, install it from here and make sure `mtkahypar` is a valid executable in your environment (e.g. `PATH`):
 https://github.com/kahypar/mt-kahypar.git
 
 ## Requirements
@@ -95,3 +95,23 @@ where $|e|$ is the number of nodes in hyperedge $e$.
 | 256k-rand | loihi64 | <code style="color : lime">ok</code> | 4108240.750 | 16451.505 |  |
 
 > All "ko"s are out-of-memory instances...
+
+# Configurations
+
+| **name** | max candidates | refinement repeats | oversized multiplier |
+| --- | --- | --- | --- |
+| default | 4 | 8 | 1.2 |
+| profile | 4 | 2 | 1.5 |
+| quality | 16 | 16 | 2.5 |
+
+# Opsies
+
+<img src="static/tehepero.png" width="250px" padding-left="15px" align="right"/>
+
+Well, this implementation isn't bulletproof, there are a few knobs that require tuning upon targeting very large hypergraphs.
+All problems usually manifest as asserts being triggered:
+- `curr_path_length < actual_path_size` in `grouping_kernel`:
+  - try increasing `PATH_SIZE`, but keep in mind that it should fit in a thread's registers for performance reasons...
+  - if even with `PATH_SIZE = 1024` the problem persist, the likely suspect is an asymmetric neighbors histogram from `candidates_kernel`, bugs aside, the only reasonable cause is an overflow due to `FIXED_POINT_SCALE`, try lowering it...
+- `GM hash-set full!` in any `apply_X` or `neighbors` kernel, means oversized segments for deduplication were not large enough, increase `-om <mul>` from the CLI...
+- `invalid partitioning returned` in k-way mode after initial Mt-KaHyPar solution means no valid initial partitioning likely existed, try raising `KWAY_INIT_UPPER_THREASHOLD`...

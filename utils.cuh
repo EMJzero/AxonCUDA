@@ -5,13 +5,31 @@
 
 // USED BY: everyone
 
-#define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
+#define CUDA_CHECK(ans) { gpuAssert((ans), #ans, __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char* expr, const char *file, int line, bool abort = true) {
     if (code != cudaSuccess) {
-        fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+        fprintf(stderr, "GPUassert:\n  Error: %s, Expr.: %s\n  File: %s, Line: %d\n", cudaGetErrorString(code), expr, file, line);
         if (abort) exit(code);
     }
 }
+
+#define LOG_MEMORY false
+
+#if LOG_MEMORY
+template<typename T>
+inline cudaError_t cudaMallocLogged(T** ptr, size_t size, const char* varname, const char* file, int line) {
+    cudaError_t ret = ::cudaMalloc(reinterpret_cast<void**>(ptr), size);
+    if (ret == cudaSuccess) printf("[CUDA MALLOC] %s | ptr=%p | size=%zu bytes | %s:%d\n", varname, (void*)(*ptr), size, file, line);
+    return ret;
+}
+template<typename T>
+inline cudaError_t cudaFreeLogged(T* ptr, const char* varname, const char* file, int line) {
+    printf("[CUDA FREE] %s | ptr=%p | %s:%d\n", varname, (void*)ptr, file, line);
+    return ::cudaFree(ptr);
+}
+#define cudaMalloc(ptr, size) cudaMallocLogged(ptr, size, #ptr, __FILE__, __LINE__)
+#define cudaFree(ptr) cudaFreeLogged(ptr, #ptr, __FILE__, __LINE__)
+#endif
 
 // absolute replacement for "size_t"
 using dim_t = unsigned long long; // aka uint64_t
@@ -112,7 +130,7 @@ __forceinline__ __device__ T warpExclusiveScan(T val) {
 // USED BY: candidates kernel
 
 #define HIST_SIZE 512u // must be a multiple of WARP_SIZE (for the histogram max reduction)
-#define MAX_CANDIDATES 4u // => how many candidates are proposed for a node (ranked by score)
+#define MAX_CANDIDATES 16u // => how many candidates are proposed for a node (ranked by score)
 
 #define DETERMINISTIC_SCORE_NOISE 64u // => adds a +[0, DETERMINISTIC_SCORE_NOISE - 1]/FIXED_POINT_SCALE symmetric noise while calculating pairing scores; set to 0 to disable; keep it a power of 2 otherwise
 

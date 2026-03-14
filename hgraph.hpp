@@ -624,32 +624,32 @@ namespace hgraph {
             return neighborhood_offsets_;
         }
 
-        /**
-         * SNN binary hypergraph format (.snn)
-         *
-         * A compact binary format for directed hypergraphs with
-         * exactly one source node per hyperedge.
-         *
-         * File layout (little-endian):
-         *
-         *   uint32  node_count        // total number of nodes
-         *   uint32  edge_count        // number of hyperedges
-         *
-         *   Repeated edge_count times:
-         *     uint32  dst_count       // number of destination nodes
-         *     uint32  src             // source node id (0-based)
-         *     uint32  dst[dst_count]  // destination node ids (0-based)
-         *     float   weight          // hyperedge weight
-         *
-         * Notes:
-         * - Node IDs are 0-based.
-         * - Hyperedges are directed: src → dst[...].
-         * - The format supports exactly one source per hyperedge.
-         * - If a hyperedge has multiple sources internally, only the first source
-         *   is preserved; additional sources are converted into destinations and
-         *   a warning is emitted during saving.
-         * - No vertex weights or metadata are stored.
-         */
+        /*
+        * SNN binary hypergraph format (.snn)
+        *
+        * A compact binary format for directed hypergraphs with
+        * exactly one source node per hyperedge.
+        *
+        * File layout (little-endian):
+        *
+        *   uint32  node_count        // total number of nodes
+        *   uint32  edge_count        // number of hyperedges
+        *
+        *   Repeated edge_count times:
+        *     uint32  dst_count       // number of destination nodes
+        *     uint32  src             // source node id (0-based)
+        *     uint32  dst[dst_count]  // destination node ids (0-based)
+        *     float   weight          // hyperedge weight
+        *
+        * Notes:
+        * - Node IDs are 0-based.
+        * - Hyperedges are directed: src → dst[...].
+        * - The format supports exactly one source per hyperedge.
+        * - If a hyperedge has multiple sources internally, only the first source
+        *   is preserved; additional sources are converted into destinations and
+        *   a warning is emitted during saving.
+        * - No vertex weights or metadata are stored.
+        */
         static HyperGraph loadSNN(const std::string& path) {
             std::ifstream f(path, std::ios::binary);
             if (!f) throw std::runtime_error("Cannot open file");
@@ -719,7 +719,7 @@ namespace hgraph {
             if (multiple_srcs_warning) std::cerr << "WARNING: the partitioned hypergraph had hedge with multiple sources, a feature unsupported in '.snn' format, every source after the first was converted to a destination !!\n";
         }
 
-        /**
+        /*
          * Axon hypergraph binary format (.axh)
          *
          * A compact binary format for directed hypergraphs supporting
@@ -748,7 +748,6 @@ namespace hgraph {
          * - This format is lossless with respect to the internal HyperGraph model.
          * - All integers and floats are stored in native little-endian format.
          */
-
         static HyperGraph loadAXH(const std::string& path) {
             std::ifstream f(path, std::ios::binary);
             if (!f) throw std::runtime_error("Cannot open .axh file");
@@ -829,57 +828,57 @@ namespace hgraph {
             }
         }
 
-        /**
-         * hMETIS hypergraph format (limited support) (.hgr)
-         *
-         * doc: https://course.ece.cmu.edu/~ee760/760docs/hMetisManual.pdf
-         *
-         * This implementation supports loading from and saving to the hMETIS
-         * plain-text hypergraph format as described in the hMETIS manual, with
-         * the following restrictions and conventions.
-         *
-         * General format:
-         *
-         *   First non-comment line:
-         *     E V [fmt]
-         *
-         *     E   = number of hyperedges
-         *     V   = number of vertices
-         *     fmt = optional format flag
-         *           0  : unweighted hyperedges (default)
-         *           1  : weighted hyperedges
-         *          10  : weighted vertices (unsupported)
-         *          11  : weighted hyperedges and vertices (vertex weights unsupported)
-         *
-         *   Followed by E hyperedge lines (comments starting with '%' are ignored):
-         *
-         *     [w] v1 v2 v3 ...
-         *
-         *     where:
-         *       w  = integer hyperedge weight (only if fmt == 1 or 11)
-         *       vi = 1-based vertex indices
-         *
-         * Semantics and limitations:
-         *
-         * - Hyperedges are treated as undirected, as per hMETIS.
-         * - Vertex indices are converted from 1-based (hMETIS) to 0-based internally.
-         * - Hyperedge weights are supported; unweighted hyperedges default to weight 1.
-         * - Vertex weights (fmt == 10 or 11) are detected but ignored; a warning is printed.
-         * - Hyperedges of cardinality 1 (singleton hyperedges) are valid in hMETIS but
-         *   unsupported here; they are skipped and counted, and a warning is printed.
-         *
-         * Export behavior (savehMETIS):
-         *
-         * - Writes a valid hMETIS .hgr file using only hyperedge weights (fmt = 1 if needed).
-         * - Vertex weights are never written.
-         * - Hyperedges are exported by listing all pins (sources first, then destinations),
-         *   preserving internal order.
-         * - Node indices are written using 1-based indexing, as required by hMETIS.
-         *
-         * Note:
-         * - Directionality and source/destination distinctions are not represented in
-         *   hMETIS and are ignored on load; all pins are treated uniformly.
-         */
+        /*
+        * hMETIS hypergraph format (limited support) (.hgr)
+        *
+        * doc: https://course.ece.cmu.edu/~ee760/760docs/hMetisManual.pdf
+        *
+        * This implementation supports loading from and saving to the hMETIS
+        * plain-text hypergraph format as described in the hMETIS manual, with
+        * the following restrictions and conventions.
+        *
+        * General format:
+        *
+        *   First non-comment line:
+        *     E V [fmt]
+        *
+        *     E   = number of hyperedges
+        *     V   = number of vertices
+        *     fmt = optional format flag
+        *           0  : unweighted hyperedges (default)
+        *           1  : weighted hyperedges
+        *          10  : weighted vertices (unsupported)
+        *          11  : weighted hyperedges and vertices (vertex weights unsupported)
+        *
+        *   Followed by E hyperedge lines (comments starting with '%' are ignored):
+        *
+        *     [w] v1 v2 v3 ...
+        *
+        *     where:
+        *       w  = integer hyperedge weight (only if fmt == 1 or 11)
+        *       vi = 1-based vertex indices
+        *
+        * Semantics and limitations:
+        *
+        * - Hyperedges are treated as undirected, as per hMETIS.
+        * - Vertex indices are converted from 1-based (hMETIS) to 0-based internally.
+        * - Hyperedge weights are supported; unweighted hyperedges default to weight 1.
+        * - Vertex weights (fmt == 10 or 11) are detected but ignored; a warning is printed.
+        * - Hyperedges of cardinality 1 (singleton hyperedges) are valid in hMETIS but
+        *   unsupported here; they are skipped and counted, and a warning is printed.
+        *
+        * Export behavior (savehMETIS):
+        *
+        * - Writes a valid hMETIS .hgr file using only hyperedge weights (fmt = 1 if needed).
+        * - Vertex weights are never written.
+        * - Hyperedges are exported by listing all pins (sources first, then destinations),
+        *   preserving internal order.
+        * - Node indices are written using 1-based indexing, as required by hMETIS.
+        *
+        * Note:
+        * - Directionality and source/destination distinctions are not represented in
+        *   hMETIS and are ignored on load; all pins are treated uniformly.
+        */
         static HyperGraph loadhMETIS(const std::string& path) {
             std::ifstream f(path);
             if (!f) throw std::runtime_error("Cannot open .hgr file");
