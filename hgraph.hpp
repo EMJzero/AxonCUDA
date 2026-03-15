@@ -13,6 +13,8 @@
 #include <functional>
 #include <unordered_map>
 
+#include <omp.h>
+
 namespace hgraph {
 
     class HyperEdge;
@@ -571,6 +573,7 @@ namespace hgraph {
         uint32_t sampleMaxNeighborhoodSize(uint32_t sample_size) {
             uint32_t max_size = 0;
 
+            #pragma omp parallel for reduction(max:max_size) schedule(guided)
             for (uint32_t n = 0; n < node_count_; n += std::max<uint32_t>(1, node_count_ / sample_size)) {
 
                 std::set<uint32_t> neigh; // distinct neighbors

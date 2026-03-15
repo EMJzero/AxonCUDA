@@ -378,6 +378,7 @@ extern void build_orphan_pairs(
     const uint32_t curr_num_nodes,
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
+    const uint32_t candidates_count,
     uint32_t* d_groups
 );
 
@@ -399,8 +400,9 @@ void printHelp() {
         "  -r <file>   Reload hypergraph from file\n"
         "  -s <file>   Save partitioned hypergraph to file\n"
         "  -p <file>   Save the partitioning to file (one line per node, containing its partition id)\n"
-        "  -c <name>   Constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024 - default is loihi64)\n"
-        "  -k <k> <ε>  K-way balanced constraints set to use (overrides '-c')\n"
+        "  -c <name>   Preconfigured constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024 - default is loihi64)\n"
+        "  -m <> <> <> Constraints set to use, in order: max part. size, max part. distinct inbound hedges, max num. of part.s (overrides '-c')\n"
+        "  -k <k> <ε>  K-way balanced constraints set to use (overrides '-c' and '-m')\n"
         "  -om <mult>  Set the deduplication oversized segment size multiplier (increase to avoid the 'GM hash-set full!' assert)\n"
         "  -cnc <num>  Set the count of candidates proposed per node during coarsening\n"
         "  -rfr <num>  Set the number of refinement repetitions per level\n"
@@ -422,7 +424,8 @@ int main(int argc, char** argv) {
     std::string save_path;
     std::string part_path;
     Mode mode = Mode::INCC;
-    std::string constraints;
+    std::string constraints_name;
+    ConstraintsConfig constr_config;
     uint32_t kway = UINT32_MAX;
     float epsi = FLT_MAX;
     float oversized_multiplier = OVERSIZED_SIZE_MULTIPLIER;
@@ -444,7 +447,14 @@ int main(int argc, char** argv) {
             part_path = argv[++i];
         } else if (arg == "-c") {
             if (i + 1 >= argc) { std::cerr << "Error: -c requires a config name\n"; return 1; }
-            constraints = argv[++i];
+            constraints_name = argv[++i];
+            mode = Mode::INCC;
+        } else if (arg == "-m") {
+            if (i + 3 >= argc) { std::cerr << "Error: -m requires integer values for the three constraints\n"; return 1; }
+            constr_config.name = "manual";
+            constr_config.nodes_per_part = std::stoul(argv[++i]);
+            constr_config.inbound_per_part = std::stoul(argv[++i]);
+            constr_config.max_parts = std::stoul(argv[++i]);
             mode = Mode::INCC;
         } else if (arg == "-k") {
             if (i + 2 >= argc) { std::cerr << "Error: -k requires values for 'k' and 'ε'\n"; return 1; }
@@ -511,9 +521,8 @@ int main(int argc, char** argv) {
         { "loihi1024", Constraints::createLoihiJin1024 },
         { "truenorth", Constraints::createTrueNorth }
     };
-    auto constr_it = configurations.find(constraints);
-    if (mode == Mode::KWAY) {
-        ConstraintsConfig constr_config;
+    auto constr_it = configurations.find(constraints_name);
+    if (mode == Mode::KWAY) { // k-way mode ('-k')
         std::ostringstream epsistr;
         epsistr << std::fixed << std::setprecision(3) << epsi;
         constr_config.name = std::to_string(kway) + "-way " + epsistr.str() + " balanced";
@@ -521,11 +530,16 @@ int main(int argc, char** argv) {
         constr_config.inbound_per_part = INT32_MAX;
         constr_config.max_parts = kway;
         constr_tmp = Constraints(constr_config);
-    } else if (constr_it == configurations.end()) {
-        std::cerr << "WARNING, no constraints provided (-c, -k), using loihi64 !!\n";
-        constr_tmp = Constraints::createLoihiLarge();
-    } else {
+    } else if (constr_config.name == "manual") { // manual constraints ('-m')
+        if (constr_config.nodes_per_part == 0) { std::cerr << "Error: the 1st constraint (max partition size) must be a positive integer \n"; return 1; }
+        if (constr_config.inbound_per_part == 0) { std::cerr << "Error: the 2nd constraint (max distinct inbound hedge per partition) must be a positive integer \n"; return 1; }
+        if (constr_config.max_parts == 0) { std::cerr << "Error: the 3rd constraint (max number of partitions) must be a positive integer \n"; return 1; }
+        constr_tmp = Constraints(constr_config);
+    } else if (constr_it != configurations.end()) { // preconfigured constraints ('-c')
         constr_tmp = constr_it->second();
+    } else { // no (valid) constraints provided
+        std::cerr << "WARNING, no constraints provided (-c, -m, -k), using loihi64 !!\n";
+        constr_tmp = Constraints::createLoihiLarge();
     }
     Constraints &constr = *constr_tmp;
     
@@ -617,7 +631,7 @@ int main(int argc, char** argv) {
 
     // estimated max hedge and neighbors count
     dim_t max_hedge_size = std::transform_reduce(std::next(hedges_offsets.begin()), hedges_offsets.end(), hedges_offsets.begin(), dim_t{0}, [](dim_t a, dim_t b) { return std::max(a, b); }, [](dim_t next, dim_t curr) { return next - curr; });
-    dim_t max_neighbors = hg.sampleMaxNeighborhoodSize(240); // TODO: is 240 enough here?
+    dim_t max_neighbors = hg.sampleMaxNeighborhoodSize(2400); // TODO: is 240 enough here?
     std::cout << "Max hedges estimate set to " << max_hedge_size << ", neighbors estimate set to " << max_neighbors << "\n";
 
     // constraints
@@ -1046,6 +1060,7 @@ int main(int argc, char** argv) {
             curr_num_nodes,
             h_max_nodes_per_part,
             h_max_inbound_per_part,
+            candidates_count,
             d_groups
         );
 
@@ -1662,6 +1677,10 @@ int main(int argc, char** argv) {
         #endif
         // =============================
 
+        // settings for refinement
+        bool chainup = false; // true -> chain moves by size, then sort chains into a sequence, false -> directly sort moves into a sequence by gain
+        bool encourage = mode == Mode::INCC; // true -> give a gain to moves that don't fully disconnect an hedge, doing so proportionally to how few pins the leave behind
+
         for (uint32_t fm_repeat = 0u; fm_repeat < refine_repeats; fm_repeat++) {
             std::cout << "Refining level " << level_idx << " repeat " << fm_repeat << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << num_partitions << "\n";
 
@@ -1732,7 +1751,7 @@ int main(int argc, char** argv) {
                 num_partitions,
                 fm_repeat,
                 discount,
-                mode == Mode::INCC, // encourage all moves only when not doing k-way partitioning
+                encourage, // encourage all moves only when not doing k-way partitioning
                 // NOTE: repurposing those from the candidates kernel!
                 d_pairs, // -> moves: pairs[node] -> partition the node wants to join
                 d_f_scores
@@ -1772,31 +1791,51 @@ int main(int argc, char** argv) {
             thrust::device_ptr<float> t_scores(d_f_scores);
 
             // alternate between sequence ordering techniques
-            // sort scores and build an array of ranks (node id -> his move's idx in sorted scores)
-            /*thrust::device_vector<uint32_t> t_indices(curr_num_nodes);
-            thrust::sequence(t_indices.begin(), t_indices.end());
-            // sort scores according to scores themselves and indices in the same way
-            // use node ids as a tie-breaker when sorting moves
-            auto rank_keys_begin = thrust::make_zip_iterator(thrust::make_tuple(t_scores, t_indices.begin()));
-            auto rank_keys_end = rank_keys_begin + curr_num_nodes;
-            thrust::sort(rank_keys_begin, rank_keys_end, [] __device__ (const thrust::tuple<float, uint32_t>& a, const thrust::tuple<float, uint32_t>& b) {
-                    float sa = thrust::get<0>(a), sb = thrust::get<0>(b);
-                    if (sa > sb) return true; // highest score first
-                    if (sa < sb) return false;
-                    return thrust::get<1>(a) < thrust::get<1>(b); // deterministic tie-break
-            });
-            thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks); // invert the permutation such that: ranks[original_index] = sorted_position
-            // free up thrust vectors
-            thrust::device_vector<uint32_t>().swap(t_indices);*/
-            // build move-chains to approximate high-gain swaps, then sort by chain total gain
-            chaining(
-                d_partitions,
-                d_pairs,
-                d_nodes_sizes,
-                d_f_scores,
-                curr_num_nodes,
-                d_ranks
-            );
+            if (chainup) {
+                // sort scores and build an array of ranks (node id -> his move's idx in sorted scores)
+                thrust::device_vector<uint32_t> t_indices(curr_num_nodes);
+                thrust::sequence(t_indices.begin(), t_indices.end());
+                // sort scores according to scores themselves and indices in the same way
+                // use node ids as a tie-breaker when sorting moves
+                auto rank_keys_begin = thrust::make_zip_iterator(thrust::make_tuple(t_scores, t_indices.begin()));
+                auto rank_keys_end = rank_keys_begin + curr_num_nodes;
+                thrust::sort(rank_keys_begin, rank_keys_end, [] __device__ (const thrust::tuple<float, uint32_t>& a, const thrust::tuple<float, uint32_t>& b) {
+                        float sa = thrust::get<0>(a), sb = thrust::get<0>(b);
+                        if (sa > sb) return true; // highest score first
+                        if (sa < sb) return false;
+                        return thrust::get<1>(a) < thrust::get<1>(b); // deterministic tie-break
+                });
+                thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks); // invert the permutation such that: ranks[original_index] = sorted_position
+                // free up thrust vectors
+                thrust::device_vector<uint32_t>().swap(t_indices);
+                // sort scores and build an array of ranks (node id -> his move's idx in sorted scores)
+                /*thrust::device_vector<uint32_t> t_indices(curr_num_nodes);
+                thrust::sequence(t_indices.begin(), t_indices.end());
+                // sort scores according to scores themselves and indices in the same way
+                // use node ids as a tie-breaker when sorting moves
+                auto rank_keys_begin = thrust::make_zip_iterator(thrust::make_tuple(t_scores, t_indices.begin()));
+                auto rank_keys_end = rank_keys_begin + curr_num_nodes;
+                thrust::sort(rank_keys_begin, rank_keys_end, [t_nodes_sizes] __device__ (const thrust::tuple<float, uint32_t>& a, const thrust::tuple<float, uint32_t>& b) {
+                        const uint32_t ia = thrust::get<1>(a), ib = thrust::get<1>(b);
+                        const float ra = thrust::get<0>(a) / static_cast<float>(t_nodes_sizes[ia]), rb = thrust::get<0>(b) / static_cast<float>(t_nodes_sizes[ib]);
+                        if (ra > rb) return true;
+                        if (ra < rb) return false;
+                        return ia < ib; // tie-breaker
+                });
+                thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks); // invert the permutation such that: ranks[original_index] = sorted_position
+                // free up thrust vectors
+                thrust::device_vector<uint32_t>().swap(t_indices);*/
+            } else {
+                // build move-chains to approximate high-gain swaps, then sort by chain total gain
+                chaining(
+                    d_partitions,
+                    d_pairs,
+                    d_nodes_sizes,
+                    d_f_scores,
+                    curr_num_nodes,
+                    d_ranks
+                );
+            }
 
             // launch configuration - fm-ref cascade kernel - same as fm-ref gains kernel
             // compute shared memory per block (bytes)
@@ -1817,7 +1856,7 @@ int main(int argc, char** argv) {
                 num_hedges,
                 curr_num_nodes,
                 num_partitions,
-                mode == Mode::INCC,
+                encourage,
                 d_f_scores
             );
             CUDA_CHECK(cudaGetLastError());
@@ -2099,7 +2138,8 @@ int main(int argc, char** argv) {
                 //if (acquired_gain < 0) std::cerr << "WARNING: applied a refinement move with negative gain on level " << level_idx << " !!\n";
             } else {
                 std::cout << "No valid refinement move found on level " << level_idx << " (reason: " << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : "negative gain")) << ") ...\n";
-                if (fm_repeat < refine_repeats / 3) fm_repeat = refine_repeats / 2;
+                if (size_validity > 0 && !chainup) chainup = true; // enable chaining when no moves are available via greedy sorting because of size constraints
+                else if (fm_repeat < refine_repeats / 3) fm_repeat = refine_repeats / 2;
                 else if (fm_repeat < 2 * refine_repeats / 3) fm_repeat = 2 * refine_repeats / 3;
                 else fm_repeat = refine_repeats; // aka break!
             }

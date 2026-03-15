@@ -334,7 +334,7 @@ void chaining(
     // parameters:
     const int iters = 4; // multi-iteration greedy chaining
     const int K = 256; // candidates scanned per node per iteration
-    const float alpha = 1e-6f; // size penalty scale (adjust based on your size magnitude)
+    const float alpha = 1e-6f; // size penalty scale (adjust based on  size magnitude)
 
     auto exec = thrust::cuda::par.on(stream);
 
@@ -562,6 +562,7 @@ void build_orphan_pairs(
     const uint32_t curr_num_nodes,
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
+    const uint32_t candidates_count,
     uint32_t* d_groups
 ) {
     thrust::device_ptr<const uint32_t> t_pairs(d_pairs);
@@ -576,8 +577,8 @@ void build_orphan_pairs(
     auto out_it = thrust::copy_if(
         idx_begin, idx_end,
         t_free_indices.begin(),
-        [t_pairs] __device__ (uint32_t i) {
-            return t_pairs[i * MAX_CANDIDATES] == UINT32_MAX;
+        [t_pairs, candidates_count] __device__ (uint32_t i) {
+            return t_pairs[i * candidates_count] == UINT32_MAX;
         }
     );
 
