@@ -558,3 +558,32 @@ Initial partitioning for k-way:
 - apply moves up to the one, for each partition, reaching its size limit (on thread per move / node) (atomics to update partition size…)
 - even allow negative gain moves, all applied in parallel, just to scramble things up
 - after T rounds of the above, switch to a best improving subsequence FM style like normal -> only this phase respects monotonically improving connectivity
+
+----
+
+Instead of updating pins to pins_in by removing outbound connections, why not generate connection/disconnection events for every hedge, regardless of in/out.
+Then, we can filter the events, generating inbound set size variation events solely when the pins count going to zero is a result of an inbound hedge?
+NO! It would fail, because you would be also have in the pin count the outbound pins, hence missing out on a disconnection unless the source pin moves too...
+
+----
+
+How to build an ordering of an hypergraph's nodes such that nodes that share strong connections are close together:
+- let each node build an histogram over its neighbors, ranking each by total connection weight between them
+- then extract the maximum out of each node's histogram, tie-breaking deterministically by node id
+- for each node, count how many other have it as their maximum, then take every node with a count >=2 ("not alone") and use it as a team-leader
+- each leader builds a chain of nodes, taking in, one after the other, all those that had chosen it as their maximum, and ordering them by the rank they had in the leader's histogram
+- each chain then becomes one of the next "supernodes" and the process repeats, appending to each chain until a single chain is formed
+
+In other words:
+- each node picks a strongest "attractor"
+- popular attractors are promoted to temporary leaders
+- form local ordered groups around those leaders
+- contract each group into a supernode
+- repeat until one chain remains
+
+----
+
+Placement improvement:
+Why just the 4 elements up-left-right-down, couldn't we have a custom stencil? Like the 8-neighbors stencil! After all, when tensions are proposed, then we build the matching, and thus regardless of candidates, it will work!
+=> how: define a parametric struct with one entry per "adjacent node" and a corresponding enum that tells you the offset w.r.t. you for each adjacent slot!
+=>=>=> this is the natural step to generalize towards hardware graphs instead of lattices!

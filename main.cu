@@ -547,7 +547,12 @@ int main(int argc, char** argv) {
     std::cout << "  Nodes per partition:         " << constr.nodesPerPart() << "\n";
     std::cout << "  Inbound hedge per partition: " << constr.inboundPerPart() << "\n";
     std::cout << "  Maximum partitions:          " << constr.maxParts() << "\n";
-    
+
+    std::cout << "Using settings:\n";
+    std::cout << "  Candidates count:            " << candidates_count << "\n";
+    std::cout << "  Refinement repetitions:      " << refine_repeats << "\n";
+    std::cout << "  Oversized multiplier factor: " << std::fixed << std::setprecision(2) << oversized_multiplier << "\n";
+
     if (!constr.checkFit(hg, false, true))
         std::cerr << "WARNING, the hypergraph did not pass the fit check on the given constraints (NOTE: this test admits false negatives) !!\n";
 

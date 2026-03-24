@@ -386,7 +386,7 @@ void swap_events_kernel(
         const slot target_swap_slot = swap_slots[my_swap_slot.id];
         if (target_swap_slot.id != tid) return;
         if (my_swap_slot.score != target_swap_slot.score)
-            printf("my id %d, my score %d, tg id %d, tg score %d\n", my_swap_slot.id, my_swap_slot.score, target_swap_slot.id, target_swap_slot.score);
+            printf("SCORE SYMMETRY MISMATCH: my id %d, my score %d, tg id %d, tg score %d\n", my_swap_slot.id, my_swap_slot.score, target_swap_slot.id, target_swap_slot.score);
         assert(my_swap_slot.score == target_swap_slot.score);
     }
 

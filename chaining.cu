@@ -46,11 +46,7 @@ float atomicMaxFloat(float* addr, float value) {
     return __int_as_float(old);
 }
 
-// ================================================================
-// Sorting key for (src, -weight) to get outgoing lists by src,
-// with heavier edges first inside each src group.
-// ================================================================
-
+// sorting key for (src, -weight) to group outgoing lists by src, heavier edges going first inside each src group
 struct SrcNegWKey {
     uint32_t src;
     float negw;
@@ -78,31 +74,16 @@ void build_src_keys(
     }
 }
 
-// ================================================================
-// Multi-iteration greedy chaining
+
+// multi-iteration greedy chaining
 //
-// We maintain:
+// data structures:
 //   next[i] : chosen successor edge index (or UINT32_MAX)
 //   prev[j] : chosen predecessor edge index (or UINT32_MAX)
 //
-// Each iteration proposes a successor for edges that don't yet have next.
-// Candidates are from outgoing list of dst[i] (i.e. edges whose src == dst[i]),
-// preferring high weight and similar size.
-// Conflicts are resolved so each successor has at most one predecessor.
-// ================================================================
-
-__global__
-void init_array_u32(int n, uint32_t* a, uint32_t v) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) a[i] = v;
-}
-
-__global__
-void init_array_f(int n, float* a, float v) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) a[i] = v;
-}
-
+// each iteration proposes a successor for edges that don't yet have next
+// candidates are from outgoing list of dst[i] (i.e. edges whose src == dst[i]), preferring high weight and similar node size / inbound set size
+// conflicts are resolved so each successor has at most one predecessor
 __global__
 void propose_successor(
     int n,
@@ -209,13 +190,9 @@ void commit_links(
     }
 }
 
-// ================================================================
-// Component and position extraction
-//
-// For paths, we want pos ~ distance from head (prev==UINT32_MAX).
-// For cycles, we just pick a representative (min index found) and pos is best-effort.
-// ================================================================
-
+// extract component and position for each chain:
+// - for paths, we want pos ~ distance from head (prev == UINT32_MAX)
+// - for cycles, we just pick a representative (min index found) and pos is best-effort
 __global__
 void compute_comp_and_pos(
     int n,
@@ -249,14 +226,7 @@ void compute_comp_and_pos(
     pos[i] = 0;
 }
 
-// ================================================================
-// Final sequence ordering (collision-free)
-//
-// We compute component total weight and count, rank components by weight,
-// then sort edges by (component_rank, pos, edge_id) and assign sequence_idx.
-// This guarantees sequence_idx is a permutation [0..n-1].
-// ================================================================
-
+// sorting key for edges in sequences
 struct EdgeOrderKey {
     uint32_t comp_rank;
     uint32_t pos;
@@ -272,6 +242,9 @@ struct EdgeOrderLess {
     }
 };
 
+// final sequence ordering (collision-free)
+// compute component total weight and count, rank components by weight, then sort edges by (component_rank, pos, edge_id) and assign sequence_idx
+// => guarantees that sequence_idx is a permutation of [0..n-1]
 __global__
 void build_edge_order_keys(
     int n,
@@ -312,7 +285,7 @@ void scatter_sequence_idx(
 // WARNING: NOT DETERMINISTIC
 // !!!!!!!!!!!!!!!!!!!!!!!!!!
 
-// Given a set of src->dst pairs, each with a size and a weight, try to construct
+// given a set of src->dst pairs, each with a size and a weight, try to construct
 // subsequences of pairs with similar size and highest total weight such that each's dst is
 // the src of the next pair, stopping upon forming a cycle. The concatenation of subsequences
 // by descending weight is then the final sequence returned.
@@ -369,8 +342,8 @@ void chaining(
 
     // chaining state
     thrust::device_vector<uint32_t> d_next(n), d_prev(n);
-    init_array_u32<<<blocks, threads, 0, stream>>>(n, thrust::raw_pointer_cast(d_next.data()), UINT32_MAX);
-    init_array_u32<<<blocks, threads, 0, stream>>>(n, thrust::raw_pointer_cast(d_prev.data()), UINT32_MAX);
+    CUDA_CHECK(cudaMemsetAsync(thrust::raw_pointer_cast(d_next.data()), 0xFF, n * sizeof(uint32_t), stream)); // init to UINT32_MAX
+    CUDA_CHECK(cudaMemsetAsync(thrust::raw_pointer_cast(d_prev.data()), 0xFF, n * sizeof(uint32_t), stream)); // init to UINT32_MAX
 
     // temporary proposal / conflict buffers
     thrust::device_vector<uint32_t> d_succ_choice(n);
@@ -381,8 +354,8 @@ void chaining(
 
     // multi-iteration greedy build
     for (int it = 0; it < iters; ++it) {
-        init_array_f<<<blocks, threads, 0, stream>>>(n, thrust::raw_pointer_cast(d_best_score.data()), -1e30f);
-        init_array_u32<<<blocks, threads, 0, stream>>>(n, thrust::raw_pointer_cast(d_best_pred.data()), UINT32_MAX);
+        thrust::fill(exec, d_best_score.begin(), d_best_score.end(), -1e30f);
+        CUDA_CHECK(cudaMemsetAsync(thrust::raw_pointer_cast(d_best_pred.data()), 0xFF, n * sizeof(uint32_t), stream)); // init to UINT32_MAX
 
         propose_successor<<<blocks, threads, 0, stream>>>(
             n,
@@ -545,13 +518,7 @@ void pair_kth_smallest_with_kth_largest(
     d_groups[idxR] = gid;
 }
 
-// ================================================================
-// d_nodes_sizes, d_inbound_count, d_pairs, d_groups are device pointers
-// h_max_nodes_per_part, h_max_inbound_per_part are the constraints
-// NOTE: d_groups should be pre-initialized; this routine writes group ids for paired nodes only.
-// ================================================================
-
-// Given a set of pairs proposed between nodes (d_pairs), isolate nodes without a pair,
+// given a set of pairs proposed between nodes (d_pairs), isolate nodes without a pair,
 // try to force them into a pair with another node in the same condition such that their
 // combined size and inbound set cardinality are within constraints. The objective is an
 // almost-maximal number of formed pairs.
@@ -563,7 +530,7 @@ void build_orphan_pairs(
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
     const uint32_t candidates_count,
-    uint32_t* d_groups
+    uint32_t* d_groups // pre-initialized -> this routine writes group ids for paired nodes only.
 ) {
     thrust::device_ptr<const uint32_t> t_pairs(d_pairs);
 

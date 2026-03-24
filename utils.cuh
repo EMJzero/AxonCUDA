@@ -44,8 +44,8 @@ using dim_t = unsigned long long; // aka uint64_t
 
 #define SMALL_PART_MERGE_SIZE_THRESHOLD 15 // number of nodes below which partitions are considered "small" and an attempt is done at merging them with one-another
 
-#define KWAY_INIT_UPPER_THREASHOLD 1200 // number of coarse nodes below which to run the initial partitioning algorithm (KWAY model only)
-#define KWAY_INIT_LOWER_THREASHOLD 800 // number of coarse nodes below which to undo the last coarsening round and run the initial partitioning algorithm (KWAY model only)
+#define KWAY_INIT_UPPER_THREASHOLD 8192 // number of coarse nodes below which to run the initial partitioning algorithm (KWAY model only)
+#define KWAY_INIT_LOWER_THREASHOLD 1024 // number of coarse nodes below which to undo the last coarsening round and run the initial partitioning algorithm (KWAY model only)
 #define KWAY_INIT_SHRINK_RATIO_LIMIT 0.95f // coarsening ratio between levels above which to run the initial partitioning algorithm (KWAY model only)
 
 #define INIT_SEED 86 // seed for random initialization (KWAY mode only)
@@ -173,7 +173,7 @@ __device__ __forceinline__ uint32_t deterministic_noise(uint32_t a, uint32_t b) 
 // USED BY: grouping kernel
 
 #define MAX_GROUP_SIZE 1u // => MAX_GROUP_SIZE - 1 slots per node; 2 means pairs
-#define PATH_SIZE 192u // initial slots for nodes to see while traversing the pairs tree, TODO: automatically extend if needed (costly...)
+#define PATH_SIZE 224u // initial slots for nodes to see while traversing the pairs tree, TODO: automatically extend if needed (costly...)
 #define MAX_REPEATS 64u // maximum number of nodes a single thread can handle, must be less than 32 (due to using one-hot anti-repeat encoding)
 
 typedef struct __align__(8) {
@@ -253,7 +253,7 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* __restrict__ s, uin
 
 // USED BY: fm refinement kernel
 
-#define REFINE_REPEATS 32u // repetitions of FM refinement per uncoarsening level
+#define REFINE_REPEATS 16u // 64u // 256u // repetitions of FM refinement per uncoarsening level
 
 #define PART_HIST_SIZE 64u // best if it is a multiple of WARP_SIZE, best if partitions_per_thread * WARP_SIZE <= num_partitions
 
