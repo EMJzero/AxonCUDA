@@ -2,20 +2,33 @@
 # Project settings
 # ==========================================
 TARGET      := hgraph_gpu.exe
+
+SRC_DIR     := sources
+HDR_DIR     := headers
+INC_DIR     := includes
+BUILD_DIR   := build
+
 CXX         := g++
 NVCC        := nvcc
+ARCH        := native
 
-CXXFLAGS    := -O3 --std=c++20 -Wall -Wextra -fopenmp -I .
-NVCCFLAGS   := -O3 --std=c++20 -arch=native -dc -allow-unsupported-compiler --extended-lambda -Xcompiler "-Wall -Wextra -Wno-maybe-uninitialized -Wno-unused-function -fopenmp" -I .
-LINKFLAGS   := --std=c++20 -arch=native -allow-unsupported-compiler --extended-lambda -lgomp
+CXXFLAGS    := -O3 --std=c++20 -Wall -Wextra -fopenmp -I$(HDR_DIR) -I$(INC_DIR)
+NVCCFLAGS   := -O3 --std=c++20 -arch=$(ARCH) -dc -allow-unsupported-compiler --extended-lambda \
+               -Xcompiler "-Wall -Wextra -Wno-maybe-uninitialized -Wno-unused-function -fopenmp" \
+               -I $(HDR_DIR) -I $(INC_DIR)
+LINKFLAGS   := --std=c++20 -arch=$(ARCH) -allow-unsupported-compiler --extended-lambda -lgomp
 
-SRC_CPPS    := #main.cpp
-SRC_CUS     := main.cu kernel.cu init_part.cu chaining.cu
+# ==========================================
+# Source discovery
+# ==========================================
+SRC_CPPS    := $(wildcard $(SRC_DIR)/*.cpp)
+SRC_CUS     := $(wildcard $(SRC_DIR)/*.cu)
 
-OBJ_CPPS    := $(SRC_CPPS:.cpp=.o)
-OBJ_CUS     := $(SRC_CUS:.cu=.o)
-
+OBJ_CPPS    := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(SRC_CPPS))
+OBJ_CUS     := $(patsubst $(SRC_DIR)/%.cu,$(BUILD_DIR)/%.o,$(SRC_CUS))
 OBJS        := $(OBJ_CPPS) $(OBJ_CUS)
+
+DEPS        := $(OBJS:.o=.d)
 
 # ==========================================
 # Build rules
@@ -25,22 +38,27 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(NVCC) $(LINKFLAGS) -o $@ $^
 
-%.o: %.cpp hgraph.hpp constr.hpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
 
-%.o: %.cu hgraph.hpp constr.hpp utils.cuh
-	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -MMD -MP -c $< -o $@
+
+-include $(DEPS)
 
 # ==========================================
-# Argument extraction (for run, profile, and memcheck)
+# Argument extraction (for run, profile, memcheck)
 # ==========================================
 RUN_ARG_1     := $(word 2, $(MAKECMDGOALS))
 RUN_ARG_2     := $(word 3, $(MAKECMDGOALS))
 PROFILE_ARG_1 := $(word 2, $(MAKECMDGOALS))
 PROFILE_ARG_2 := $(word 3, $(MAKECMDGOALS))
 
-# Dummy rule to avoid "No rule to make target 'filename'"
-$(RUN_ARG1) $(RUN_ARG2) $(PROFILE_ARG1) $(PROFILE_ARG2):
+# Dummy rule to avoid "No rule to make target ..."
+$(RUN_ARG_1) $(RUN_ARG_2) $(PROFILE_ARG_1) $(PROFILE_ARG_2):
 	@:
 
 # ==========================================
@@ -97,6 +115,7 @@ memcheck: $(TARGET)
 
 # ==========================================
 clean:
-	rm -f $(TARGET) *.o *.qdrep *.nsys-rep *.sqlite
+	rm -f $(TARGET) *.qdrep *.nsys-rep *.sqlite
+	rm -rf $(BUILD_DIR)
 
 .PHONY: all run run8k profile memcheck clean

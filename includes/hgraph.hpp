@@ -364,7 +364,10 @@ namespace hgraph {
             return HyperGraph(new_nodes, new_hedges, new_weights);
         }
 
-        HyperGraph feedForwardOrder() const {
+        // return a greedy order of nodes that maximizes high-locality
+        // -> frontier expansion starting from nodes with minimal inbound connections
+        // -> iteratively add to the frontier the node most strongly connected to those already part of it
+        std::vector<int32_t> feedForwardOrder() const {
             std::vector<int32_t> new_id(node_count_, -1);
             std::vector<float> priority(node_count_, 0.0f);
             std::vector<bool> active(node_count_, false);
@@ -439,6 +442,13 @@ namespace hgraph {
                     }
                 }
             }
+
+            return new_id;
+        }
+
+        // renames nodes according to a new id give for each of them
+        HyperGraph renameNodes(std::vector<int32_t> new_id) const {
+            if (new_id.size() != node_count_) throw std::runtime_error("The number of new ids did not match the number of existing nodes");
 
             std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> new_hedges;
             std::vector<float> new_weights;

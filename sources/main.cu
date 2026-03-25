@@ -24,395 +24,24 @@
 
 #include "hgraph.hpp"
 #include "constr.hpp"
+#include "runconfig.hpp"
+
 #include "utils.cuh"
+#include "constants.cuh"
+#include "coarsening.cuh"
+#include "construction.cuh"
+#include "refinement.cuh"
+#include "chaining.cuh"
+#include "init_part.cuh"
 
 #define DEVICE_ID 0
 
-#define VERBOSE true
+#define VERBOSE false
 #define VERBOSE_LENGTH 20
-
-extern __global__ void neighborhoods_count_kernel(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
-    const uint32_t num_nodes,
-    const dim_t max_neighbors,
-    const bool discharge,
-    uint32_t* neighbors,
-    dim_t* neighbors_offsets
-);
-
-extern __global__ void neighborhoods_scatter_kernel(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
-    const uint32_t num_nodes,
-    const dim_t* neighbors_offsets,
-    uint32_t* neighbors
-);
-
-extern __global__ void candidates_kernel(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
-    const uint32_t* neighbors,
-    const dim_t* neighbors_offsets,
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
-    const uint32_t* inbound_count,
-    const float* hedge_weights,
-    const uint32_t* nodes_sizes,
-    const uint32_t num_nodes,
-    const uint32_t candidates_count,
-    uint32_t* pairs,
-    uint32_t* scores
-);
-
-extern __global__ void grouping_kernel(
-    const uint32_t* pairs,
-    const uint32_t* scores,
-    const uint32_t* nodes_sizes,
-    const uint32_t num_nodes,
-    const uint32_t num_repeats,
-    const uint32_t candidates_count,
-    slot* group_slots,
-    dp_score* d_dp_scores,
-    uint32_t* groups
-);
-
-extern __global__ void apply_coarsening_hedges_count(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
-    const uint32_t* groups,
-    const uint32_t num_hedges,
-    const uint32_t max_hedge_size,
-    uint32_t *coarse_oversized_hedges,
-    dim_t* coarse_hedges_offsets,
-    uint32_t* coarse_srcs_count
-);
-
-extern __global__ void apply_coarsening_hedges_scatter_dsts(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
-    const uint32_t* groups,
-    const uint32_t num_hedges,
-    const dim_t* coarse_hedges_offsets,
-    uint32_t* coarse_hedges
-);
-
-extern __global__ void apply_coarsening_hedges_scatter_srcs(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
-    const uint32_t* groups,
-    const uint32_t num_hedges,
-    const dim_t* coarse_hedges_offsets,
-    const uint32_t* coarse_srcs_count,
-    uint32_t* coarse_hedges
-);
-
-extern __global__ void apply_coarsening_neighbors_count(
-    const uint32_t* neighbors,
-    const dim_t* neighbors_offsets,
-    const uint32_t* groups,
-    const uint32_t* ungroups,
-    const dim_t* ungroups_offsets,
-    const uint32_t num_groups,
-    const dim_t max_neighbors,
-    const bool discharge,
-    uint32_t* oversized_coarse_neighbors,
-    dim_t* coarse_neighbors_offsets
-);
-
-extern __global__ void apply_coarsening_neighbors_scatter(
-    const uint32_t* neighbors,
-    const dim_t* neighbors_offsets,
-    const uint32_t* groups,
-    const uint32_t* ungroups,
-    const dim_t* ungroups_offsets,
-    const uint32_t num_groups,
-    const dim_t* coarse_neighbors_offsets,
-    uint32_t* coarse_neighbors
-);
-
-extern __global__ void apply_coarsening_touching_count(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t num_hedges,
-    dim_t* coarse_touching_offsets
-) ;
-
-extern __global__ void apply_coarsening_touching_scatter_inbound(
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
-    const uint32_t* inbound_count,
-    const uint32_t* ungroups,
-    const dim_t* ungroups_offsets,
-    const uint32_t num_groups,
-    const dim_t* coarse_touching_offsets,
-    uint32_t* coarse_touching,
-    uint32_t* coarse_inbound_count
-);
-
-extern __global__ void apply_coarsening_touching_scatter_outbound(
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
-    const uint32_t* inbound_count,
-    const uint32_t* ungroups,
-    const dim_t* ungroups_offsets,
-    const uint32_t num_groups,
-    const dim_t* coarse_touching_offsets,
-    const uint32_t* coarse_inbound_count,
-    uint32_t* coarse_touching
-);
-
-extern __global__ void apply_uncoarsening_partitions(
-    const uint32_t* groups,
-    const uint32_t* coarse_partitions,
-    const uint32_t num_nodes,
-    uint32_t* partitions
-);
-
-extern __global__ void pins_per_partition_kernel(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* partitions,
-    const uint32_t num_hedges,
-    const uint32_t num_partitions,
-    uint32_t* pins_per_partitions,
-    uint32_t* partitions_inbound_sizes
-);
-
-extern __global__ void inbound_pins_per_partition_kernel(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
-    const uint32_t* partitions,
-    const uint32_t num_hedges,
-    const uint32_t num_partitions,
-    uint32_t* inbound_pins_per_partitions,
-    uint32_t* partitions_inbound_sizes
-);
-
-extern __global__ void fm_refinement_gains_kernel(
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
-    const float* hedge_weights,
-    const uint32_t* partitions,
-    const uint32_t* pins_per_partitions,
-    const uint32_t* nodes_sizes,
-    const uint32_t* partitions_sizes,
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    const uint32_t randomizer,
-    const uint32_t discount,
-    const bool encourage_all_moves,
-    uint32_t* moves,
-    float* scores
-);
-
-extern __global__ void fm_refinement_cascade_kernel(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
-    const float* hedge_weights,
-    const uint32_t* move_ranks,
-    const uint32_t* moves,
-    const uint32_t* partitions,
-    const uint32_t* pins_per_partitions,
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    const bool encourage_all_moves,
-    float* scores
-);
-
-extern __global__ void fm_refinement_apply_kernel(
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
-    const uint32_t* moves,
-    const uint32_t* move_ranks,
-    const uint32_t* nodes_sizes,
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    const uint32_t num_good_moves,
-    uint32_t* partitions,
-    uint32_t* partitions_sizes
-    //uint32_t* pins_per_partitions
-);
-
-extern __global__ void build_size_events_kernel(
-    const uint32_t* moves,
-    const uint32_t* ranks,
-    const uint32_t* partitions,
-    const uint32_t* nodes_sizes,
-    const uint32_t num_nodes,
-    uint32_t* ev_partition,
-    uint32_t* ev_index,
-    int32_t* ev_delta
-);
-
-extern __global__ void flag_size_events_kernel(
-    const uint32_t* ev_partition,
-    const uint32_t* ev_index,
-    const int32_t* ev_delta,
-    const uint32_t* partitions_sizes,
-    const uint32_t num_events,
-    int32_t* valid_moves
-);
-
-extern __global__ void build_hedge_events_kernel(
-    const uint32_t* moves,
-    const uint32_t* ranks,
-    const uint32_t* partitions,
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
-    const uint32_t* inbound_count,
-    const uint32_t num_nodes,
-    uint32_t* ev_partition,
-    uint32_t* ev_index,
-    uint32_t* ev_hedge,
-    int32_t* ev_delta
-);
-
-extern __global__ void count_inbound_size_events_kernel(
-    const uint32_t* partitions_inbound_counts,
-    const uint32_t* ev_partition,
-    const uint32_t* ev_index,
-    const uint32_t* ev_hedge,
-    const int32_t* ev_delta,
-    uint32_t num_events,
-    uint32_t num_partitions,
-    uint32_t* inbound_size_events_offsets
-);
-
-extern __global__ void build_inbound_size_events_kernel(
-    const uint32_t* partitions_inbound_counts,
-    const uint32_t* ev_partition,
-    const uint32_t* ev_index,
-    const uint32_t* ev_hedge,
-    const int32_t* ev_delta,
-    const uint32_t* inbound_size_events_offsets,
-    uint32_t num_events,
-    uint32_t num_partitions,
-    uint32_t* new_ev_partition,
-    uint32_t* new_ev_index,
-    int32_t* new_ev_delta
-);
-
-extern __global__ void flag_inbound_events_kernel(
-    const uint32_t* ev_partition,
-    const uint32_t* ev_index,
-    const int32_t* ev_delta,
-    const uint32_t* partitions_inbound_sizes,
-    const uint32_t num_events,
-    int32_t* valid_moves
-);
-
-extern __global__ void pack_segments(
-    const uint32_t* oversized,
-    const dim_t* offsets,
-    const uint32_t num_subs,
-    const dim_t sub_size,
-    uint32_t* out
-);
-
-extern __global__ void pack_segments_varsize(
-    const uint32_t* oversized,
-    const dim_t* oversized_offsets,
-    const dim_t* offsets,
-    const uint32_t num_subs,
-    const dim_t base_sub_size,
-    uint32_t* out
-);
-
-extern std::tuple<uint32_t*, uint32_t*> initial_partitioning(
-    const uint32_t num_nodes,
-    const uint32_t num_hedges,
-    const uint32_t* d_hedges,
-    const dim_t* d_hedges_offsets,
-    const float* d_hedge_weights,
-    const dim_t hedges_size,
-    const uint32_t* d_touching,
-    const dim_t* d_touching_offsets,
-    const uint32_t* d_nodes_sizes,
-    const uint32_t max_parts,
-    const uint32_t h_max_nodes_per_part
-);
-
-extern std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
-    const uint32_t num_nodes,
-    const uint32_t num_hedges,
-    const uint32_t* d_hedges,
-    const dim_t* d_hedges_offsets,
-    const float* d_hedge_weights,
-    const dim_t* d_touching_offsets,
-    const dim_t hedges_size,
-    const uint32_t* d_nodes_sizes,
-    const uint32_t k,
-    const float epsilon,
-    const uint32_t h_max_nodes_per_part
-);
-
-extern void chaining(
-    const uint32_t *srcs,
-    const uint32_t *dsts,
-    const uint32_t *size,
-    const float *weight,
-    const uint32_t num,
-    uint32_t *sequence_idx,
-    cudaStream_t stream = 0
-);
-
-extern void build_orphan_pairs(
-    const uint32_t* d_nodes_sizes,
-    const uint32_t* d_inbound_count,
-    const uint32_t* d_pairs,
-    const uint32_t curr_num_nodes,
-    const uint32_t h_max_nodes_per_part,
-    const uint32_t h_max_inbound_per_part,
-    const uint32_t candidates_count,
-    uint32_t* d_groups
-);
-
-extern __constant__ uint32_t max_nodes_per_part;
-extern __constant__ uint32_t max_inbound_per_part;
-
 
 using namespace hgraph;
 using namespace constraints;
 
-
-void printHelp() {
-    std::cout <<
-        "Usage:\n"
-        "  prog -r <input_file> [-c <constr>] [-s <output_file>] [-p <part_file>]\n"
-        "  prog -r <input_file> [-k <k> <ε>] [-s <output_file>] [-p <part_file>]\n"
-        "  prog -h\n\n"
-        "Options:\n"
-        "  -r <file>   Reload hypergraph from file\n"
-        "  -s <file>   Save partitioned hypergraph to file\n"
-        "  -p <file>   Save the partitioning to file (one line per node, containing its partition id)\n"
-        "  -c <name>   Preconfigured constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024 - default is loihi64)\n"
-        "  -m <> <> <> Constraints set to use, in order: max part. size, max part. distinct inbound hedges, max num. of part.s (overrides '-c')\n"
-        "  -k <k> <ε>  K-way balanced constraints set to use (overrides '-c' and '-m')\n"
-        "  -om <mult>  Set the deduplication oversized segment size multiplier (increase to avoid the 'GM hash-set full!' assert)\n"
-        "  -cnc <num>  Set the count of candidates proposed per node during coarsening\n"
-        "  -rfr <num>  Set the number of refinement repetitions per level\n"
-        "  -h          Show this help\n";
-}
-
-enum class Mode {
-    INCC, // incidence constraints
-    KWAY  // k-way balanced
-};
 
 int main(int argc, char** argv) {
     if (argc == 1) {
@@ -420,138 +49,31 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::string load_path;
-    std::string save_path;
-    std::string part_path;
-    Mode mode = Mode::INCC;
-    std::string constraints_name;
-    ConstraintsConfig constr_config;
-    uint32_t kway = UINT32_MAX;
-    float epsi = FLT_MAX;
-    float oversized_multiplier = OVERSIZED_SIZE_MULTIPLIER;
-    uint32_t candidates_count = MAX_CANDIDATES;
-    uint32_t refine_repeats = REFINE_REPEATS;
-
-    // CLI handling
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "-h") { printHelp(); return 0; }
-        else if (arg == "-r") {
-            if (i + 1 >= argc) { std::cerr << "Error: -r requires a file path\n"; return 1; }
-            load_path = argv[++i];
-        } else if (arg == "-s") {
-            if (i + 1 >= argc) { std::cerr << "Error: -s requires a file path\n"; return 1; }
-            save_path = argv[++i];
-        } else if (arg == "-p") {
-            if (i + 1 >= argc) { std::cerr << "Error: -p requires a file path\n"; return 1; }
-            part_path = argv[++i];
-        } else if (arg == "-c") {
-            if (i + 1 >= argc) { std::cerr << "Error: -c requires a config name\n"; return 1; }
-            constraints_name = argv[++i];
-            mode = Mode::INCC;
-        } else if (arg == "-m") {
-            if (i + 3 >= argc) { std::cerr << "Error: -m requires integer values for the three constraints\n"; return 1; }
-            constr_config.name = "manual";
-            constr_config.nodes_per_part = std::stoul(argv[++i]);
-            constr_config.inbound_per_part = std::stoul(argv[++i]);
-            constr_config.max_parts = std::stoul(argv[++i]);
-            mode = Mode::INCC;
-        } else if (arg == "-k") {
-            if (i + 2 >= argc) { std::cerr << "Error: -k requires values for 'k' and 'ε'\n"; return 1; }
-            kway = std::stoul(argv[++i]);
-            epsi = std::stof(argv[++i]);
-            mode = Mode::KWAY;
-        } else if (arg == "-om") {
-            if (i + 1 >= argc) { std::cerr << "Error: -om requires a float value\n"; return 1; }
-            oversized_multiplier = std::stof(argv[++i]);
-        } else if (arg == "-cnc") {
-            if (i + 1 >= argc) { std::cerr << "Error: -cnc requires a positive integer value\n"; return 1; }
-            candidates_count = std::stoul(argv[++i]);
-            if (candidates_count > MAX_CANDIDATES) { std::cerr << "Error: -cnc must be less or equal to " << MAX_CANDIDATES << "\n"; return 1; }
-        } else if (arg == "-rfr") {
-            if (i + 1 >= argc) { std::cerr << "Error: -rfr requires a positive integer value\n"; return 1; }
-            refine_repeats = std::stoul(argv[++i]);
-        } else { std::cerr << "Unknown option: " << arg << "\n"; return 1; }
-    }
+    // parse CLI args
+    runconfig cfg = parseArgs(argc, argv);
 
     // load hypergraph
-    HyperGraph hg(0, {}, {}); // placeholder -> overwritten if "-r" is given
-    bool loaded = false;
-
-    if (!load_path.empty()) {
-        try {
-            if (!std::filesystem::is_regular_file(load_path)) throw std::runtime_error("Failed to load hypergraph, the provided path is not a file.");
-            std::filesystem::path file_path(load_path);
-            if (file_path.extension() == ".hgr") {
-                std::cout << "Loading hypergraph from: " << load_path << " (hMETIS format) ...\n";
-                std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
-                hg = HyperGraph::loadhMETIS(load_path);
-            } else if (file_path.extension() == ".snn") {
-                std::cout << "Loading hypergraph from: " << load_path << " (SNN format) ...\n";
-                std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
-                hg = HyperGraph::loadSNN(load_path);
-            } else if (file_path.extension() == ".axh") {
-                std::cout << "Loading hypergraph from: " << load_path << " (AXH format) ...\n";
-                std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
-                hg = HyperGraph::loadAXH(load_path);
-            } else {
-                throw std::runtime_error("Failed to load hypergraph, unsupported file format (supported: '.hgr', '.snn', '.axh').");
-            }
-            loaded = true;
-        } catch (const std::exception& e) {
-            std::cerr << "Error loading file: " << e.what() << "\n";
-            return 1;
-        }
-
-        // print statistics
-        std::cout << "Loaded hypergraph:\n";
-        std::cout << "  Nodes:      " << hg.nodes() << "\n";
-        std::cout << "  Hyperedges: " << hg.hedges().size() << "\n";
-        std::cout << "  Total pins: " << hg.hedgesFlat().size() << "\n";
-        std::cout << "  Total connections weight: " << std::fixed << std::setprecision(3) << hg.connectivity() << "\n";
-    } else {
-        std::cerr << "WARNING, no hypergraph provided (-r), performing a dry-run !!\n";
-    }
+    HyperGraph hg = loadHgraph(cfg);
 
     // setup constraints
-    std::optional<Constraints> constr_tmp;
-    std::unordered_map<std::string, Constraints (*)()> configurations {
-        { "loihi64", Constraints::createLoihiLarge },
-        { "loihi84", Constraints::createLoihiJin84 },
-        { "loihi1024", Constraints::createLoihiJin1024 },
-        { "truenorth", Constraints::createTrueNorth }
-    };
-    auto constr_it = configurations.find(constraints_name);
-    if (mode == Mode::KWAY) { // k-way mode ('-k')
-        std::ostringstream epsistr;
-        epsistr << std::fixed << std::setprecision(3) << epsi;
-        constr_config.name = std::to_string(kway) + "-way " + epsistr.str() + " balanced";
-        constr_config.nodes_per_part = (uint32_t)std::ceil((1 + epsi)*(float)hg.nodes()/kway);
-        constr_config.inbound_per_part = INT32_MAX;
-        constr_config.max_parts = kway;
-        constr_tmp = Constraints(constr_config);
-    } else if (constr_config.name == "manual") { // manual constraints ('-m')
-        if (constr_config.nodes_per_part == 0) { std::cerr << "Error: the 1st constraint (max partition size) must be a positive integer \n"; return 1; }
-        if (constr_config.inbound_per_part == 0) { std::cerr << "Error: the 2nd constraint (max distinct inbound hedge per partition) must be a positive integer \n"; return 1; }
-        if (constr_config.max_parts == 0) { std::cerr << "Error: the 3rd constraint (max number of partitions) must be a positive integer \n"; return 1; }
-        constr_tmp = Constraints(constr_config);
-    } else if (constr_it != configurations.end()) { // preconfigured constraints ('-c')
-        constr_tmp = constr_it->second();
-    } else { // no (valid) constraints provided
-        std::cerr << "WARNING, no constraints provided (-c, -m, -k), using loihi64 !!\n";
-        constr_tmp = Constraints::createLoihiLarge();
-    }
-    Constraints &constr = *constr_tmp;
-    
+    Constraints constr = setupConstr(cfg, hg);
+
+    // print statistics
+    std::cout << "Loaded hypergraph:\n";
+    std::cout << "  Nodes:      " << hg.nodes() << "\n";
+    std::cout << "  Hyperedges: " << hg.hedges().size() << "\n";
+    std::cout << "  Total pins: " << hg.hedgesFlat().size() << "\n";
+    std::cout << "  Total connections weight: " << std::fixed << std::setprecision(3) << hg.connectivity() << "\n";
+
     std::cout << "Using constraints \"" << constr.name() << "\":\n";
     std::cout << "  Nodes per partition:         " << constr.nodesPerPart() << "\n";
     std::cout << "  Inbound hedge per partition: " << constr.inboundPerPart() << "\n";
     std::cout << "  Maximum partitions:          " << constr.maxParts() << "\n";
 
     std::cout << "Using settings:\n";
-    std::cout << "  Candidates count:            " << candidates_count << "\n";
-    std::cout << "  Refinement repetitions:      " << refine_repeats << "\n";
-    std::cout << "  Oversized multiplier factor: " << std::fixed << std::setprecision(2) << oversized_multiplier << "\n";
+    std::cout << "  Candidates count:            " << cfg.candidates_count << "\n";
+    std::cout << "  Refinement repetitions:      " << cfg.refine_repeats << "\n";
+    std::cout << "  Oversized multiplier factor: " << std::fixed << std::setprecision(2) << cfg.oversized_multiplier << "\n";
 
     if (!constr.checkFit(hg, false, true))
         std::cerr << "WARNING, the hypergraph did not pass the fit check on the given constraints (NOTE: this test admits false negatives) !!\n";
@@ -605,7 +127,7 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> touching_hedges;
     std::vector<dim_t> touching_hedges_offsets;
     std::vector<uint32_t> inbound_count;
-    touching_hedges.reserve(hg.hedgesFlat().size()); // with one outbound hedge per node, the total number of pins (e*d) is the total number of connections (n*h)
+    touching_hedges.reserve(hg.hedgesFlat().size());
     touching_hedges_offsets.reserve(hg.nodes() + 1);
     inbound_count.reserve(hg.nodes());
 
@@ -709,9 +231,9 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_touching_offsets, (num_nodes + 1) * sizeof(dim_t))); // touching_offsets[node idx] -> touching set start idx in d_touching
     CUDA_CHECK(cudaMalloc(&d_inbound_count, num_nodes * sizeof(uint32_t))); // inbound_count[node idx] -> how many hedge of touching[node idx] are inbound (inbound hedges are before inbound_count[node idx], then outbound)
     CUDA_CHECK(cudaMalloc(&d_hedge_weights, num_hedges * sizeof(float))); // hedge_weights[hedge idx] -> weight
-    CUDA_CHECK(cudaMalloc(&d_pairs, num_nodes * sizeof(uint32_t) * candidates_count)); // partitions[node idx] -> best neighbor
+    CUDA_CHECK(cudaMalloc(&d_pairs, num_nodes * sizeof(uint32_t) * cfg.candidates_count)); // partitions[node idx] -> best neighbor
     CUDA_CHECK(cudaMalloc(&d_f_scores, num_nodes * sizeof(float))); // connection streght for each pair, used during refinement
-    CUDA_CHECK(cudaMalloc(&d_u_scores, num_nodes * sizeof(uint32_t) * candidates_count)); // fixed point version of the above, used for the multi-candidates kernel
+    CUDA_CHECK(cudaMalloc(&d_u_scores, num_nodes * sizeof(uint32_t) * cfg.candidates_count)); // fixed point version of the above, used for the multi-candidates kernel
     CUDA_CHECK(cudaMalloc(&d_slots, num_nodes * sizeof(slot) * MAX_GROUP_SIZE)); // slot to finalize node pairs during grouping (true dtype: "slot")
     CUDA_CHECK(cudaMalloc(&d_dp_scores, num_nodes * sizeof(dp_score))); // dynamic programming score for each node in the tree assuming it connected (with) or not (w/out) to its target
     CUDA_CHECK(cudaMalloc(&d_nodes_sizes, num_nodes * sizeof(uint32_t))); // nodes_size[node idx] -> how many pins the node counts as towards the partition size limit
@@ -747,7 +269,7 @@ int main(int argc, char** argv) {
     // uses a two-step method, first just counting, then writing, to allocate exactly the amount of memory needed, since neighborhoods can explode quickly...
     // if there is enough memory, a speedier version is used, that replaced the scatter with a direct pack from the initial oversized allocation!
     uint32_t *d_oversized_neighbors = nullptr;
-    dim_t init_max_neighbors = (dim_t)std::ceil(oversized_multiplier * (float)max_neighbors);
+    dim_t init_max_neighbors = (dim_t)std::ceil(cfg.oversized_multiplier * (float)max_neighbors);
     cudaMemGetInfo(&free_bytes, &total_bytes);
     // check if there could be space to allocate both oversized neighbors and final neighbors at once; with no better guess, use 'max_neighbors' to estimate the final neighbors size...
     bool direct_scatter_neighbors = (num_nodes * init_max_neighbors /*oversized*/ + num_nodes * max_neighbors /*final upper bound*/) * sizeof(uint32_t) + num_nodes * sizeof(dim_t) /*offsets*/ < free_bytes;
@@ -903,7 +425,7 @@ int main(int argc, char** argv) {
         // ======================================
         // k-way base case, build inital partitioning
         // => condition: passed the nodes threshold
-        if (mode == Mode::KWAY && curr_num_nodes < KWAY_INIT_UPPER_THREASHOLD) {
+        if (cfg.mode == Mode::KWAY && curr_num_nodes < KWAY_INIT_UPPER_THREASHOLD) {
             /*auto [d_init_partitions, d_init_partitions_sizes] = initial_partitioning(
                 curr_num_nodes,
                 num_hedges,
@@ -926,8 +448,8 @@ int main(int argc, char** argv) {
                 d_touching_offsets,
                 hedges_size,
                 d_nodes_sizes,
-                kway,
-                epsi,
+                cfg.kway,
+                cfg.epsi,
                 h_max_nodes_per_part
             );
             d_partitions_sizes = d_init_partitions_sizes;
@@ -939,7 +461,7 @@ int main(int argc, char** argv) {
 
         // zero-out candidates kernel's outputs
         // TODO: could just init. up to curr_num_nodes
-        CUDA_CHECK(cudaMemset(d_pairs, 0xFF, num_nodes * sizeof(uint32_t) * candidates_count)); // 0xFF -> UINT32_MAX
+        CUDA_CHECK(cudaMemset(d_pairs, 0xFF, num_nodes * sizeof(uint32_t) * cfg.candidates_count)); // 0xFF -> UINT32_MAX
         // NOTE: no need to init. "d_u_scores" if we use "d_pairs" to see which locations are valid
         
         // launch configuration - candidates kernel
@@ -965,7 +487,7 @@ int main(int argc, char** argv) {
             d_hedge_weights,
             d_nodes_sizes,
             curr_num_nodes,
-            candidates_count,
+            cfg.candidates_count,
             d_pairs,
             d_u_scores
         );
@@ -975,18 +497,18 @@ int main(int argc, char** argv) {
         // =============================
         // print some temporary results
         #if VERBOSE
-        std::vector<uint32_t> pairs_tmp(curr_num_nodes * candidates_count);
-        std::vector<uint32_t> scores_tmp(curr_num_nodes * candidates_count);
-        std::vector<std::set<uint32_t>> candidates_count(candidates_count);
-        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * candidates_count, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_u_scores, curr_num_nodes * sizeof(uint32_t) * candidates_count, cudaMemcpyDeviceToHost));
+        std::vector<uint32_t> pairs_tmp(curr_num_nodes * cfg.candidates_count);
+        std::vector<uint32_t> scores_tmp(curr_num_nodes * cfg.candidates_count);
+        std::vector<std::set<uint32_t>> candidates_count(cfg.candidates_count);
+        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_u_scores, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
         std::cout << "Pairing results:";
         for (uint32_t i = 0; i < curr_num_nodes; ++i) {
             if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH))
                 std::cout << "\n  node " << i << " ->";
-            for (uint32_t j = 0; j < candidates_count; ++j) {
-                float score = ((float)scores_tmp[i * candidates_count + j])/FIXED_POINT_SCALE;
-                uint32_t target = pairs_tmp[i * candidates_count + j];
+            for (uint32_t j = 0; j < cfg.candidates_count; ++j) {
+                float score = ((float)scores_tmp[i * cfg.candidates_count + j])/FIXED_POINT_SCALE;
+                uint32_t target = pairs_tmp[i * cfg.candidates_count + j];
                 candidates_count[j].insert(target);
                 if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
                     if (target == UINT32_MAX) std::cout << " (" << j << " target=none score=none)";
@@ -995,12 +517,12 @@ int main(int argc, char** argv) {
                 }
                 if (target == UINT32_MAX) continue;
                 // check the symmetry invariant: mutual pairs or the other has found a higher score pair (or one with lower id - tiebreaker) [easy for j = 0, for j > 0 check first that the target wasn't already used at a lower j]
-                if (pairs_tmp[target * candidates_count + j] != i && pairs_tmp[target * candidates_count + j] != UINT32_MAX && std::find(pairs_tmp.begin() + target * candidates_count, pairs_tmp.begin() + target * candidates_count + j, i) == pairs_tmp.begin() + target * candidates_count + j && !(scores_tmp[target * candidates_count + j] > score || scores_tmp[target * candidates_count + j] == score && pairs_tmp[target * candidates_count + j] < i))
-                    std::cerr << "\n  WARNING, symmetry violated: node " << i << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ") AND node " << target << " (" << j << " target=" << pairs_tmp[target * candidates_count + j] << " score=" << std::fixed << std::setprecision(3) << scores_tmp[target * candidates_count + j] << ") !!";
+                if (pairs_tmp[target * cfg.candidates_count + j] != i && pairs_tmp[target * cfg.candidates_count + j] != UINT32_MAX && std::find(pairs_tmp.begin() + target * cfg.candidates_count, pairs_tmp.begin() + target * cfg.candidates_count + j, i) == pairs_tmp.begin() + target * cfg.candidates_count + j && !(scores_tmp[target * cfg.candidates_count + j] > score || scores_tmp[target * cfg.candidates_count + j] == score && pairs_tmp[target * cfg.candidates_count + j] < i))
+                    std::cerr << "\n  WARNING, symmetry violated: node " << i << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ") AND node " << target << " (" << j << " target=" << pairs_tmp[target * cfg.candidates_count + j] << " score=" << std::fixed << std::setprecision(3) << scores_tmp[target * cfg.candidates_count + j] << ") !!";
             }
         }
         std::cout << "\n";
-        for (uint32_t j = 0; j < candidates_count; ++j)
+        for (uint32_t j = 0; j < cfg.candidates_count; ++j)
             std::cout << "Candidates count (" << j << "): " << candidates_count[j].size() << "\n";
         std::vector<uint32_t>().swap(scores_tmp);
         std::vector<std::set<uint32_t>>().swap(candidates_count);
@@ -1046,7 +568,7 @@ int main(int argc, char** argv) {
             (void*)&d_nodes_sizes,
             (void*)&curr_num_nodes,
             (void*)&num_repeats,
-            (void*)&candidates_count,
+            (void*)&cfg.candidates_count,
             (void*)&d_slots,
             (void*)&d_dp_scores,
             (void*)&d_groups
@@ -1065,7 +587,7 @@ int main(int argc, char** argv) {
             curr_num_nodes,
             h_max_nodes_per_part,
             h_max_inbound_per_part,
-            candidates_count,
+            cfg.candidates_count,
             d_groups
         );
 
@@ -1108,7 +630,7 @@ int main(int argc, char** argv) {
         // ======================================
         // k-way base case, build inital partitioning
         // => condition: too little shrinking to justify further coarsening
-        if (mode == Mode::KWAY && ((float)new_num_nodes / (float)curr_num_nodes > KWAY_INIT_SHRINK_RATIO_LIMIT || new_num_nodes < KWAY_INIT_LOWER_THREASHOLD)) {
+        if (cfg.mode == Mode::KWAY && ((float)new_num_nodes / (float)curr_num_nodes > KWAY_INIT_SHRINK_RATIO_LIMIT || new_num_nodes < KWAY_INIT_LOWER_THREASHOLD)) {
             /*auto [d_init_partitions, d_init_partitions_sizes] = initial_partitioning(
                 curr_num_nodes,
                 num_hedges,
@@ -1131,8 +653,8 @@ int main(int argc, char** argv) {
                 d_touching_offsets,
                 hedges_size,
                 d_nodes_sizes,
-                kway,
-                epsi,
+                cfg.kway,
+                cfg.epsi,
                 h_max_nodes_per_part
             );
             d_partitions_sizes = d_init_partitions_sizes;
@@ -1215,7 +737,7 @@ int main(int argc, char** argv) {
         #if VERBOSE
         std::vector<uint32_t> groups_tmp(curr_num_nodes);
         std::vector<uint32_t> groups_sizes_tmp(new_num_nodes);
-        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * candidates_count, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(groups_tmp.data(), d_groups, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(groups_sizes_tmp.data(), d_groups_sizes, new_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         std::unordered_map<uint32_t, int> groups_count;
@@ -1226,8 +748,8 @@ int main(int argc, char** argv) {
             groups_count[group]++;
             if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
                 std::cout << "  node " << i << " ->";
-                for (uint32_t j = 0; j < candidates_count; ++j) {
-                    uint32_t target = pairs_tmp[i * candidates_count + j];
+                for (uint32_t j = 0; j < cfg.candidates_count; ++j) {
+                    uint32_t target = pairs_tmp[i * cfg.candidates_count + j];
                     if (target == UINT32_MAX) std::cout << " (" << j << " target=none)";
                     else std::cout << " (" << j << " target=" << target << ")";
                 }
@@ -1266,7 +788,7 @@ int main(int argc, char** argv) {
         uint32_t *d_coarse_neighbors = nullptr;
         uint32_t *d_coarse_oversized_neighbors = nullptr;
         dim_t *d_coarse_neighbors_offsets = nullptr;
-        dim_t curr_max_neighbors = (dim_t)(oversized_multiplier * (float)max_neighbors); // add a bit of safety-room to compensate for the flat scaling by 'new_num_nodes / curr_num_nodes'
+        dim_t curr_max_neighbors = (dim_t)(cfg.oversized_multiplier * (float)max_neighbors); // add a bit of safety-room to compensate for the flat scaling by 'new_num_nodes / curr_num_nodes'
         // if there is enough memory for the full oversized buffer, SM dischard included, a speedier version is used, that replaced the scatter with a direct pack from the initial oversized allocation!
         cudaMemGetInfo(&free_bytes, &total_bytes);
         // NOTE: no need to check if there could be space to allocate both oversized neighbors and final neighbors at once, if the oversized fits, then the new neighbors are allocated either after the oversized is freed, or after the original neighbors are freed
@@ -1371,7 +893,7 @@ int main(int argc, char** argv) {
         uint32_t *d_coarse_oversized_hedges = nullptr;
         dim_t *d_coarse_hedges_offsets = nullptr;
         uint32_t* d_coarse_srcs_count = nullptr;
-        dim_t curr_max_hedge_size = (dim_t)(oversized_multiplier * (float)max_hedge_size);
+        dim_t curr_max_hedge_size = (dim_t)(cfg.oversized_multiplier * (float)max_hedge_size);
         curr_max_hedge_size = curr_max_hedge_size > MAX_SM_WARP_DEDUPE_BUFFER_SIZE ? curr_max_hedge_size - MAX_SM_WARP_DEDUPE_BUFFER_SIZE : 0;
         curr_max_hedge_size = max(curr_max_hedge_size, (dim_t)MIN_GM_WARP_DEDUPE_BUFFER_SIZE);
         if (num_hedges * curr_max_hedge_size * sizeof(uint32_t) > (1ull << 32))
@@ -1684,13 +1206,17 @@ int main(int argc, char** argv) {
 
         // settings for refinement
         bool chainup = false; // true -> chain moves by size, then sort chains into a sequence, false -> directly sort moves into a sequence by gain
-        bool encourage = mode == Mode::INCC; // true -> give a gain to moves that don't fully disconnect an hedge, doing so proportionally to how few pins the leave behind
+        bool encourage = cfg.mode == Mode::INCC; // true -> give a gain to moves that don't fully disconnect an hedge, doing so proportionally to how few pins the leave behind
 
-        for (uint32_t fm_repeat = 0u; fm_repeat < refine_repeats; fm_repeat++) {
+        for (uint32_t fm_repeat = 0u; fm_repeat < cfg.refine_repeats; fm_repeat++) {
             std::cout << "Refining level " << level_idx << " repeat " << fm_repeat << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << num_partitions << "\n";
 
+            // initially relax partition size, then rely on later refinement to bring it back [TERRIBLE MISTAKE!]
+            //const uint32_t h_varying_max_nodes_per_part = (int32_t)((float)h_max_nodes_per_part * (1.4f - 0.4f * (float)std::min(2*fm_repeat, cfg.refine_repeats) / cfg.refine_repeats));
+            //CUDA_CHECK(cudaMemcpyToSymbol(max_nodes_per_part, &h_varying_max_nodes_per_part, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
+
             // by how much of a node's size to allow an invalid move to be proposed (but filtered later by events - if still invalid)
-            uint32_t discount = fm_repeat < refine_repeats / 3 ? 1u : (fm_repeat < 2 * refine_repeats / 3 ? 2u : UINT32_MAX);
+            uint32_t discount = fm_repeat < cfg.refine_repeats / 3 ? 1u : (fm_repeat < 2 * cfg.refine_repeats / 3 ? 2u : UINT32_MAX);
 
             // prepare this level's pins per partition
             CUDA_CHECK(cudaMemset(d_pins_per_partitions, 0x00, num_hedges * num_partitions * sizeof(uint32_t)));
@@ -2144,9 +1670,9 @@ int main(int argc, char** argv) {
             } else {
                 std::cout << "No valid refinement move found on level " << level_idx << " (reason: " << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : "negative gain")) << ") ...\n";
                 if (size_validity > 0 && !chainup) chainup = true; // enable chaining when no moves are available via greedy sorting because of size constraints
-                else if (fm_repeat < refine_repeats / 3) fm_repeat = refine_repeats / 2;
-                else if (fm_repeat < 2 * refine_repeats / 3) fm_repeat = 2 * refine_repeats / 3;
-                else fm_repeat = refine_repeats; // aka break!
+                else if (fm_repeat < cfg.refine_repeats / 3) fm_repeat = cfg.refine_repeats / 2;
+                else if (fm_repeat < 2 * cfg.refine_repeats / 3) fm_repeat = 2 * cfg.refine_repeats / 3;
+                else fm_repeat = cfg.refine_repeats; // aka break!
             }
             CUDA_CHECK(cudaFree(d_ranks));
             CUDA_CHECK(cudaFree(d_valid_moves));
@@ -2177,7 +1703,7 @@ int main(int argc, char** argv) {
     thrust::device_ptr<uint32_t> t_partitions_sizes(d_partitions_sizes);
     thrust::device_ptr<uint32_t> t_partitions_inbound_sizes(d_partitions_inbound_sizes);
 
-    if (mode == Mode::INCC) {
+    if (cfg.mode == Mode::INCC) {
         // greedily merge small partitions
         // => checking inbound constraints w/out deduping, with a straight sum, to make it fast
         thrust::device_vector<uint32_t> t_part_index(num_partitions);
@@ -2304,6 +1830,7 @@ int main(int argc, char** argv) {
     */
 
     if (constr.checkPartitionValidity(hg, partitions, true)) {
+        // log metrics
         auto partitioned_hg = hg.getPartitionsHypergraph(partitions, 2, true); // remove the destination if self-cycles happen
         auto hedge_overlap = constr.hedgeOverlap(hg, partitions);
         std::cout << "Partitioned hypergraph:\n";
@@ -2317,51 +1844,11 @@ int main(int argc, char** argv) {
         //if (dbg_conn != partitioned_hg.connectivity()) std::cerr << "ERROR, incorrect metric calculation for connectivity: " << dbg_conn << " vs " << partitioned_hg.connectivity() << " !!\n";
         //if (dbg_cutn != partitioned_hg.cutnet()) std::cerr << "ERROR, incorrect metric calculation for cut-net: " << dbg_cutn << " vs " << partitioned_hg.cutnet() << " !!\n";
         
-        // save hypergraph
-        if (!save_path.empty()) {
-            if (!loaded) {
-                std::cerr << "Error: -s used without loading a hypergraph first.\n";
-                return 1;
-            }
-            try {
-                std::filesystem::path file_path(save_path);
-                if (file_path.extension() == ".hgr") {
-                    std::cout << "Saving partitioned hypergraph to: " << save_path << " (hMETIS format) ...\n";
-                    partitioned_hg.savehMETIS(save_path);
-                } else if (file_path.extension() == ".snn") {
-                    std::cout << "Saving partitioned hypergraph to: " << save_path << " (SNN format) ...\n";
-                    partitioned_hg.saveSNN(save_path);
-                } else if (file_path.extension() == ".axh") {
-                    std::cout << "Saving partitioned hypergraph to: " << save_path << " (AXH format) ...\n";
-                    partitioned_hg.saveAXH(save_path);
-                } else {
-                    throw std::runtime_error("Failed to save partitioned hypergraph, unsupported file format (supported: '.hgr', '.snn', '.axh').");
-                }
-                std::cout << "Partitioned hypergraph saved to " << save_path << "\n";
-                std::cout << "Partitioned hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(save_path)) / (1 << 20) << " MB\n";
-            } catch (const std::exception& e) {
-                std::cerr << "Error saving file: " << e.what() << "\n";
-                return 1;
-            }
-        }
-
-        // save partitioning
-        if (!part_path.empty()) {
-            try {
-                std::cout << "Saving partitioning to: " << part_path << " (each node's partition id on its line by node idx) ...\n";
-                std::ofstream f(part_path);
-                if (!f) throw std::runtime_error("Cannot open output file");
-                for (const auto& p : partitions)
-                    f << p << "\n";
-                std::cout << "Partitioning saved to " << part_path << "\n";
-                std::cout << "Partitioning file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(part_path)) / (1 << 20) << " MB\n";
-            } catch (const std::exception& e) {
-                std::cerr << "Error saving file: " << e.what() << "\n";
-                return 1;
-            }
-        }
+        // save results
+        saveResult(cfg, partitioned_hg, partitions);
     } else {
         std::cerr << "WARNING, invalid partitining !!\n";
+        return 1;
     }
 
     return 0;

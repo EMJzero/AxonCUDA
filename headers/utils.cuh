@@ -3,20 +3,37 @@
 #include <cstdint>
 #include <stdint.h>
 
+#include "constants.cuh"
+
+// REMEMBER: "const" means the data pointed to is not modified, not the pointer itself!
+
 // USED BY: everyone
 
-// absolute replacement for "size_t"
-using dim_t = unsigned long long; // aka uint64_t
+#define CUDA_CHECK(ans) { gpuAssert((ans), #ans, __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char* expr, const char *file, int line, bool abort = true) {
+    if (code != cudaSuccess) {
+        fprintf(stderr, "GPUassert:\n  Error: %s, Expr.: %s\n  File: %s, Line: %d\n", cudaGetErrorString(code), expr, file, line);
+        if (abort) exit(code);
+    }
+}
 
-#define WARP_SIZE 32u
-// TODO: determine this at runtime w.r.t. the mean and variance of the spike frequency!
-#define FIXED_POINT_SCALE 262144u // used to convert scores to fixed point
-// TODO: this is just a good guess on how much more memory give to oversized buffers during deduplication, refine it!
-#define OVERSIZED_SIZE_MULTIPLIER 1.5f
+#define LOG_MEMORY false
 
-#define SAVE_MEMORY_UP_TO_LEVEL 2 // number of coarsening levels for which to spill non-coarse data structures to the host, set to 0 to disable the feature
-
-#define SMALL_PART_MERGE_SIZE_THRESHOLD 15 // number of nodes below which partitions are considered "small" and an attempt is done at merging them with one-another
+#if LOG_MEMORY
+template<typename T>
+inline cudaError_t cudaMallocLogged(T** ptr, size_t size, const char* varname, const char* file, int line) {
+    cudaError_t ret = ::cudaMalloc(reinterpret_cast<void**>(ptr), size);
+    if (ret == cudaSuccess) printf("[CUDA MALLOC] %s | ptr=%p | size=%zu bytes | %s:%d\n", varname, (void*)(*ptr), size, file, line);
+    return ret;
+}
+template<typename T>
+inline cudaError_t cudaFreeLogged(T* ptr, const char* varname, const char* file, int line) {
+    printf("[CUDA FREE] %s | ptr=%p | %s:%d\n", varname, (void*)ptr, file, line);
+    return ::cudaFree(ptr);
+}
+#define cudaMalloc(ptr, size) cudaMallocLogged(ptr, size, #ptr, __FILE__, __LINE__)
+#define cudaFree(ptr) cudaFreeLogged(ptr, #ptr, __FILE__, __LINE__)
+#endif
 
 // NOTE: everything tagged as "wrp" or "warp" assumes that all lanes are active, unless otherwise specified!
 
@@ -89,39 +106,27 @@ __forceinline__ __device__ T warpExclusiveScan(T val) {
 }
 
 
-// USED BY: neighborhoods kernel
-
-#define SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
-#define GM_MIN_BLOCK_DEDUPE_BUFFER_SIZE 256u
-
-
 // USED BY: candidates kernel
 
-#define HIST_SIZE 512u // must be a multiple of WARP_SIZE (for the histogram max reduction)
-#define MAX_CANDIDATES 4u // => how many candidates are proposed for a node (ranked by score)
-
-#define DETERMINISTIC_SCORE_NOISE 64u // => adds a +[0, DETERMINISTIC_SCORE_NOISE - 1]/FIXED_POINT_SCALE symmetric noise while calculating pairing scores; set to 0 to disable; keep it a power of 2 otherwise
-
-typedef struct __align__(8) {
-    uint32_t node;
-    uint32_t score;
-} bin;
-
-__forceinline__ __device__ bin warpReduceMax(uint32_t val, uint32_t payload) {
+template <typename T>
+__forceinline__ __device__ bin<T> warpReduceMax(T val, uint32_t payload) {
+    static_assert(sizeof(T) == 4, "T (val) must be 32-bit");
     #pragma unroll
     for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-        uint32_t other_val = __shfl_xor_sync(0xffffffff, val, offset);
+        T other_val = __shfl_xor_sync(0xffffffff, val, offset);
         uint32_t other_payload = __shfl_xor_sync(0xffffffff, payload, offset);
-        if (other_val > val || other_val == val && other_payload < payload) {
+        if (other_val > val || other_val == val && other_payload > payload) {
             val = other_val;
             payload = other_payload;
         }
     }
-    return {.node = payload, .score = val};
+    return {.payload = payload, .val = val};
 }
 
 // symmetric and deterministic pseudo-random hash
+template <uint32_t MAX_NOISE>
 __device__ __forceinline__ uint32_t deterministic_noise(uint32_t a, uint32_t b) {
+    static_assert((MAX_NOISE & (MAX_NOISE - 1)) == 0, "MAX_NOISE must be power-of-two");
     uint32_t lo = min(a, b), hi = max(a, b);
     uint32_t x = lo * 0x9E3779B1u; // golden-ratio :)
     x ^= hi + 0x85EBCA6Bu + (x << 6) + (x >> 2);
@@ -130,24 +135,11 @@ __device__ __forceinline__ uint32_t deterministic_noise(uint32_t a, uint32_t b) 
     x ^= x >> 13;
     x *= 0x9E3779B1u;
     x ^= x >> 16;
-    return x & (DETERMINISTIC_SCORE_NOISE - 1);
+    return x & (MAX_NOISE - 1);
 }
 
+
 // USED BY: grouping kernel
-
-#define MAX_GROUP_SIZE 1u // => MAX_GROUP_SIZE - 1 slots per node; 2 means pairs
-#define PATH_SIZE 192u // initial slots for nodes to see while traversing the pairs tree, TODO: automatically extend if needed (costly...)
-#define MAX_REPEATS 4u // maximum number of nodes a single thread can handle, must be less than 32 (due to using one-hot anti-repeat encoding)
-
-typedef struct __align__(8) {
-    uint32_t id; // lower 32 bits (Nvidia GPUs are little-endian)
-    uint32_t score; // converted from float to fixed point! higher 32 bits
-} slot;
-
-typedef struct __align__(8) {
-    uint32_t with; // total score in the traversed subtree assuming the current node will be paired with its targed
-    uint32_t wout; // total score in the traversed subtree assuming the current node will NOT be paired with its targed
-} dp_score;
 
 __device__ __forceinline__ unsigned long long pack_slot(uint32_t score, uint32_t node) {
     // high 32 bits = score, low 32 bits = node
@@ -208,44 +200,21 @@ __device__ __forceinline__ bool atomic_max_on_slot_ret(slot* __restrict__ s, uin
 }
 
 
-// USED BY: coarsening routines (all, touching, hedges, and neighbors)
-
-#define MAX_SM_WARP_DEDUPE_BUFFER_SIZE 3072u // the A100 has 48KB of SM, this is (48KB/4B of uint32s)/4 warps per block
-#define MIN_GM_WARP_DEDUPE_BUFFER_SIZE 256u // just for safety, interplays with 'MAX_HASH_PROBE_LENGTH' and 'OVERSIZED_SIZE_MULTIPLIER'
-
-
-// USED BY: fm refinement kernel
-
-#define PART_HIST_SIZE 64u // best if it is a multiple of WARP_SIZE, best if partitions_per_thread * WARP_SIZE <= num_partitions
-
-
-// USED BY: refinement constraints checks
-
-// valid values filtering functor
-struct masked_value_functor {
-    const float* value;
-    const uint32_t* valid_1;
-    const uint32_t* valid_2;
-    __host__ __device__ float operator()(uint32_t i) const { return valid_1[i] == 0 && valid_2[i] == 0 ? value[i] : -FLT_MAX; }
-};
-
-
-// USED BY: final small partitions merging
-
-struct constraints_state {
-    dim_t s, i;
-    uint32_t g;
-};
-
-
 // HASH-SET
 
 // NOTE: before using the set, call "sm_init" with HASH_EMPTY as the value!
 
 // TODO: replace all "%" operations in those helpers!!!!
 
-#define HASH_EMPTY 0xFFFFFFFFu
-#define MAX_HASH_PROBE_LENGTH 32u
+// simple 64-bit hash, should be good enough for a small shared-memory hash-set
+__device__ __forceinline__ uint64_t hash_uint64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
 
 // simple 32-bit hash, should be good enough for a small shared-memory hash-set
 __device__ __forceinline__ uint32_t hash_uint32(uint32_t x) {
@@ -410,11 +379,6 @@ __device__ __forceinline__ bool gm_hashset_contains(const uint32_t* __restrict__
 //  HASH-MAP
 
 // NOTE: this reuses defines and hash functions from the hash-set above
-
-typedef struct {
-    uint32_t key;
-    uint32_t value;
-} hashmap_entry;
 
 // SHARED MEMORY VERSION
 // => shared among threads, needs atomics
@@ -796,21 +760,31 @@ __device__ __forceinline__ void wrp_bitonic_sort_by_key(K* __restrict__ keys, V*
 }
 
 // binary search, returns the index of 'value' in 'a' or UINT32_MAX if it is not found
-template <typename T>
+// IMPORTANT: when 'ASC' is true, it assumes data sorted in ascending order, when false in descending order
+template <typename T, bool ASC>
 __device__ __forceinline__ uint32_t binary_search(const T* a, dim_t n, T value) {
     int lo = 0;
     int hi = n - 1;
     while (lo <= hi) {
         int mid = (lo + hi) >> 1;
         T v = a[mid];
-        if (v < value)
-            lo = mid + 1;
-        else if (v > value)
-            hi = mid - 1;
-        else
-            return mid; // found -> return idx
+        if constexpr (ASC) {
+            if (v < value)
+                lo = mid + 1;
+            else if (v > value)
+                hi = mid - 1;
+            else
+                return mid;
+        } else {
+            if (v > value)
+                lo = mid + 1;
+            else if (v < value)
+                hi = mid - 1;
+            else
+                return mid;
+        }
     }
-    return UINT32_MAX; // not found
+    return UINT32_MAX;
 }
 
 

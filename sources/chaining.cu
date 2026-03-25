@@ -1,25 +1,4 @@
-#include <stdint.h>
-#include <algorithm>
-
-#include <cuda_runtime.h>
-
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
-#include <thrust/sort.h>
-#include <thrust/sequence.h>
-#include <thrust/iterator/zip_iterator.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/tuple.h>
-#include <thrust/gather.h>
-#include <thrust/scatter.h>
-#include <thrust/reduce.h>
-#include <thrust/transform.h>
-#include <thrust/binary_search.h>
-#include <thrust/copy.h>
-#include <thrust/functional.h>
-
-#include "utils.cuh"
-
+#include "chaining.cuh"
 
 // ================================================================
 // Device helpers
@@ -89,6 +68,7 @@ void propose_successor(
     int n,
     const uint32_t* dst,
     const uint32_t* size,
+    //const uint32_t* icnt,
     const float* w,
     const int* out_begin,
     const int* out_end,
@@ -292,11 +272,12 @@ void scatter_sequence_idx(
 void chaining(
     const uint32_t* srcs,
     const uint32_t* dsts,
-    const uint32_t* size,
+    const uint32_t* size, // node sizes
+    //const uint32_t* icnt, // inbound set sizes
     const float* weight,
     uint32_t num,
     uint32_t* sequence_idx,
-    cudaStream_t stream = 0
+    cudaStream_t stream
 ) {
     if (num == 0) return;
 
@@ -307,17 +288,20 @@ void chaining(
     // parameters:
     const int iters = 4; // multi-iteration greedy chaining
     const int K = 256; // candidates scanned per node per iteration
-    const float alpha = 1e-6f; // size penalty scale (adjust based on  size magnitude)
+    const float alpha = 1e-6f; // node size penalty scale (adjust based on size magnitude)
+    //const float beta = 1e-7f; // inbound set size penalty scale (adjust based on inbound set size magnitude)
 
     auto exec = thrust::cuda::par.on(stream);
 
     // copy input device arrays into vectors so we can sort/reorder
     thrust::device_vector<uint32_t> d_src(n), d_dst(n), d_size(n), d_orig(n);
+    //thrust::device_vector<uint32_t> d_src(n), d_dst(n), d_size(n), d_icnt(n), d_orig(n);
     thrust::device_vector<float> d_w(n);
 
     CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(d_src.data()), srcs, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(d_dst.data()), dsts, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(d_size.data()), size, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+    //CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(d_icnt.data()), icnt, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(d_w.data()), weight, n * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 
     thrust::sequence(exec, d_orig.begin(), d_orig.end());
@@ -332,6 +316,7 @@ void chaining(
     );
 
     auto zipped = thrust::make_zip_iterator(thrust::make_tuple(d_src.begin(), d_dst.begin(), d_size.begin(), d_w.begin(), d_orig.begin()));
+    //auto zipped = thrust::make_zip_iterator(thrust::make_tuple(d_src.begin(), d_dst.begin(), d_size.begin(), d_icnt.begin(), d_w.begin(), d_orig.begin()));
 
     thrust::sort_by_key(exec, t_keys.begin(), t_keys.end(), zipped, SrcNegWLess());
 
@@ -361,6 +346,7 @@ void chaining(
             n,
             thrust::raw_pointer_cast(d_dst.data()),
             thrust::raw_pointer_cast(d_size.data()),
+            //thrust::raw_pointer_cast(d_icnt.data()),
             thrust::raw_pointer_cast(d_w.data()),
             thrust::raw_pointer_cast(d_out_begin.data()),
             thrust::raw_pointer_cast(d_out_end.data()),

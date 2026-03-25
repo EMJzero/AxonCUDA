@@ -587,3 +587,9 @@ Placement improvement:
 Why just the 4 elements up-left-right-down, couldn't we have a custom stencil? Like the 8-neighbors stencil! After all, when tensions are proposed, then we build the matching, and thus regardless of candidates, it will work!
 => how: define a parametric struct with one entry per "adjacent node" and a corresponding enum that tells you the offset w.r.t. you for each adjacent slot!
 =>=>=> this is the natural step to generalize towards hardware graphs instead of lattices!
+
+----
+
+Initial placement IDEA:
+- bisection, k=2 epsilon=0.1 balanced partitioning, minimizes the cut-net metric! Hence, it gives you two sets of nodes that’s fine to put far from each other as they have little locality in between them!
+- so if you do recursive bysection, you end up with partitions of partitions down to single nodes, order the nodes internally in each partition, and concatenate as you go back up the recursion!

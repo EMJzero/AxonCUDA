@@ -35,9 +35,9 @@ void inverse_placement_kernel(
 __global__
 void forces_kernel(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const float* __restrict__ hedge_weights,
     const coords* __restrict__ placement,
     const uint32_t num_nodes,
@@ -426,9 +426,9 @@ void scatter_ranks_kernel(
 __global__
 void cascade_kernel(
     const uint32_t* __restrict__ hedges,
-    const uint32_t* __restrict__ hedges_offsets,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ touching,
-    const uint32_t* __restrict__ touching_offsets,
+    const dim_t* __restrict__ touching_offsets,
     const float* __restrict__ hedge_weights,
     const coords* __restrict__ placement,
     const swap* __restrict__ ev_swaps,
