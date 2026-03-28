@@ -28,7 +28,6 @@
 #include "refinement.cuh"
 #include "init_part.cuh"
 
-
 using namespace hgraph;
 using namespace constraints;
 
@@ -81,10 +80,11 @@ int main(int argc, char** argv) {
 
     std::cout << "Preparing hypergraph data...\n";
 
-    //if (!cfg.device_touching_construction)
-    //    hg.buildIncidenceSets();
+    // build incidence sets on the host only if explicitly required
+    if (!cfg.device_touching_construction)
+        hg.buildIncidenceSets();
 
-    if (!constr.checkFit(hg, false, true))
+    if (!cfg.device_touching_construction && !constr.checkFit(hg, false, true))
         std::cerr << "WARNING, the hypergraph did not pass the fit check on the given constraints (NOTE: this test admits false negatives) !!\n";
 
     /*
@@ -117,29 +117,6 @@ int main(int argc, char** argv) {
     }
     hedges_offsets.push_back(hg.hedgesFlat().size());
     
-    std::vector<uint32_t> touching_hedges;
-    std::vector<dim_t> touching_hedges_offsets;
-    std::vector<uint32_t> inbound_count;
-    touching_hedges.reserve(hg.hedgesFlat().size());
-    touching_hedges_offsets.reserve(hg.nodes() + 1);
-    inbound_count.reserve(hg.nodes());
-
-    // prepare touching sets
-    // HP: no duplicates in either set, eventually duplicates in outbound w.r.t. inbounds will also be lost,
-    //     inbounds must come first and their part must be sorted by id (ascending)
-    for (uint32_t n = 0; n < hg.nodes(); ++n) {
-        auto curr_size = touching_hedges.size();
-        touching_hedges_offsets.push_back(curr_size);
-        // NOTE: must put in inbounds first!
-        for (uint32_t h : hg.inboundSortedIds(n))
-            touching_hedges.push_back(h);
-        inbound_count.push_back(touching_hedges.size() - curr_size);
-        for (uint32_t h : hg.outboundSortedIds(n))
-            touching_hedges.push_back(h);
-    }
-    touching_hedges_offsets.push_back(touching_hedges.size());
-    uint32_t touching_hedges_size = touching_hedges.size();
-    
     // prepare hyperedge weights
     std::vector<float> hedge_weights(num_hedges);
     for (uint32_t i = 0; i < num_hedges; ++i) {
@@ -148,11 +125,6 @@ int main(int argc, char** argv) {
     
     // total number of distinct nodes (for output indexing)
     const uint32_t num_nodes = hg.nodes(); // nodes count used when allocating outputs
-
-    // estimated max hedge and neighbors count
-    dim_t max_hedge_size = std::transform_reduce(std::next(hedges_offsets.begin()), hedges_offsets.end(), hedges_offsets.begin(), dim_t{0}, [](dim_t a, dim_t b) { return std::max(a, b); }, [](dim_t next, dim_t curr) { return next - curr; });
-    dim_t max_neighbors = hg.sampleMaxNeighborhoodSize(2400); // TODO: is 240 enough here?
-    std::cout << "Max hedges estimate set to " << max_hedge_size << ", neighbors estimate set to " << max_neighbors << "\n";
 
     // constraints
     const uint32_t h_max_nodes_per_part = constr.nodesPerPart();
@@ -212,9 +184,6 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_hedges, hg.hedgesFlat().size() * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_hedges_offsets, (num_hedges + 1) * sizeof(dim_t)));
     CUDA_CHECK(cudaMalloc(&d_srcs_count, num_hedges * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_touching, touching_hedges.size() * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_touching_offsets, (num_nodes + 1) * sizeof(dim_t)));
-    CUDA_CHECK(cudaMalloc(&d_inbound_count, num_nodes * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_hedge_weights, num_hedges * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_pairs, num_nodes * sizeof(uint32_t) * cfg.candidates_count));
     CUDA_CHECK(cudaMalloc(&d_f_scores, num_nodes * sizeof(float)));
@@ -227,15 +196,10 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_hedges, hg.hedgesFlat().data(), hg.hedgesFlat().size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_hedges_offsets, hedges_offsets.data(), (num_hedges + 1) * sizeof(dim_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_srcs_count, srcs_count.data(), num_hedges * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_touching, touching_hedges.data(), touching_hedges.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_touching_offsets, touching_hedges_offsets.data(), (num_nodes + 1) * sizeof(dim_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_hedge_weights, hedge_weights.data(), num_hedges * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_inbound_count, inbound_count.data(), num_nodes * sizeof(uint32_t), cudaMemcpyHostToDevice));
     std::vector<dim_t>().swap(hedges_offsets);
-    std::vector<uint32_t>().swap(touching_hedges);
     std::vector<uint32_t>().swap(srcs_count);
-    std::vector<dim_t>().swap(touching_hedges_offsets);
-    std::vector<uint32_t>().swap(inbound_count);
+    std::vector<float>().swap(hedge_weights);
 
     // initialize
     thrust::device_ptr<uint32_t> t_nodes_sizes(d_nodes_sizes);
@@ -248,6 +212,51 @@ int main(int argc, char** argv) {
     // wrap up memory duties with a sync
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    // prepare touching sets
+    dim_t touching_hedges_size;
+    if (cfg.device_touching_construction) {
+        std::tie(touching_hedges_size, d_touching, d_touching_offsets, d_inbound_count) = buildTouching(
+            cfg,
+            d_hedges,
+            d_hedges_offsets,
+            d_srcs_count,
+            num_nodes,
+            num_hedges
+        );
+        assert(touching_hedges_size == hg.hedgesFlat().size()); // touching sets are the reverse map of hedge pins, hence they must be the same size
+    } else {
+        std::tie(touching_hedges_size, d_touching, d_touching_offsets, d_inbound_count) = buildTouchingHost(
+            hg
+        );
+    }
+
+    // estimated max hedge and neighbors count
+    thrust::device_ptr<dim_t> t_hedges_offsets(d_hedges_offsets);
+    dim_t max_hedge_size =
+    thrust::transform_reduce(
+        thrust::make_zip_iterator(thrust::make_tuple(t_hedges_offsets + 1, t_hedges_offsets)),
+        thrust::make_zip_iterator(thrust::make_tuple(t_hedges_offsets + num_hedges + 1, t_hedges_offsets + num_hedges)),
+        [] __host__ __device__ (const thrust::tuple<dim_t, dim_t>& t) { return thrust::get<0>(t) - thrust::get<1>(t); },
+        dim_t{0}, thrust::maximum<dim_t>()
+    );
+    //dim_t max_neighbors = hg.sampleMaxNeighborhoodSize(NEIGHBORS_SAMPLE_SIZE); // TODO: is 240 enough here? Maybe 2400?
+    dim_t max_neighbors = sampleMaxNeighborhoodSize(
+        cfg,
+        d_hedges,
+        d_hedges_offsets,
+        d_touching,
+        d_touching_offsets,
+        num_nodes,
+        NEIGHBORS_SAMPLE_SIZE
+    );
+    std::cout << "Max hedges estimate set to " << max_hedge_size << ", neighbors estimate set to " << max_neighbors << "\n";
+
+    std::cout << "Starting core timer...\n";
+    cudaEvent_t d_time_core_start, d_time_core_stop;
+    CUDA_CHECK(cudaEventCreate(&d_time_core_start));
+    CUDA_CHECK(cudaEventCreate(&d_time_core_stop));
+    CUDA_CHECK(cudaEventRecord(d_time_core_start));
 
     // prepare neighborhoods
     std::tie(max_neighbors, d_neighbors, d_neighbors_offsets) = buildNeighbors(
@@ -767,17 +776,45 @@ int main(int argc, char** argv) {
         if (!t_small_parts.empty()) {
             std::cout << "Partitions compression over " << t_small_parts.size() << " partitions ...\n";
             // stable sort small partitions with key (size, inbound, id)
-            thrust::stable_sort(t_small_parts.begin(), t_small_parts.end(), [=] __host__ __device__ (uint32_t a, uint32_t b) { uint32_t sa = t_partitions_sizes[a]; uint32_t sb = t_partitions_sizes[b]; if (sa != sb) return sa < sb; uint32_t ia = t_partitions_inbound_sizes[a]; uint32_t ib = t_partitions_inbound_sizes[b]; if (ia != ib) return ia < ib; return a < b; });
+            thrust::stable_sort(
+                t_small_parts.begin(), t_small_parts.end(),
+                [=] __host__ __device__ (uint32_t a, uint32_t b) {
+                    uint32_t sa = t_partitions_sizes[a];
+                    uint32_t sb = t_partitions_sizes[b];
+                    if (sa != sb) return sa < sb;
+                    uint32_t ia = t_partitions_inbound_sizes[a];
+                    uint32_t ib = t_partitions_inbound_sizes[b];
+                    if (ia != ib) return ia < ib; return a < b;
+                }
+            );
             // greedy grouping scan for constraints
             thrust::device_vector<constraints_state> t_constraints_states(t_small_parts.size());
-            thrust::transform(t_small_parts.begin(), t_small_parts.end(), t_constraints_states.begin(), [=] __host__ __device__ (uint32_t p) { return constraints_state{ t_partitions_sizes[p], t_partitions_inbound_sizes[p], 0u }; });
-            thrust::inclusive_scan(t_constraints_states.begin(), t_constraints_states.end(), t_constraints_states.begin(), [=] __host__ __device__ (const constraints_state& a, const constraints_state& b) { if (a.s + b.s <= h_max_nodes_per_part && a.i + b.i <= h_max_inbound_per_part) return constraints_state{ a.s + b.s, a.i + b.i, a.g }; return constraints_state{ b.s, b.i, a.g + 1 }; });
+            thrust::transform(
+                t_small_parts.begin(), t_small_parts.end(), t_constraints_states.begin(),
+                [=] __host__ __device__ (uint32_t p) {
+                    return constraints_state{ t_partitions_sizes[p], t_partitions_inbound_sizes[p], 0u };
+                }
+            );
+            thrust::inclusive_scan(
+                t_constraints_states.begin(), t_constraints_states.end(), t_constraints_states.begin(),
+                [=] __host__ __device__ (const constraints_state& a, const constraints_state& b) {
+                    if (a.s + b.s <= h_max_nodes_per_part && a.i + b.i <= h_max_inbound_per_part) return constraints_state{ a.s + b.s, a.i + b.i, a.g };
+                    return constraints_state{ b.s, b.i, a.g + 1 };
+                }
+            );
             // get the id of each node of a group
             thrust::device_vector<uint32_t> t_groups(t_constraints_states.size());
-            thrust::transform(t_constraints_states.begin(), t_constraints_states.end(), t_groups.begin(), [] __host__ __device__ (const constraints_state& s) { return s.g; });
+            thrust::transform(
+                t_constraints_states.begin(), t_constraints_states.end(), t_groups.begin(),
+                [] __host__ __device__ (const constraints_state& s) { return s.g; }
+            );
             // map groups to a representative partition id (lowest id in the group); groups are already contiguous, a single reduce-by-key is enough
             thrust::device_vector<uint32_t> t_rep_ids(t_groups.size());
-            auto rep_end = thrust::reduce_by_key(t_groups.begin(), t_groups.end(), t_small_parts.begin(), thrust::make_discard_iterator(), t_rep_ids.begin(), thrust::equal_to<uint32_t>(), thrust::minimum<uint32_t>());
+            auto rep_end = thrust::reduce_by_key(
+                t_groups.begin(), t_groups.end(), t_small_parts.begin(),
+                thrust::make_discard_iterator(), t_rep_ids.begin(),
+                thrust::equal_to<uint32_t>(), thrust::minimum<uint32_t>()
+            );
             t_rep_ids.resize(rep_end.second - t_rep_ids.begin());
             // build the map from partition id to the representative node
             thrust::device_vector<uint32_t> pid_map(num_partitions);
@@ -787,7 +824,10 @@ int main(int argc, char** argv) {
             thrust::scatter(new_pids.begin(), new_pids.end(), t_small_parts.begin(), pid_map.begin());
             // update partitions
             uint32_t* pid_map_ptr = thrust::raw_pointer_cast(pid_map.data());
-            thrust::transform(t_partitions, t_partitions + num_nodes, t_partitions, [pid_map_ptr] __host__ __device__ (uint32_t p) { return pid_map_ptr[p]; });
+            thrust::transform(
+                t_partitions, t_partitions + num_nodes, t_partitions,
+                [pid_map_ptr] __host__ __device__ (uint32_t p) { return pid_map_ptr[p]; }
+            );
         } else
             std::cout << "Partitions compression not performed ...\n";
     }
@@ -798,7 +838,10 @@ int main(int argc, char** argv) {
     thrust::sort_by_key(t_partitions, t_partitions + num_nodes, t_indices.begin());
     thrust::device_vector<uint32_t> t_headflags(num_nodes);
     t_headflags[0] = 0;
-    thrust::transform(t_partitions + 1, t_partitions + num_nodes, t_partitions, t_headflags.begin() + 1, [] __device__ (uint32_t curr, uint32_t prev) { return curr != prev ? 1u : 0u; });
+    thrust::transform(
+        t_partitions + 1, t_partitions + num_nodes, t_partitions, t_headflags.begin() + 1,
+        [] __device__ (uint32_t curr, uint32_t prev) { return curr != prev ? 1u : 0u; }
+    );
     thrust::inclusive_scan(t_headflags.begin(), t_headflags.end(), t_headflags.begin());
     const uint32_t new_num_partitions = t_headflags.back() + 1;
     thrust::scatter(t_headflags.begin(), t_headflags.end(), t_indices.begin(), t_partitions);
@@ -862,6 +905,14 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventElapsedTime(&d_total_ms, d_time_start, d_time_stop));
     CUDA_CHECK(cudaEventDestroy(d_time_start));
     CUDA_CHECK(cudaEventDestroy(d_time_stop));
+
+    CUDA_CHECK(cudaEventRecord(d_time_core_stop));
+    CUDA_CHECK(cudaEventSynchronize(d_time_core_stop));
+    float d_core_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&d_core_ms, d_time_core_start, d_time_core_stop));
+    CUDA_CHECK(cudaEventDestroy(d_time_core_start));
+    CUDA_CHECK(cudaEventDestroy(d_time_core_stop));
+
     auto time_end = std::chrono::high_resolution_clock::now();
     std::cout << "Stopping timer...\n";
 
@@ -871,6 +922,8 @@ int main(int argc, char** argv) {
     std::cout << "CUDA section: complete; proceeding with partitioning results validation and evalution...\n";
 
     double total_ms = std::chrono::duration<double, std::milli>(time_end - time_start).count();
+    // core: excluding the initialization of hedges and incidence sets in device memory
+    std::cout << "Total device core execution time: " << std::fixed << std::setprecision(3) << d_core_ms << " ms\n";
     std::cout << "Total device execution time: " << std::fixed << std::setprecision(3) << d_total_ms << " ms\n";
     std::cout << "Total host execution time: " << std::fixed << std::setprecision(3) << total_ms << " ms\n";
 

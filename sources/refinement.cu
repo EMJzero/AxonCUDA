@@ -151,23 +151,6 @@ void refinementRepeats(
             thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks); // invert the permutation such that: ranks[original_index] = sorted_position
             // free up thrust vectors
             thrust::device_vector<uint32_t>().swap(t_indices);
-            // sort scores and build an array of ranks (node id -> his move's idx in sorted scores)
-            /*thrust::device_vector<uint32_t> t_indices(curr_num_nodes);
-            thrust::sequence(t_indices.begin(), t_indices.end());
-            // sort scores according to scores themselves and indices in the same way
-            // use node ids as a tie-breaker when sorting moves
-            auto rank_keys_begin = thrust::make_zip_iterator(thrust::make_tuple(t_scores, t_indices.begin()));
-            auto rank_keys_end = rank_keys_begin + curr_num_nodes;
-            thrust::sort(rank_keys_begin, rank_keys_end, [t_nodes_sizes] __device__ (const thrust::tuple<float, uint32_t>& a, const thrust::tuple<float, uint32_t>& b) {
-                    const uint32_t ia = thrust::get<1>(a), ib = thrust::get<1>(b);
-                    const float ra = thrust::get<0>(a) / static_cast<float>(t_nodes_sizes[ia]), rb = thrust::get<0>(b) / static_cast<float>(t_nodes_sizes[ib]);
-                    if (ra > rb) return true;
-                    if (ra < rb) return false;
-                    return ia < ib; // tie-breaker
-            });
-            thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks); // invert the permutation such that: ranks[original_index] = sorted_position
-            // free up thrust vectors
-            thrust::device_vector<uint32_t>().swap(t_indices);*/
         } else {
             // build move-chains to approximate high-gain swaps, then sort by chain total gain
             chaining(

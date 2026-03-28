@@ -4,11 +4,237 @@
 
 #include <cub/cub.cuh>
 
+#include "hgraph.hpp"
 #include "runconfig.hpp"
 
 #include "utils.cuh"
 #include "defines.cuh"
 #include "construction.cuh"
+
+std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouchingHost(
+    const HyperGraph& hg
+) {
+    std::cerr << "WARNING: moving inbound and outbound sets host -> device will take a while...\n";
+
+    // HP: hedges already internally deduplicated (acyclic), keeping the dst whenever a duplicate is between srcs and dsts
+    uint32_t *d_touching = nullptr;
+    dim_t *d_touching_offsets = nullptr;
+    uint32_t *d_inbound_count = nullptr;
+
+    const uint32_t num_nodes = hg.nodes();
+
+    std::vector<uint32_t> touching_hedges;
+    std::vector<dim_t> touching_hedges_offsets;
+    std::vector<uint32_t> inbound_count;
+    touching_hedges.reserve(hg.hedgesFlat().size());
+    touching_hedges_offsets.reserve(num_nodes + 1);
+    inbound_count.reserve(num_nodes);
+
+    // prepare touching sets
+    // HP: no duplicates in either set, eventually duplicates in outbound w.r.t. inbounds will also be lost,
+    //     inbounds must come first and their part must be sorted by id (ascending)
+    for (uint32_t n = 0; n < num_nodes; ++n) {
+        auto curr_size = touching_hedges.size();
+        touching_hedges_offsets.push_back(curr_size);
+        // NOTE: must put in inbounds first!
+        for (uint32_t h : hg.inboundSortedIds(n))
+            touching_hedges.push_back(h);
+        inbound_count.push_back(touching_hedges.size() - curr_size);
+        for (uint32_t h : hg.outboundSortedIds(n))
+            touching_hedges.push_back(h);
+    }
+    touching_hedges_offsets.push_back(touching_hedges.size());
+    dim_t touching_hedges_size = touching_hedges.size();
+
+    CUDA_CHECK(cudaMalloc(&d_touching, touching_hedges_size * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_touching_offsets, (num_nodes + 1) * sizeof(dim_t)));
+    CUDA_CHECK(cudaMalloc(&d_inbound_count, num_nodes * sizeof(uint32_t)));
+
+    CUDA_CHECK(cudaMemcpy(d_touching, touching_hedges.data(), touching_hedges_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_touching_offsets, touching_hedges_offsets.data(), (num_nodes + 1) * sizeof(dim_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_inbound_count, inbound_count.data(), num_nodes * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    return std::make_tuple(touching_hedges_size, d_touching, d_touching_offsets, d_inbound_count);
+}
+
+std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouching(
+    const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_srcs_count,
+    const uint32_t num_nodes,
+    const uint32_t num_hedges
+) {
+    // HP: hedges already internally deduplicated (acyclic), keeping the dst whenever a duplicate is between srcs and dsts
+    uint32_t *d_touching = nullptr;
+    uint32_t *d_touching_buffer = nullptr;
+    dim_t *d_touching_offsets = nullptr;
+    uint32_t *d_inbound_count = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_touching_offsets, (num_nodes + 1) * sizeof(dim_t)));
+    CUDA_CHECK(cudaMemset(d_touching_offsets, 0x00, (num_nodes + 1) * sizeof(dim_t))); // remember to leave the first offset at 0
+    CUDA_CHECK(cudaMalloc(&d_inbound_count, num_nodes * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(d_inbound_count, 0x00, num_nodes * sizeof(uint32_t)));
+    
+    {
+        // launch configuration - touching count
+        int threads_per_block = 128; // 128/32 -> 4 warps per block
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        int num_warps_needed = num_hedges; // 1 warp per hedge
+        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+        // launch - touching count
+        std::cout << "Running touching count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        touching_count_kernel<<<blocks, threads_per_block>>>(
+            d_hedges,
+            d_hedges_offsets,
+            d_srcs_count,
+            num_hedges,
+            d_touching_offsets,
+            d_inbound_count
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    
+    thrust::device_ptr<dim_t> t_touching_offsets(d_touching_offsets);
+    thrust::inclusive_scan(t_touching_offsets, t_touching_offsets + (num_nodes + 1), t_touching_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
+    dim_t touching_size = 0; // last value in the inclusive scan = full reduce = total number of touching hedges among all sets
+    CUDA_CHECK(cudaMemcpy(&touching_size, d_touching_offsets + num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMalloc(&d_touching, touching_size * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_touching_buffer, touching_size * sizeof(uint32_t)));
+    
+    uint32_t *d_inserted_inbound = nullptr;
+    uint32_t *d_inserted_outbound = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_inserted_inbound, num_nodes * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_inserted_outbound, num_nodes * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(d_inserted_inbound, 0x00, num_nodes * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_inserted_outbound, d_inbound_count, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToDevice)); // initialize to inbound_count (to spare an add in the kernel)
+    {
+        // launch configuration - touching build kernel
+        int threads_per_block = 128; // 128/32 -> 4 warps per block
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        int num_warps_needed = num_hedges; // 1 warp per hedge
+        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+        // launch - touching build kernel
+        std::cout << "Running touching build kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        touching_build_kernel<<<blocks, threads_per_block>>>(
+            d_hedges,
+            d_hedges_offsets,
+            d_srcs_count,
+            d_touching_offsets,
+            num_hedges,
+            d_touching,
+            d_inserted_inbound,
+            d_inserted_outbound
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    CUDA_CHECK(cudaFree(d_inserted_inbound));
+    CUDA_CHECK(cudaFree(d_inserted_outbound));
+
+    // setup CUB radix sort
+    cub::DoubleBuffer<uint32_t> c_touching_double_buffer(d_touching, d_touching_buffer);
+    void* c_touching_storage = nullptr;
+    size_t c_touching_storage_bytes = 0;
+
+    // compute the end offset of elements to sort in each segment (offset + inbound_count)
+    auto d_inbound_end_offsets = thrust::make_transform_iterator(
+        thrust::make_zip_iterator(thrust::make_tuple(d_touching_offsets, d_inbound_count)),
+        [] __host__ __device__ (const thrust::tuple<dim_t, uint32_t>& t) {
+            return thrust::get<0>(t) + static_cast<dim_t>(thrust::get<1>(t));
+        }
+    );
+
+    // sort each inbound touching set
+    cub::DeviceSegmentedRadixSort::SortKeys(
+        c_touching_storage, c_touching_storage_bytes, c_touching_double_buffer,
+        touching_size, num_nodes,
+        d_touching_offsets, d_inbound_end_offsets,
+        /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0
+    );
+    std::cout
+        << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(touching_size * sizeof(uint32_t)) / (1 << 30)
+        << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_touching_storage_bytes) / (1 << 20)
+        << " MB of temporary storage ...\n";
+    cudaMalloc(&c_touching_storage, c_touching_storage_bytes);
+    cub::DeviceSegmentedRadixSort::SortKeys(
+        c_touching_storage, c_touching_storage_bytes, c_touching_double_buffer,
+        touching_size, num_nodes,
+        d_touching_offsets, d_inbound_end_offsets,
+        /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0
+    );
+    if (c_touching_double_buffer.Current() != d_touching) {
+        uint32_t* tmp = d_touching_buffer;
+        d_touching_buffer = d_touching;
+        d_touching = tmp;
+    }
+    CUDA_CHECK(cudaFree(d_touching_buffer));
+    CUDA_CHECK(cudaFree(c_touching_storage));
+
+    return std::make_tuple(touching_size, d_touching, d_touching_offsets, d_inbound_count);
+}
+
+dim_t sampleMaxNeighborhoodSize(
+    const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
+    const uint32_t num_nodes,
+    const uint32_t num_samples
+) {
+    if (num_samples == 0 || num_nodes == 0) return 0;
+
+    uint32_t *d_flags_bits = nullptr; // flags_bits[(sample / repeats) * ceil(num_nodes / 32) + nodes idx / 32] -> flags used bit-per-bit, the (idx % 32)-th bit will 1 if the idx-th element was seen for that sample
+    dim_t *d_neighbors_count = nullptr; // neighbors_count[(sample / repeats)] -> neighbors count for sample (already "maxed" over previous samples in the same slot)
+
+    const size_t bytes_per_sample = ((num_nodes + 31) / 32) * sizeof(uint32_t); // aka ceil(num_nodes / 32) * 4
+    const size_t required_bytes = bytes_per_sample * num_samples;
+    size_t free_bytes, total_bytes;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    const uint32_t repeats = (required_bytes + free_bytes - 1) / free_bytes; // aka ceil(required_bytes / free_bytes)
+    const uint32_t samples_per_repeat = (num_samples + repeats - 1) / repeats;
+
+    CUDA_CHECK(cudaMalloc(&d_flags_bits, samples_per_repeat * bytes_per_sample));
+    CUDA_CHECK(cudaMalloc(&d_neighbors_count, samples_per_repeat * sizeof(dim_t)));
+    CUDA_CHECK(cudaMemset(d_neighbors_count, 0x00, samples_per_repeat * sizeof(dim_t)));
+    
+    // TODO: could perform all repeats in a single kernel call...
+    for (uint32_t repeat = 0; repeat < repeats; repeat++) {
+        CUDA_CHECK(cudaMemset(d_flags_bits, 0x00, samples_per_repeat * bytes_per_sample));
+        {
+            // launch configuration - neighbors sample kernel
+            int threads_per_block = 128; // 128/32 -> 4 warps per block
+            int warps_per_block = threads_per_block / WARP_SIZE;
+            int num_warps_needed = samples_per_repeat; // 1 warp per sample (node)
+            int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+            // launch - neighbors sample kernel
+            std::cout << "Running neighbors sample kernel (repeat=" << repeat + 1 << "/" << repeats << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            neighbors_sample_kernel<<<blocks, threads_per_block>>>(
+                d_hedges,
+                d_hedges_offsets,
+                d_touching,
+                d_touching_offsets,
+                num_nodes,
+                num_samples,
+                samples_per_repeat,
+                repeat,
+                d_flags_bits,
+                d_neighbors_count
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+    }
+    CUDA_CHECK(cudaFree(d_flags_bits));
+
+    thrust::device_ptr<dim_t> t_neighbors_count(d_neighbors_count);
+    dim_t max_neighbors = thrust::reduce(t_neighbors_count, t_neighbors_count + samples_per_repeat, 0ull, thrust::maximum<dim_t>());
+    CUDA_CHECK(cudaFree(d_neighbors_count));
+    
+    return max_neighbors;
+}
 
 std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     const runconfig cfg,
@@ -32,11 +258,14 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     // check if there could be space to allocate both oversized neighbors and final neighbors at once; with no better guess, use 'max_neighbors' to estimate the final neighbors size...
     bool direct_scatter_neighbors = (num_nodes * init_max_neighbors /*oversized*/ + num_nodes * max_neighbors /*final upper bound*/) * sizeof(uint32_t) + num_nodes * sizeof(dim_t) /*offsets*/ < free_bytes;
     // no pack? can spare space in the oversized buffer equal to the amount of shared memory used for fast deduping
-    if (!direct_scatter_neighbors) init_max_neighbors = init_max_neighbors > SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE ? init_max_neighbors - SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE : 0;
+    if (!direct_scatter_neighbors)
+        init_max_neighbors = init_max_neighbors > SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE ? init_max_neighbors - SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE : 0;
     init_max_neighbors = max(init_max_neighbors, (dim_t)GM_MIN_BLOCK_DEDUPE_BUFFER_SIZE);
     
     if (num_nodes * init_max_neighbors * sizeof(uint32_t) > (1ull << 32))
-        std::cout << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_nodes * init_max_neighbors * sizeof(uint32_t)) / (1 << 30) << " GB for neighbors deduplication ...\n";
+        std::cout
+            << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_nodes * init_max_neighbors * sizeof(uint32_t)) / (1 << 30)
+            << " GB for neighbors deduplication ...\n";
     CUDA_CHECK(cudaMalloc(&d_oversized_neighbors, num_nodes * init_max_neighbors * sizeof(uint32_t))); // space for spilling deduplication hash-sets
     CUDA_CHECK(cudaMalloc(&d_neighbors_offsets, (num_nodes + 1) * sizeof(dim_t))); // node -> neighbors set start idx in d_neighbors
     thrust::device_ptr<dim_t> t_neigh_offsets(d_neighbors_offsets);
@@ -137,11 +366,14 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
     // NOTE: no need to check if there could be space to allocate both oversized neighbors and final neighbors at once, if the oversized fits, then the new neighbors are allocated either after the oversized is freed, or after the original neighbors are freed
     bool direct_scatter_coarse_neighbors = (curr_num_nodes * curr_max_neighbors /*oversized (SM included)*/ + new_num_nodes * max_neighbors /*final upper bound*/) * sizeof(uint32_t) + new_num_nodes * sizeof(dim_t) /*offsets*/ < free_bytes;
     // no pack? can spare space in the oversized buffer equal to the amount of shared memory used for fast deduping
-    if (!direct_scatter_coarse_neighbors) curr_max_neighbors = curr_max_neighbors > MAX_SM_WARP_DEDUPE_BUFFER_SIZE ? curr_max_neighbors - MAX_SM_WARP_DEDUPE_BUFFER_SIZE : 0; // save the spaced for the duplicates caught in SM
+    if (!direct_scatter_coarse_neighbors)
+        curr_max_neighbors = curr_max_neighbors > MAX_SM_WARP_DEDUPE_BUFFER_SIZE ? curr_max_neighbors - MAX_SM_WARP_DEDUPE_BUFFER_SIZE : 0; // save the spaced for the duplicates caught in SM
     curr_max_neighbors = max(curr_max_neighbors, (dim_t)MIN_GM_WARP_DEDUPE_BUFFER_SIZE); // just some ensurance...
     
     if (curr_num_nodes * curr_max_neighbors * sizeof(uint32_t) > (1ull << 32))
-        std::cout << "Allocating " << std::fixed << std::setprecision(1) << (float)(curr_num_nodes * curr_max_neighbors * sizeof(uint32_t)) / (1 << 30) << " GB for neighbors deduplication ...\n";
+        std::cout
+            << "Allocating " << std::fixed << std::setprecision(1) << (float)(curr_num_nodes * curr_max_neighbors * sizeof(uint32_t)) / (1 << 30)
+            << " GB for neighbors deduplication ...\n";
     CUDA_CHECK(cudaMalloc(&d_coarse_oversized_neighbors, curr_num_nodes * curr_max_neighbors * sizeof(uint32_t))); // space for spilling deduplication hash-sets
     CUDA_CHECK(cudaMalloc(&d_coarse_neighbors_offsets, (1 + new_num_nodes) * sizeof(dim_t))); // NOTE: the number nodes decreases!
     CUDA_CHECK(cudaMemset(d_coarse_neighbors_offsets, 0x00, sizeof(dim_t))); // init. the first offset at 0
@@ -260,7 +492,9 @@ std::tuple<dim_t, dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
     curr_max_hedge_size = max(curr_max_hedge_size, (dim_t)MIN_GM_WARP_DEDUPE_BUFFER_SIZE);
     
     if (num_hedges * curr_max_hedge_size * sizeof(uint32_t) > (1ull << 32))
-        std::cout << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_hedges * curr_max_hedge_size * sizeof(uint32_t)) / (1 << 30) << " GB for hedges deduplication ...\n";
+        std::cout
+            << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_hedges * curr_max_hedge_size * sizeof(uint32_t)) / (1 << 30)
+            << " GB for hedges deduplication ...\n";
     CUDA_CHECK(cudaMalloc(&d_coarse_oversized_hedges, num_hedges * curr_max_hedge_size * sizeof(uint32_t))); // space for spilling deduplication hash-sets
     CUDA_CHECK(cudaMalloc(&d_coarse_hedges_offsets, (1 + num_hedges) * sizeof(dim_t))); // NOTE: the number of hedges never decreases (for now), unlike that of nodes!
     CUDA_CHECK(cudaMalloc(&d_coarse_srcs_count, num_hedges * sizeof(uint32_t)));
@@ -324,10 +558,21 @@ std::tuple<dim_t, dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
     cub::DoubleBuffer<uint32_t> c_coarse_hedges_double_buffer(d_coarse_hedges, d_coarse_hedges_buffer);
     void* c_hedges_storage = nullptr;
     size_t c_hedges_storage_bytes = 0;
-    cub::DeviceSegmentedRadixSort::SortKeysDescending(c_hedges_storage, c_hedges_storage_bytes, c_coarse_hedges_double_buffer, new_hedges_size, num_hedges, d_coarse_hedges_offsets, d_coarse_hedges_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
-    std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_hedges_size * sizeof(uint32_t)) / (1 << 30) << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_hedges_storage_bytes) / (1 << 20) << " MB of temporary storage ...\n";
+    cub::DeviceSegmentedRadixSort::SortKeysDescending(
+        c_hedges_storage, c_hedges_storage_bytes, c_coarse_hedges_double_buffer,
+        new_hedges_size, num_hedges, d_coarse_hedges_offsets, d_coarse_hedges_offsets + 1,
+        /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0
+    );
+    std::cout
+        << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_hedges_size * sizeof(uint32_t)) / (1 << 30)
+        << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_hedges_storage_bytes) / (1 << 20)
+        << " MB of temporary storage ...\n";
     cudaMalloc(&c_hedges_storage, c_hedges_storage_bytes);
-    cub::DeviceSegmentedRadixSort::SortKeysDescending(c_hedges_storage, c_hedges_storage_bytes, c_coarse_hedges_double_buffer, new_hedges_size, num_hedges, d_coarse_hedges_offsets, d_coarse_hedges_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
+    cub::DeviceSegmentedRadixSort::SortKeysDescending(
+        c_hedges_storage, c_hedges_storage_bytes, c_coarse_hedges_double_buffer,
+        new_hedges_size, num_hedges, d_coarse_hedges_offsets, d_coarse_hedges_offsets + 1,
+        /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0
+    );
     if (c_coarse_hedges_double_buffer.Current() != d_coarse_hedges) {
         uint32_t* tmp = d_coarse_hedges_buffer;
         d_coarse_hedges_buffer = d_coarse_hedges;
@@ -429,8 +674,15 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
         cub::DoubleBuffer<uint32_t> c_coarse_touching_double_buffer(d_coarse_touching, d_coarse_touching_buffer);
         void* c_touching_storage = nullptr;
         size_t c_touching_storage_bytes = 0;
-        cub::DeviceSegmentedRadixSort::SortKeys(c_touching_storage, c_touching_storage_bytes, c_coarse_touching_double_buffer, new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
-        std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_touching_size * sizeof(uint32_t)) / (1 << 30) << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_touching_storage_bytes) / (1 << 20) << " MB of temporary storage ...\n";
+        cub::DeviceSegmentedRadixSort::SortKeys(
+            c_touching_storage, c_touching_storage_bytes, c_coarse_touching_double_buffer,
+            new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1,
+            /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0
+        );
+        std::cout
+            << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_touching_size * sizeof(uint32_t)) / (1 << 30)
+            << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_touching_storage_bytes) / (1 << 20)
+            << " MB of temporary storage ...\n";
         cudaMalloc(&c_touching_storage, c_touching_storage_bytes);
         cub::DeviceSegmentedRadixSort::SortKeys(c_touching_storage, c_touching_storage_bytes, c_coarse_touching_double_buffer, new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
         if (c_coarse_touching_double_buffer.Current() != d_coarse_touching) {

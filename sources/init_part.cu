@@ -1270,8 +1270,11 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
 
     // invoke Mt-KaHyPar
     std::ostringstream command;
-    //command << "mtkahypar -h coarse_tmp.hgr -k " << k << " -e " << std::format("{}", epsilon) << " -t " << MAX_OMP_THREADS << " -o km1 -v 0 --write-partition-file 1 --partition-output-folder . --preset-type deterministic_quality --seed " << INIT_SEED;
-    command << "mtkahypar -h coarse_tmp.hgr -k " << k << " -e " << std::format("{}", epsilon) << " -t " << MAX_OMP_THREADS << " -o km1 -v 0 -m direct --write-partition-file 1 --partition-output-folder . --preset-type default --seed " << INIT_SEED;
+    command
+        << "mtkahypar -h coarse_tmp.hgr -k " << k
+        << " -e " << std::format("{}", epsilon)
+        << " -t " << MAX_OMP_THREADS
+        << " -o km1 -v 0 -m direct --write-partition-file 1 --partition-output-folder . --preset-type default --seed " << INIT_SEED;
     std::cout << "Running Mt-KaHyPar: " << command.str().c_str() << "\n";
     int command_result = std::system(command.str().c_str());
     std::ostringstream out_filename;
@@ -1326,7 +1329,6 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     CUDA_CHECK(cudaMemcpy(d_partitions, h_partitions.data(), num_nodes * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_partitions_sizes, h_partitions_sizes.data(), k * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-    //std::cout << "Completed initial partitioning via Mt-KaHyPar, connectivity=" << std::fixed << std::setprecision(3) << best_conn << "\n";
     std::cout << "Completed initial partitioning via Mt-KaHyPar !\n";
     return std::make_tuple(d_partitions, d_partitions_sizes);
 }

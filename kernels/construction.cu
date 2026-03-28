@@ -1,6 +1,155 @@
 #include "construction.cuh"
 #include "utils.cuh"
 
+// count how many hedges are inbound and how many touch each node
+// SEQUENTIAL COMPLEXITY: e*d
+// PARALLEL OVER: e
+// SHUFFLES OVER: d
+__global__
+void touching_count_kernel(
+    const uint32_t* __restrict__ hedges, // stores srcs first, then dsts
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const uint32_t num_hedges,
+    dim_t* __restrict__ touching_offsets, // initialized at 0s
+    uint32_t* __restrict__ inbound_count // initialized at 0s
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the hedge to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    /*
+    * Idea:
+    * - every warp visits an hedge
+    * - for every pin, it atomically increments the pin's touching set size
+    * - for every destination, it atomically increments the pin's inbound count
+    */
+
+    const uint32_t* hedge = hedges + hedges_offsets[warp_id];
+    const uint32_t hedge_size = (uint32_t)(hedges_offsets[warp_id + 1] - hedges_offsets[warp_id]);
+    const dim_t hedge_srcs_count = srcs_count[warp_id];
+
+    for (uint32_t pin_idx = lane_id; pin_idx < hedge_size; pin_idx += WARP_SIZE) {
+        const uint32_t pin = hedge[pin_idx]; // already a group id
+        atomicAdd(&touching_offsets[pin + 1], 1); // leave the first entry to be 0 (offset of the first set)
+        if (pin_idx >= hedge_srcs_count) // the pin is a dst
+            atomicAdd(&inbound_count[pin], 1);
+    }
+}
+
+// write inbound and outbound sets
+// SEQUENTIAL COMPLEXITY: n*h
+// PARALLEL OVER: n
+// SHUFFLES OVER: h (touching)
+__global__
+void touching_build_kernel(
+    const uint32_t* __restrict__ hedges, // already coarsened as of here, thus contain group ids!
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t num_hedges,
+    uint32_t* __restrict__ touching,
+    uint32_t* __restrict__ inserted_inbound, // initialized at 0s
+    uint32_t* __restrict__ inserted_outbound // initialized from inbound_count
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the hedge to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    /*
+    * Idea:
+    * - every warp visits an hedge
+    * - for every source, it claims a slot by atomically incrementing the pin's count of seen srcs, then inserts the src in the pin's inbound set
+    * - for every destination, same mechanism, with a separate atomic counter
+    */
+
+    const uint32_t* hedge = hedges + hedges_offsets[warp_id];
+    const uint32_t hedge_size = (uint32_t)(hedges_offsets[warp_id + 1] - hedges_offsets[warp_id]);
+    const dim_t hedge_srcs_count = srcs_count[warp_id];
+
+    for (uint32_t pin_idx = lane_id; pin_idx < hedge_size; pin_idx += WARP_SIZE) {
+        const uint32_t pin = hedge[pin_idx]; // already a group id
+        uint32_t *pin_touching = touching + touching_offsets[pin];
+        uint32_t insert_idx;
+        if (pin_idx >= hedge_srcs_count) // the pin is a dst
+            insert_idx = atomicAdd(&inserted_inbound[pin], 1);
+        else
+            insert_idx = atomicAdd(&inserted_outbound[pin], 1);
+        pin_touching[insert_idx] = warp_id;
+    }
+}
+
+// count how many unique neighbors each sample (node) has
+// SEQUENTIAL COMPLEXITY: #samples*d*h
+// PARALLEL OVER: n
+// SHUFFLES OVER: h (touching)
+__global__
+void neighbors_sample_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t num_nodes,
+    const uint32_t num_samples,
+    const uint32_t samples_per_repeat, // number of samples to explore per kernel launch
+    const uint32_t curr_repeat, // offset w.r.t. the start of samples
+    uint32_t* __restrict__ flags_bits, // bit-flags (a unique set per sample - concatenated), set a the i-th bit to 1 if the 1-th node has been seen
+    dim_t* __restrict__ neighbors_count // neighbors_count[i] -> maximum number of neighbors seen by samples handled by the i-th warp across repeats
+) {
+    // STYLE: one sample (node) per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the sample to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= samples_per_repeat) return;
+
+    const uint32_t sample_idx = curr_repeat * samples_per_repeat + warp_id;
+    if (sample_idx >= num_samples) return;
+
+    uint32_t* my_flags = flags_bits + warp_id * ((num_nodes + 32 - 1) / 32);
+    const uint32_t my_node = static_cast<uint32_t>((static_cast<uint64_t>(sample_idx) * static_cast<uint64_t>(num_nodes)) / static_cast<uint64_t>(num_samples));
+
+    const uint32_t* my_touching = touching + touching_offsets[my_node];
+    const uint32_t* not_my_touching = touching + touching_offsets[my_node + 1];
+
+    dim_t unique_neigh = 0u;
+
+    for (const uint32_t* hedge_ptr = my_touching; hedge_ptr < not_my_touching; hedge_ptr++) {
+        const uint32_t hedge = *hedge_ptr;
+        const uint32_t* my_hedge = hedges + hedges_offsets[hedge];
+        const uint32_t* not_my_hedge = hedges + hedges_offsets[hedge + 1];
+        for (const uint32_t* pin_ptr = my_hedge + lane_id; pin_ptr < not_my_hedge; pin_ptr += WARP_SIZE) {
+            const uint32_t pin = *pin_ptr;
+            // now all thread in the warp set the "pin-th bit" of my_flags to 1 in parallel
+            // => since multiple threads might want to write the same 32bit word, make them agree on a single update per word
+            const uint32_t word_idx = pin >> 5;
+            const uint32_t bit_mask = 1u << (pin & 31);
+            const unsigned active = __activemask();
+            // lanes targeting the same 32-bit word cooperate
+            const unsigned peers = __match_any_sync(active, word_idx);
+            // OR-reduce all bit requests for the same word across peers
+            const uint32_t combined_mask = __reduce_or_sync(peers, bit_mask);
+            const int leader = __ffs(peers) - 1;
+            if (static_cast<int>(lane_id) == leader) {
+                // exactly one writer per word per iteration
+                uint32_t* const word_ptr = my_flags + word_idx;
+                const uint32_t old_bits = *word_ptr;
+                const uint32_t updated_bits = old_bits | combined_mask;
+                *word_ptr = updated_bits;
+                unique_neigh += static_cast<dim_t>(__popc(updated_bits & ~old_bits));
+            }
+        }
+    }
+
+    unique_neigh = warpReduceSumLN0<dim_t>(unique_neigh);
+
+    if (lane_id == 0)
+        neighbors_count[warp_id] = max(unique_neigh, neighbors_count[warp_id]);
+}
+
 // compute the distinct neighbors count of each node, aided by a global hash-set
 // SEQUENTIAL COMPLEXITY: n*h*d
 // PARALLEL OVER: n

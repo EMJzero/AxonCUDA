@@ -89,8 +89,17 @@ void logCandidates(
             }
             if (target == UINT32_MAX) continue;
             // check the symmetry invariant: mutual pairs or the other has found a higher score pair (or one with lower id - tiebreaker) [easy for j = 0, for j > 0 check first that the target wasn't already used at a lower j]
-            if (pairs_tmp[target * cfg.candidates_count + j] != i && pairs_tmp[target * cfg.candidates_count + j] != UINT32_MAX && std::find(pairs_tmp.begin() + target * cfg.candidates_count, pairs_tmp.begin() + target * cfg.candidates_count + j, i) == pairs_tmp.begin() + target * cfg.candidates_count + j && !(scores_tmp[target * cfg.candidates_count + j] > score || scores_tmp[target * cfg.candidates_count + j] == score && pairs_tmp[target * cfg.candidates_count + j] < i))
-                std::cerr << "\n  WARNING, symmetry violated: node " << i << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ") AND node " << target << " (" << j << " target=" << pairs_tmp[target * cfg.candidates_count + j] << " score=" << std::fixed << std::setprecision(3) << scores_tmp[target * cfg.candidates_count + j] << ") !!";
+            if (
+                pairs_tmp[target * cfg.candidates_count + j] != i && pairs_tmp[target * cfg.candidates_count + j] != UINT32_MAX
+                && std::find(pairs_tmp.begin() + target * cfg.candidates_count, pairs_tmp.begin() + target * cfg.candidates_count + j, i) == pairs_tmp.begin() + target * cfg.candidates_count + j
+                && !(scores_tmp[target * cfg.candidates_count + j] > score || scores_tmp[target * cfg.candidates_count + j] == score && pairs_tmp[target * cfg.candidates_count + j] < i)
+            ) {
+                std::cerr
+                    << "\n  WARNING, symmetry violated: node " << i
+                    << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score
+                    << ") AND node " << target << " (" << j << " target=" << pairs_tmp[target * cfg.candidates_count + j]
+                    << " score=" << std::fixed << std::setprecision(3) << scores_tmp[target * cfg.candidates_count + j] << ") !!";
+            }
         }
     }
     std::cout << "\n";

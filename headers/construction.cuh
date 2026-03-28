@@ -8,6 +8,11 @@
 
 struct runconfig;
 
+namespace hgraph {
+    class HyperGraph;
+}
+
+using namespace hgraph;
 
 // USED BY: neighborhoods kernel
 
@@ -22,6 +27,29 @@ struct runconfig;
 
 
 // STEPS
+
+std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouchingHost(
+    const HyperGraph& hg
+);
+
+std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouching(
+    const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_srcs_count,
+    const uint32_t num_nodes,
+    const uint32_t num_hedges
+);
+
+dim_t sampleMaxNeighborhoodSize(
+    const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
+    const uint32_t num_nodes,
+    const uint32_t num_samples
+);
 
 std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     const runconfig cfg,
@@ -72,6 +100,42 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
 
 
 // KERNELS
+
+__global__
+void touching_count_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const uint32_t num_hedges,
+    dim_t* __restrict__ touching_offsets,
+    uint32_t* __restrict__ inbound_count
+);
+
+__global__
+void touching_build_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t num_hedges,
+    uint32_t* __restrict__ touching,
+    uint32_t* __restrict__ inserted_inbound,
+    uint32_t* __restrict__ inserted_outbound
+);
+
+__global__
+void neighbors_sample_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t num_nodes,
+    const uint32_t num_samples,
+    const uint32_t samples_per_repeat,
+    const uint32_t curr_repeat,
+    uint32_t* __restrict__ flags_bits,
+    dim_t* __restrict__ neighbors_count
+);
 
 __global__
 void neighborhoods_count_kernel(

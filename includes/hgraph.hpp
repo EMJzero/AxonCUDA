@@ -145,9 +145,6 @@ namespace hgraph {
                 hedges_.emplace_back(offset, he.first.size() + he.second.size(), he.first.size(), w, hedges_flat_.data());
                 offset += he.first.size() + he.second.size();
             }
-
-            // TODO: temporary solution - always touching inbount sets on the host
-            buildIncidenceSets();
         }
 
         uint32_t nodes() const { return node_count_; }

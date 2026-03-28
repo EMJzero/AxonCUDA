@@ -33,6 +33,11 @@
 #define INIT_SEED 86 // seed for random initialization (KWAY mode only)
 
 
+// USED BY: neighborhoods kernel
+
+#define NEIGHBORS_SAMPLE_SIZE 2400
+
+
 // USED BY: candidates kernel
 
 #define MAX_CANDIDATES 16u // => how many candidates are proposed for a node (ranked by score)
