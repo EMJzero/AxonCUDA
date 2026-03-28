@@ -7,6 +7,7 @@
 #include <utility>
 #include <cstdint>
 #include <fstream>
+#include <sstream>
 #include <iostream>
 #include <stdexcept>
 #include <algorithm>
@@ -97,8 +98,10 @@ namespace hgraph {
         std::vector<HyperEdge> hedges_;
 
         // pointer-based adjacency maps
-        std::vector<std::set<uint32_t>> outbound_;  // store indices w.r.t. the hedges array
+        // NOTE: these are only built when needed via a call to "buildIncidenceSets"
+        std::vector<std::set<uint32_t>> outbound_; // store indices w.r.t. the hedges array
         std::vector<std::set<uint32_t>> inbound_;
+        bool incidences_built_ = false;
 
         // contiguous array of the neighbors to each node
         // NOTE: these are only built when needed via a call to "buildNeighborhoods"
@@ -143,23 +146,8 @@ namespace hgraph {
                 offset += he.first.size() + he.second.size();
             }
 
-            // build inbound/outbound maps
-            outbound_.resize(nodes);
-            inbound_.resize(nodes);
-
-            for (uint32_t idx = 0; idx < hedges_.size(); idx++) {
-                auto& he = hedges_[idx];
-
-                for (uint32_t src : he.sources()) {
-                    if (src >= nodes) throw std::runtime_error("Invalid source node");
-                    outbound_[src].insert(idx);
-                }
-
-                for (uint32_t dst : he.destinations()) {
-                    if (dst >= nodes) throw std::runtime_error("Invalid destination node");
-                    inbound_[dst].insert(idx);
-                }
-            }
+            // TODO: temporary solution - always touching inbount sets on the host
+            buildIncidenceSets();
         }
 
         uint32_t nodes() const { return node_count_; }
@@ -168,22 +156,26 @@ namespace hgraph {
 
         // these getters give the set of HyperEdges, lazily paying the de-indexing overhead
         HedgeView<std::set<uint32_t>> outbound(Node n) const {
+            if (!incidences_built_) throw std::runtime_error("Call to outbound(Node n). Incidence sets not built. Call buildIncidenceSets() first.");
             if (n >= node_count_) throw std::runtime_error("Invalid node");
             return std::ranges::transform_view(std::ranges::ref_view{ outbound_[n] }, HedgeLookup{ &hedges_ });
         }
         // |
         HedgeView<std::set<uint32_t>> inbound(Node n) const {
+            if (!incidences_built_) throw std::runtime_error("Call to inbound(Node n). Incidence sets not built. Call buildIncidenceSets() first.");
             if (n >= node_count_) throw std::runtime_error("Invalid node");
             return std::ranges::transform_view(std::ranges::ref_view{ inbound_[n] }, HedgeLookup{ &hedges_ });
         }
 
         // these getters give you raw hedge ids w.r.t. the hedges array -> use hg.hedges()[id] to get the actual HyperEdge
         const std::set<uint32_t>& outboundIds(Node n) const {
+            if (!incidences_built_) throw std::runtime_error("Call to outboundIds(Node n). Incidence sets not built. Call buildIncidenceSets() first.");
             if (n >= node_count_) throw std::runtime_error("Invalid node");
             return outbound_[n];
         }
         // |
         const std::set<uint32_t>& inboundIds(Node n) const {
+            if (!incidences_built_) throw std::runtime_error("Call to inboundIds(Node n). Incidence sets not built. Call buildIncidenceSets() first.");
             if (n >= node_count_) throw std::runtime_error("Invalid node");
             return inbound_[n];
         }
@@ -191,11 +183,13 @@ namespace hgraph {
         // like outboundIds/inboundIds, these getters give you raw hedge ids w.r.t. the hedges array, also sorting them for each node
         // => std::set always stores elements sorted by its comparator so this is easy!
         const std::ranges::subrange<std::set<uint32_t>::const_iterator> outboundSortedIds(Node n) const {
+            if (!incidences_built_) throw std::runtime_error("Call to outboundSortedIds(Node n). Incidence sets not built. Call buildIncidenceSets() first.");
             if (n >= node_count_) throw std::runtime_error("Invalid node");
             return {outbound_[n].begin(), outbound_[n].end()};
         }
         // |
         const std::ranges::subrange<std::set<uint32_t>::const_iterator> inboundSortedIds(Node n) const {
+            if (!incidences_built_) throw std::runtime_error("Call to inboundSortedIds(Node n). Incidence sets not built. Call buildIncidenceSets() first.");
             if (n >= node_count_) throw std::runtime_error("Invalid node");
             return {inbound_[n].begin(), inbound_[n].end()};
         }
@@ -364,10 +358,38 @@ namespace hgraph {
             return HyperGraph(new_nodes, new_hedges, new_weights);
         }
 
+        // build inbound and outbound sets
+        void buildIncidenceSets() {
+            std::cerr << "WARNING: building inbound and outbound sets will take a while...\n";
+
+            outbound_.clear();
+            inbound_.clear();
+            outbound_.resize(node_count_);
+            inbound_.resize(node_count_);
+
+            for (uint32_t idx = 0; idx < hedges_.size(); idx++) {
+                auto& he = hedges_[idx];
+
+                for (uint32_t src : he.sources()) {
+                    if (src >= node_count_) throw std::runtime_error("Invalid source node");
+                    outbound_[src].insert(idx);
+                }
+
+                for (uint32_t dst : he.destinations()) {
+                    if (dst >= node_count_) throw std::runtime_error("Invalid destination node");
+                    inbound_[dst].insert(idx);
+                }
+            }
+
+            incidences_built_ = true;
+        }
+
         // return a greedy order of nodes that maximizes high-locality
         // -> frontier expansion starting from nodes with minimal inbound connections
         // -> iteratively add to the frontier the node most strongly connected to those already part of it
         std::vector<int32_t> feedForwardOrder() const {
+            if (!incidences_built_) throw std::runtime_error("Call to feedForwardOrder(). Incidence sets not built. Call buildIncidenceSets() first.");
+
             std::vector<int32_t> new_id(node_count_, -1);
             std::vector<float> priority(node_count_, 0.0f);
             std::vector<bool> active(node_count_, false);
@@ -533,7 +555,7 @@ namespace hgraph {
             for (auto& he : hedges_)
                 he = HyperEdge(he.offset(), he.length(), he.src_count(), he.weight(), base);
 
-            if (update_in_out_sets) {
+            if (update_in_out_sets && incidences_built_) {
                 for (uint32_t i = 0; i < inbound_.size(); ++i) {
                     const auto& out = outbound_[i];
                     std::erase_if(inbound_[i], [&](auto x) { return out.contains(x); });
@@ -543,7 +565,8 @@ namespace hgraph {
 
         // builds all neighborhoods (in- and outbound to each node)
         void buildNeighborhoods() {
-            std::cerr << "WARNING: building neighborhoods will take a while...\n";
+            if (!incidences_built_) throw std::runtime_error("Call to buildNeighborhoods(). Incidence sets not built. Call buildIncidenceSets() first.");
+            std::cerr << "WARNING: building neighborhoods will take a long while...\n";
 
             neighborhoods_.clear();
             neighborhood_offsets_.clear();
@@ -581,6 +604,7 @@ namespace hgraph {
 
         // gives the maximum neighborhood size found by sampling 'sample_size' equi-spaced nodes
         uint32_t sampleMaxNeighborhoodSize(uint32_t sample_size) {
+            if (!incidences_built_) throw std::runtime_error("Call to sampleMaxNeighborhoodSize(uint32_t sample_size). Incidence sets not built. Call buildIncidenceSets() first.");
             uint32_t max_size = 0;
 
             #pragma omp parallel for reduction(max:max_size) schedule(guided)
@@ -613,7 +637,7 @@ namespace hgraph {
         // return a view (pointer + size) of a node's neighborhood
         std::pair<const uint32_t*, size_t> getNeighborhood(Node n) const {
             if (!neighborhoods_built_)
-                throw std::runtime_error("Neighborhoods not built. Call buildNeighborhoods() first.");
+                throw std::runtime_error("Call to getNeighborhood(Node n). Neighborhoods not built. Call buildNeighborhoods() first.");
             if (n >= node_count_)
                 throw std::runtime_error("Invalid node");
 
@@ -626,14 +650,14 @@ namespace hgraph {
         // return the entire neighborhoods array
         const std::vector<uint32_t>& getNeighborhoods() const {
             if (!neighborhoods_built_)
-                throw std::runtime_error("Neighborhoods not built. Call buildNeighborhoods() first.");
+                throw std::runtime_error("Call to getNeighborhoods(). Neighborhoods not built. Call buildNeighborhoods() first.");
             return neighborhoods_;
         }
 
         // return the entire neighborhoods array
         const std::vector<uint32_t>& getNeighborhoodOffsets() const {
             if (!neighborhoods_built_)
-                throw std::runtime_error("Neighborhoods not built. Call buildNeighborhoods() first.");
+                throw std::runtime_error("Call to getNeighborhoodOffsets(). Neighborhoods not built. Call buildNeighborhoods() first.");
             return neighborhood_offsets_;
         }
 

@@ -590,6 +590,68 @@ Why just the 4 elements up-left-right-down, couldn't we have a custom stencil? L
 
 ----
 
+Old initial placement IDEA:
+- every warp handles a node and builds a SM histogram over its neighbors, containing their total connection weight with the node
+  - when the histogram is full, with a certain probability, evict a small-valued entry
+- construct linearized arborescences out of best-neighbor relations, every node is given a "string_id" identifying its arborescence, an "depth" inside it (distance from root), and a "score" inside such arborescence
+- every node moves to its best neighbor, and to its best neighbor, and so on, until entering a cycle or reaching a dead end, in doing so:
+  - every hop it takes, increases the original node's depth by 1
+  - the score of each node it visits is incremented by the score such node held, if any, in the original node's histogram (maybe multiplied by 1/2 + 1/2*depth)
+  - the node's string_id becomes the id of the root node (or the lowest of two root nodes forming a 2-cycle)
+- return once every warp reached a root starting from its node
+- sort nodes by the tuple (string_id, depth, score)
+  => TODO: sorting by depth->score means that after a branch in the arborescence, nodes from all branches interleave, this is not desirable, rather, one branch should come first, the other next, or maybe even interleave ter finding out how many neighbors they have in common
+- every warp handles a node again and builds an histogram over arborescences, going over all neighbors of the node and accumulating their connection weight for the arborescence they belong to
+- same game as before to now order arborescences (use a stable sort, obv.)
+
+----
+
 Initial placement IDEA:
 - bisection, k=2 epsilon=0.1 balanced partitioning, minimizes the cut-net metric! Hence, it gives you two sets of nodes that’s fine to put far from each other as they have little locality in between them!
 - so if you do recursive bysection, you end up with partitions of partitions down to single nodes, order the nodes internally in each partition, and concatenate as you go back up the recursion!
+
+Additional crazy/dumb ideas:
+
+Crazy ass idea again, a reverse disjoint set:
+- HP: the hypergraph is fully connected
+- every node has a certain random id assigned
+- every node builds the histogram over neighbors, treating it as ranking neighbors
+- everyone picks the first neighbor (tie-break) and walks up the resulting pseudo tree, the path every node defined gets “remembered”
+- upon reaching the root each node inherits its tree’s id, taken as the id of the lowest-id node in the 2-cycle root
+- now each node picks its second best neighbor:
+  - if it finds it has the same id it already has, do nothing
+  - if it has a different id, the whole tree of the two with a smaller id is overridden with the other’s id, and the node causing the link remembers the additional path
+- repeat the whole hypergraph is under the same id
+- now used paths constitute a sort of maximum weight minimum hops spanning tree over the hypergraph
+- to linearize this giant tree, then this is the problem...
+
+Crazy ass ordering idea:
+- give every node a real number in [-1, 1], starting randomly
+- extract the highest degree hedge and put it at 0.0, propagate to all its pins with strength w(e) (normalized in 0-1) and they propagate it to their pins with the strength multiplied by the w(e’) they are seen with (propagate only once, for speed)
+- extract another hedge, and compute how much it overlaps with the first, based on that put it at a certain distance, the propagate it a value to nodes too
+- ultimately, make it so you lay a few different hedges on the range -1:1 and have them pull nodes along over it with a recursion of 2 over pins
+
+Not so great idea:
+- build trees out of best neighbors
+- build pieces of arborescences inside each tree by looking at the second-best neighbor (among those in the same tree)
+- repeat until you have only pairs
+- order each pair randomly, and re-expand
+- every time you look at a later tree, order it subtrees sequentially (greedy pop from queue - queue rank is the histogram sum in that component for the elements already taken)
+- finally, order the outermost forest
+=> ISSUE: ordering is sequential…
+
+Another crazy idea:
+- order hyperedges by highest w first
+- give idx 0 to all nodes in the highest w hedge, idx 1 to all those NEW in the second, 2 to those NEW in the third and so on
+- this gives you groups of node to order, groups already being globally ordered by id
+- internally, order each group by the total weights of hedges each node partakes in
+=> ISSUE: where TF is the locality...
+||
+I could add to any already seen once being seen by an hedge after the first the 1/2^n value of the current n-th hedge
+
+Ordering IDEA:
+- each hedge visits its pins and their incidence sets
+- each hedge counts how many times it has seen other hedges among its pins (histogram over its overlapping hedges)
+- each hedge ranks its pins by the total occurrencies of other hedges in the histogram that every pin owns -> a higher-up pin will have the highest overlapping incidence set with the hedge
+- and then what!? Aggreate ranks per node and use them as proxies for their resulting overlap when together?
+=> I am just doing random bullshit at this point...

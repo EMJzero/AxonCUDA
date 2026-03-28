@@ -1,607 +1,580 @@
+#include <tuple>
+
+#include "thruster.cuh"
+
+#include "runconfig.hpp"
+
+#include "utils.cuh"
+#include "defines.cuh"
+#include "chaining.cuh"
 #include "refinement.cuh"
 
-// for each hyperedge, remove its sources from the pins per partition counts
-// SEQUENTIAL COMPLEXITY: e
-// PARALLEL OVER: e
-__global__
-void inbound_pins_per_partition_kernel(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ srcs_count,
-    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
+void refinementRepeats(
+    const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_srcs_count,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
+    const uint32_t *d_inbound_count,
+    const float *d_hedge_weights,
+    const uint32_t *d_nodes_sizes,
+    const uint32_t level_idx,
+    const uint32_t curr_num_nodes,
     const uint32_t num_hedges,
     const uint32_t num_partitions,
-    uint32_t* __restrict__ inbound_pins_per_partitions, // inbound_pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of inbound pins of that partition owned by this hedge
-    uint32_t* __restrict__ partitions_inbound_sizes // partitions_inbound_sizes[part] -> number of inbound_pins_per_partitions for 'part' that are not zero
+    const dim_t touching_size,
+    uint32_t *d_pairs,
+    float *d_f_scores,
+    uint32_t *d_partitions,
+    uint32_t *d_partitions_sizes,
+    uint32_t *d_pins_per_partitions,
+    uint32_t *d_partitions_inbound_sizes
 ) {
-    // STYLE: one hedge per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_hedges) return;
+    // settings for refinement
+    bool chainup = false; // true -> chain moves by size, then sort chains into a sequence, false -> directly sort moves into a sequence by gain
+    bool encourage = cfg.mode == Mode::INCC; // true -> give a gain to moves that don't fully disconnect an hedge, doing so proportionally to how few pins the leave behind
 
-    const dim_t hedge_start_idx = hedges_offsets[tid];
-    const uint32_t *hedge_start = hedges + hedge_start_idx;
-    const uint32_t hedge_srcs_count = srcs_count[tid];
-    const uint32_t *hedge_srcs_end = hedges + hedge_srcs_count;
-    uint32_t *my_inbound_pins_per_partitions = inbound_pins_per_partitions + tid * num_partitions;
+    for (uint32_t fm_repeat = 0u; fm_repeat < cfg.refine_repeats; fm_repeat++) {
+        std::cout << "Refining level " << level_idx << " repeat " << fm_repeat << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << num_partitions << "\n";
 
-    for (const uint32_t* curr = hedge_start; curr < hedge_srcs_end; curr++) {
-        const uint32_t src_part = partitions[*curr];
-        const uint32_t prev = atomicSub(&my_inbound_pins_per_partitions[src_part], 1);
-        if (prev == 1) atomicSub(&partitions_inbound_sizes[src_part], 1);
-    }
-}
+        // initially relax partition size, then rely on later refinement to bring it back [TERRIBLE MISTAKE!]
+        //const uint32_t h_varying_max_nodes_per_part = (int32_t)((float)h_max_nodes_per_part * (1.4f - 0.4f * (float)std::min(2*fm_repeat, cfg.refine_repeats) / cfg.refine_repeats));
+        //CUDA_CHECK(cudaMemcpyToSymbol(max_nodes_per_part, &h_varying_max_nodes_per_part, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
 
-// find moves of nodes from one partition to another that yield a positive gain
-// SEQUENTIAL COMPLEXITY: n*h*partitions
-// PARALLEL OVER: n
-// SHUFFLES OVER: partitions
-__global__
-void fm_refinement_gains_kernel(
-    const uint32_t* __restrict__ touching,
-    const dim_t* __restrict__ touching_offsets,
-    const float* __restrict__ hedge_weights,
-    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
-    const uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
-    const uint32_t* __restrict__ nodes_sizes,
-    const uint32_t* __restrict__ partitions_sizes,
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    const uint32_t randomizer,
-    const uint32_t discount, // by how much to overshoot the size constraint when proposing moves
-    const bool encourage_all_moves, // if true, even moves that don't fully disconnect an hyperedge receive a gain inversely proportional to how many pins remain
-    // NOTE: we repurpose the arrays allocated for the "candidates kernel" for those!
-    uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx
-    float* __restrict__ scores // scores[idx] -> gain for move in position idx
-) { 
-    // STYLE: one node per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_nodes) return;
-    
-    /*
-    * Idea:
-    * - one node per warp
-    * - different part of the histogram (different partitions - one bin per partition) in each thread's registers
-    * - repeat enough times for finite-sized (PART_HIST_SIZE) histogram parts among threads to cover all partitions
-    * - scan hyperedges, specifically their pins per hedge (with manual caching in shared memory?) enough times to have each partition once in the histogram
-    * - maximum bin inside each thread, then warp primitives to find the maximum bin per node
-    *
-    * Upgrade: since in "pins_per_partitions", each hedge has an entry for each partition, and they are all always in the same order, we can just
-    *          assign a thread in each warp to a few partitions, and always make it see those! No need for the whole histogram of all partitions
-    *          per thread where each bin is then reduced! Just each thread in the warp is in charge of num_partitions/warp_size partitions!
-    *
-    * TODO: this kernel could undergo the same multi-candidate upgrade as "pairs"! Tho here it would be much harder with the moves sorting mechanism...
-    * 
-    * TODO: full conversion to shared memory histogram...
-    *
-    * TODO: like in HyperG, we could repurpose neighbors to keep a list of neighboring hedges to each node (maybe one-hot encoded), and thus
-    *       not build the full histogram, but build it only for those neighboring partitions...
-    *
-    * NOTE: no need for FIXED POINT here, since we don't need symmetry nor other invariants!
-    */
-    
-    const uint32_t my_partition = partitions[warp_id];
-    const uint32_t my_size = nodes_sizes[warp_id];
-    
-    const uint32_t* my_touching = touching + touching_offsets[warp_id];
-    const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
-    //uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
-    float loss[PART_HIST_SIZE]; // make sure this fits in registers (no spill) !! Store here only the score, the partition id can be inferred!
-    float saving = 0.0f;
-    
-    // all threads in the warp should agree on those...
-    float best_gain = -FLT_MAX;
-    uint32_t best_move = UINT32_MAX;
+        // by how much of a node's size to allow an invalid move to be proposed (but filtered later by events - if still invalid)
+        uint32_t discount = fm_repeat < cfg.refine_repeats / 3 ? 1u : (fm_repeat < 2 * cfg.refine_repeats / 3 ? 2u : UINT32_MAX);
 
-    // handle the current partition first with its own scan of touching hyperedges
-    for (const uint32_t* hedge_idx = my_touching + lane_id; hedge_idx < not_my_touching; hedge_idx += WARP_SIZE) {
-        const uint32_t actual_hedge_idx = *hedge_idx;
-        const uint32_t* my_pin_per_partition = pins_per_partitions + actual_hedge_idx * num_partitions;
-        const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-        // hedge connected to my partition: gain the hedge's weight iff moving would disconnect it from my partition (I am its last pin left there)
-        if (!encourage_all_moves && my_pin_per_partition[my_partition] == 1)
-            saving += my_hedge_weight;
-        // VARIANT: give a little push to nodes leaving a partition with not just one, but few pins left for an hedge
-        if (encourage_all_moves && my_pin_per_partition[my_partition] >= 1)
-            saving += my_hedge_weight / (my_pin_per_partition[my_partition] * my_pin_per_partition[my_partition]);
-    }
-
-    saving = warpReduceSum<float>(saving);
-    
-    // handle PART_HIST_SIZE*WARP_SIZE partitions at a time, that is partitions_per_thread per thread in the warp
-    for (uint32_t curr_base_part = 0; curr_base_part < num_partitions; curr_base_part += PART_HIST_SIZE*WARP_SIZE) {
-        // each thread handles, at once, min(PART_HIST_SIZE, partitions_per_thread) partitions, each partition is handled by exactly one thread per warp
-        const uint32_t partitions_to_handle = min(num_partitions - curr_base_part, PART_HIST_SIZE*WARP_SIZE); // ... to handle over the whole warp
-        const uint32_t partitions_per_thread = (partitions_to_handle + WARP_SIZE - 1) / WARP_SIZE; // ceiled
-        const uint32_t threads_with_one_less_partition = partitions_per_thread*WARP_SIZE - partitions_to_handle;
-        const uint32_t my_part_count = partitions_per_thread - (lane_id >= WARP_SIZE - threads_with_one_less_partition ? 1 : 0);
-
-        // clear per-thread local histograms
-        for (uint32_t p = 0; p < my_part_count; p++)
-            loss[p] = 0.0f;
-
-        // scan touching hyperedges
-        // NOTE: interpret this as "for each hedge, see if you moving to a certain partition is something that they like or not"
-        for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-            const uint32_t actual_hedge_idx = *hedge_idx;
-            const uint32_t* my_pin_per_partition = pins_per_partitions + actual_hedge_idx * num_partitions;
-            const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-            // each thread in the warp reads partitions_per_thread counters
-            for (uint32_t p = 0; p < my_part_count; p++) {
-                const uint32_t part = curr_base_part + lane_id + p * WARP_SIZE;
-                // hedge not yet connected to the partition: pay the hedge's weight iff moving there connects it to the new partition (I would become its first pin there)
-                if (my_pin_per_partition[part] == 0) loss[p] += my_hedge_weight;
-                // VARIANT: pt2
-                //loss[p] += my_hedge_weight / ((my_pin_per_partition[part] + 1) * (my_pin_per_partition[part] + 1));
-            }
-        }
-
-        // reduce max inside each threads
-        for (uint32_t p = 0; p < my_part_count; p++) {
-            const float gain = saving - loss[p];
-            const uint32_t part = curr_base_part + lane_id + p * WARP_SIZE;
-            //const float gain = (saving - loss[p]) * (partitions_sizes[part] + my_size <= max_nodes_per_part ? 1.0f : 0.8f);
-            // MAYBE: could anticipate the constraint check! E.g. at the beginning of the iteration, entirely removing some partitions from the histogram,
-            //        but this will require keeping a list of active partitions, since the indices won't suffice anymore...
-            // => pseudo-random tie-break via hashes
-            if (part != my_partition && partitions_sizes[part] + my_size - (my_size / discount) <= max_nodes_per_part && (gain > best_gain || gain == best_gain && hash_uint32(part + randomizer) > hash_uint32(best_move + randomizer))) {
-            //if (part != my_partition && (gain > best_gain || gain == best_gain && hash_uint32(part) > hash_uint32(best_move))) {
-                best_gain = gain;
-                best_move = part;
-            }
-        }
-
-        // reduce max between threads
-        bin<float> max = warpReduceMax<float>(best_gain, best_move);
-        best_gain = max.val;
-        best_move = max.payload; // yeah, "node" should be called "partition" here, but this way we repurpose the struct...
-    }
-
-    if (lane_id == 0) {
-        moves[warp_id] = best_move;
-        scores[warp_id] = best_gain;
-    }
-}
-
-// find the gain of each move under the HP that all higher-score moves have been applied
-// SEQUENTIAL COMPLEXITY: n*h*d
-// PARALLEL OVER: n
-// SHUFFLES OVER: d
-__global__
-void fm_refinement_cascade_kernel(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ touching,
-    const dim_t* __restrict__ touching_offsets,
-    const float* hedge_weights,
-    // CHOOSE: either rank nodes by their score and pass "move_ranks" or pass "scores" and sort on the fly, with the node id as a tie-breaker
-    // CHOICE: sorted scores and move_ranks, because we need to keep scores in their current (sorted) order even after updating them
-    const uint32_t* __restrict__ move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
-    const uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
-    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
-    const uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    const bool encourage_all_moves,
-    float* __restrict__ scores // scores[move_ranks[node_idx]] -> gain for node idx's move
-) {
-    // STYLE: one node (move) per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_nodes) return;
-
-    /*
-    * Idea (from HyperG):
-    * - moves are sorted from the highest to lowest score
-    * - greedy assumption: all moves with a higher score get applied
-    * - therefore, for each move, recompute its score (gain) like in "fm_refinement_gains_kernel", but now assuming
-    *   each node with a higher score changed partition to the one specified by the move
-    * - write the new score in place of the previous one for each move, this then enables a scan to find the sequence of
-        "moves as if applied in isolation" that yields the highest total gain when applied all together
-    *
-    * NOTE: we assume that the # of partitions is close to the avg. hedge cardinality, from which iterating over pins_per_partitions is just as efficient as it would be to iterate over hedges!
-    *
-    * NOTE: no need for FIXED POINT here, since we don't need neither symmetry nor invariants!
-    *
-    * NOTE: re-evaluate here EVERY move, even negative-gain ones, because after applying all previous moves, they may become positive-gained!
-    *
-    * MAYBE: do NOT read "my_move_part_counter" and "my_move_part_counter", but for every pin you see read its "partitions[pin]" and from it
-    *        just recompute them while we are at it; this allow in-place updates to my_pin_per_partition without waiting for the global sync
-    */
-    
-    float score = 0.0f;
-    
-    //const uint32_t my_move_score = scores[warp_id];
-    const uint32_t my_move_part = moves[warp_id];
-    // no need to update invalid moves
-    if (my_move_part == UINT32_MAX) return;
-    
-    const uint32_t my_partition = partitions[warp_id];
-    const uint32_t my_move_rank = move_ranks[warp_id];
-    
-    const uint32_t* my_touching = touching + touching_offsets[warp_id];
-    const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
-    //uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
-    
-    // scan touching hyperedges
-    // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
-    for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-        const uint32_t actual_hedge_idx = *hedge_idx;
-        // NOTE: this is not a warp-sync kernel, so using shuffles here to share data looses time, it's better to exploit caches with redundant reads!
-        const uint32_t* my_hedge = hedges + hedges_offsets[actual_hedge_idx];
-        my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
-        const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
-        const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-        const uint32_t my_curr_part_counter = pins_per_partitions[actual_hedge_idx * num_partitions + my_partition];
-        const uint32_t my_move_part_counter = pins_per_partitions[actual_hedge_idx * num_partitions + my_move_part];
-        int32_t my_curr_part_counter_delta = 0;
-        int32_t my_move_part_counter_delta = 0;
-        for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
-            uint32_t pin = *my_hedge;
-            if (move_ranks[pin] < my_move_rank) { // speculation: better-ranked move -> applied
-                // NOTE: invalid moves should all have a lower score and thus a higher rank than all others, never being see here
-                uint32_t new_pin_partition = moves[pin];
-                uint32_t prev_pin_partition = partitions[pin];
-                if (new_pin_partition == my_partition)
-                    my_curr_part_counter_delta++;
-                else if (new_pin_partition == my_move_part)
-                    my_move_part_counter_delta++;
-                if (prev_pin_partition == my_partition)
-                    my_curr_part_counter_delta--;
-                else if (prev_pin_partition == my_move_part)
-                    my_move_part_counter_delta--;
-            }
-        }
-        // VVVV
-        // NOTE: do not use the variant AT ALL when you work on k-way !!
-        // ^^^^
-        // gain the hedge's weight iff moving would disconnect the hedge from my partition (I am its last pin left there)
-        const uint32_t true_curr_part_counter = my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta);
-        if (!encourage_all_moves && true_curr_part_counter == 1)
-            score += my_hedge_weight;
-        // pay the hedge's weight iff moving there connects the hedge to the new partition (I would become its first pin there)
-        if (my_move_part_counter + warpReduceSumLN0<int32_t>(my_move_part_counter_delta) == 0)
-            score -= my_hedge_weight;
-        // VARIANT: give a little push to nodes leaving a partition with not just one, but few pins left for an hedge
-        if (encourage_all_moves && true_curr_part_counter >= 1)
-            score += my_hedge_weight / (true_curr_part_counter * true_curr_part_counter);
-        //const uint32_t true_move_part_counter = my_move_part_counter + warpReduceSumLN0<int32_t>(my_move_part_counter_delta);
-        //score -= my_hedge_weight / ((true_move_part_counter + 1) * (true_move_part_counter + 1));
-    }
-
-    if (lane_id == 0)
-        scores[my_move_rank] = score;
-}
-
-// apply moves with a positive gain
-// SEQUENTIAL COMPLEXITY: n*h
-// PARALLEL OVER: n
-__global__
-void fm_refinement_apply_kernel(
-    const uint32_t* __restrict__ touching,
-    const dim_t* __restrict__ touching_offsets,
-    const uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
-    const uint32_t* __restrict__ move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
-    const uint32_t* __restrict__ nodes_sizes,
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    const uint32_t num_good_moves, // idx + 1 of the maximum in the updated scores
-    uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
-    uint32_t* __restrict__ partitions_sizes
-    //uint32_t* pins_per_partitions // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
-) {
-    // STYLE: one node (move) per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
-    
-    // stop at the last gain-increasing move
-    // TODO: remove "moves[tid] == UINT32_MAX", it's redundant and here "just in case", invalid moves should always be outside of num_good_moves
-    if (move_ranks[tid] >= num_good_moves || moves[tid] == UINT32_MAX) return;
-
-    const uint32_t my_partition = partitions[tid];
-    const uint32_t my_move_part = moves[tid];
-    const uint32_t my_size = nodes_sizes[tid];
-
-    // update partition sizes
-    atomicSub(&partitions_sizes[my_partition], my_size);
-    atomicAdd(&partitions_sizes[my_move_part], my_size);
-
-    // update my partition
-    partitions[tid] = my_move_part;
-
-    /*const uint32_t* my_touching = touching + touching_offsets[tid];
-    const uint32_t* not_my_touching = touching + touching_offsets[tid + 1];
-
-    // scan touching hyperedges and update pins_per_partitions counts
-    for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-        const uint32_t actual_hedge_idx = *hedge_idx;
-        atomicAdd(&pins_per_partitions[actual_hedge_idx * num_partitions + my_partition], -1);
-        atomicAdd(&pins_per_partitions[actual_hedge_idx * num_partitions + my_move_part], 1);
-    }*/
-}
-
-// transform moves into a sequence of size-altering events for capacity constraint checks
-__global__
-void build_size_events_kernel(
-    const uint32_t* __restrict__ moves,
-    const uint32_t* __restrict__ ranks,
-    const uint32_t* __restrict__ partitions,
-    const uint32_t* __restrict__ nodes_sizes,
-    const uint32_t num_nodes,
-    uint32_t* __restrict__ ev_partition,
-    uint32_t* __restrict__ ev_index,
-    int32_t* __restrict__ ev_delta
-) {
-    // STYLE: one node (move) per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
-
-    const int32_t size = static_cast<int32_t>(nodes_sizes[tid]);
-    const uint32_t dst_part = moves[tid];
-    const uint32_t rank = ranks[tid];
-    
-    // first event: node leaves its current partition
-    const uint32_t e0 = 2 * tid;
-    // second event: node enters its destination partition
-    const uint32_t e1 = e0 + 1;
-    
-    // create no events for invalid moves
-    if (dst_part == UINT32_MAX) {
-        ev_partition[e0] = UINT32_MAX;
-        ev_index[e0] = rank;
-        ev_delta[e0] = 0;
-
-        ev_partition[e1] = UINT32_MAX;
-        ev_index[e1] = rank;
-        ev_delta[e1] = 0;
-        return;
-    }
-
-    ev_partition[e0] = partitions[tid];
-    ev_index[e0] = rank;
-    ev_delta[e0] = -size;
-
-    ev_partition[e1] = dst_part;
-    ev_index[e1] = rank;
-    ev_delta[e1] = size;
-}
-
-// mark moves that are valid points in the sequence w.r.t. size constraints
-__global__
-void flag_size_events_kernel(
-    const uint32_t* __restrict__ ev_partition,
-    const uint32_t* __restrict__ ev_index,
-    const int32_t* __restrict__ ev_delta,
-    const uint32_t* __restrict__ partitions_sizes,
-    const uint32_t num_events,
-    int32_t* __restrict__ valid_moves // initialized with 0s
-) {
-    // STYLE: one event per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_events) return;
-
-    /*
-    * Idea:
-    * - for each move, compute how many partitions it brings to be invalid or it brings back to a valid state
-    * - then compute the number of invalid partitions at each point in time as the prefix sum of the number going from ok to not-ok (+1) and not-ok to ok (-1)
-    *
-    * How:
-    * - one thread per event
-    * - all flags start at 0
-    * - add to the flag how much you violated constraints by with this move, or subtract by how much you recovered
-    * - if the initial state is valid, only having a final count of zero makes a move valid
-    * - if the initial state is invalid, the more negative the count, the more we get close to a valid state
-    */
-
-    const uint32_t part = ev_partition[tid];
-    const uint32_t rank = ev_index[tid];
-
-    // dispose of invalid moves
-    if (part == UINT32_MAX) {
-        valid_moves[rank] = 1;
-        return;
-    }
-
-    // TODO: those type casts are kinda dangerous...
-    const int32_t base_size = static_cast<int32_t>(partitions_sizes[part]);
-    const int32_t curr_size = base_size + ev_delta[tid];
-    const int32_t max_size = static_cast<int32_t>(max_nodes_per_part);
-    const int32_t new_excess = max(curr_size - max_size, 0); // by how much we now exceed the constraint
-
-    const uint32_t pred_part = tid > 0 ? ev_partition[tid - 1] : UINT32_MAX; // partition acted upon by the event before this one
-    const int32_t old_excess = max(pred_part != part ? base_size - max_size : base_size + ev_delta[tid - 1] - max_size, 0); // by how much we previously were exceeding the constraint
-
-    atomicAdd(&valid_moves[rank], new_excess - old_excess); // accumulate how much we recovered from constraint violations with this move (valid -> valid = 0, invalid -> valid = <0, valid -> invalid = >0)
-}
-
-// for every move, generate two events for every inbound hedge, one removing it front the src, one adding it back
-// SEQUENTIAL COMPLEXITY: n*h (h -> inbound only)
-// PARALLEL OVER: n
-__global__
-void build_hedge_events_kernel(
-    const uint32_t* __restrict__ moves,
-    const uint32_t* __restrict__ ranks,
-    const uint32_t* __restrict__ partitions,
-    const uint32_t* __restrict__ touching,
-    const dim_t* __restrict__ touching_offsets,
-    const uint32_t* __restrict__ inbound_count,
-    const uint32_t num_nodes,
-    uint32_t* __restrict__ ev_partition, // init. to UINT32_MAX (to spot invalid ones later)
-    uint32_t* __restrict__ ev_index,
-    uint32_t* __restrict__ ev_hedge,
-    int32_t* __restrict__ ev_delta
-) {
-    // STYLE: one node (move) per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_nodes) return;
-    
-    /*
-    * Idea:
-    * - let each move write to an offset given by "touching_offsets", this will leave some blank events at the end of each // S;G
-    *   move's, but we can easily filter those out later by identifying them from the UINT32_MAX ev_partition...
-    */
-
-    uint32_t *my_ev_partition = ev_partition + 2 * touching_offsets[warp_id] + 2 * lane_id;
-    uint32_t *my_ev_index = ev_index + 2 * touching_offsets[warp_id] + 2 * lane_id;
-    uint32_t *my_ev_hedge = ev_hedge + 2 * touching_offsets[warp_id] + 2 * lane_id;
-    int32_t *my_ev_delta = ev_delta + 2 * touching_offsets[warp_id] + 2 * lane_id;
-
-    const uint32_t src_part = partitions[warp_id];
-    const uint32_t dst_part = moves[warp_id];
-    const uint32_t my_rank = ranks[warp_id];
-
-    const uint32_t* inbound = touching + touching_offsets[warp_id];
-    const uint32_t my_inbound_count = inbound_count[warp_id];
-    for (uint32_t i = lane_id; i < my_inbound_count; i += WARP_SIZE) {
-        uint32_t hedge = inbound[i];
-        // first event: hedge does not touches one less time the node's current partition
-        my_ev_partition[0] = src_part;
-        my_ev_index[0] = my_rank;
-        my_ev_hedge[0] = hedge;
-        my_ev_delta[0] = -1;
-        // second event: hedge touches one more time the node's destination partition
-        my_ev_partition[1] = dst_part;
-        my_ev_index[1] = my_rank;
-        my_ev_hedge[1] = hedge;
-        my_ev_delta[1] = +1;
+        // prepare this level's pins per partition
+        CUDA_CHECK(cudaMemset(d_pins_per_partitions, 0x00, num_hedges * num_partitions * sizeof(uint32_t)));
+        // while computing pins per partition also compute the distinct inbound counts per partition (number of pins with a count > 0)
+        CUDA_CHECK(cudaMemset(d_partitions_inbound_sizes, 0x00, num_partitions * sizeof(uint32_t)));
         
-        my_ev_partition += 2 * WARP_SIZE;
-        my_ev_index += 2 * WARP_SIZE;
-        my_ev_hedge += 2 * WARP_SIZE;
-        my_ev_delta += 2 * WARP_SIZE;
+        // TODO: if you are struggling for memory, store both pins per partition in a compact form
+        // TODO: compute both pins per partition (inbound only and not) via a highly optimized map+histogram pattern
+        //       => map from edges of nodes to hedges of partitions, then histogram for each hedge in // (by key)
+
+        {
+            // launch configuration - pins per partition kernel
+            // TODO: could update this in-place instead of recomputing it each time by going over 'touching' for moved nodes when applying the refinement!
+            // HARDER: if we change pins per partition to represent only destination (inbound) pins after we computed gains, also need to revert it to represent all pins...
+            // => If we do this, uncomment "pins_per_partitions" in "fm_refinement_apply_kernel"
+            // TODO: maybe it would be faster to build pins per partition with 'touching', by going one block per partition, 256 threads digesting touching hedge with
+            //       an hash-map in shared memory, then dumped to global with one streak of atomics?
+            // => call something like "apply_coarsening_touching_count" at the innermost level using partitions as groups to compute the initial pins per partition?
+            int threads_per_block = 256;
+            int num_threads_needed = num_hedges; // 1 thread per hedge
+            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+            // launch - pins per partition kernel
+            std::cout << "Running pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // NOTE: having this available during FM refinement makes its complexity linear in the connectivity, instead of quadratic!
+            pins_per_partition_kernel<<<blocks, threads_per_block>>>(
+                d_hedges,
+                d_hedges_offsets,
+                d_partitions,
+                num_hedges,
+                num_partitions,
+                d_pins_per_partitions,
+                d_partitions_inbound_sizes // as of here, this will be incorrect (also including outbounds)
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        
+        // zero-out fm-ref gains kernel's outputs
+        CUDA_CHECK(cudaMemset(d_pairs, 0xFF, curr_num_nodes * sizeof(uint32_t))); // 0xFF -> UINT32_MAX
+        // NOTE: no need to init. "d_f_scores" if we use "d_pairs" to see which locations are valid
+
+        {
+            // launch configuration - fm-ref gains kernel
+            // NOTE: choose threads_per_block multiple of WARP_SIZE
+            int threads_per_block = 128; // 128/32 -> 4 warps per block
+            int warps_per_block = threads_per_block / WARP_SIZE;
+            int num_warps_needed = curr_num_nodes ; // 1 warp per node
+            int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+            // launch - fm-ref gains kernel
+            std::cout << "Running fm-ref gains kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            fm_refinement_gains_kernel<<<blocks, threads_per_block>>>(
+                d_touching,
+                d_touching_offsets,
+                d_hedge_weights,
+                d_partitions,
+                d_pins_per_partitions,
+                d_nodes_sizes,
+                d_partitions_sizes,
+                num_hedges,
+                curr_num_nodes,
+                num_partitions,
+                fm_repeat,
+                discount,
+                encourage, // encourage all moves only when not doing k-way partitioning
+                // NOTE: repurposing those from the candidates kernel!
+                d_pairs, // -> moves: pairs[node] -> partition the node wants to join
+                d_f_scores
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        // =============================
+        // print some temporary results
+        #if VERBOSE
+        logMoves(
+            d_pairs,
+            d_f_scores,
+            d_partitions,
+            curr_num_nodes
+        );
+        #endif
+        // =============================
+        
+        uint32_t *d_ranks = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_ranks, curr_num_nodes * sizeof(uint32_t))); // node -> number of touching hedges seen as of now
+        thrust::device_ptr<uint32_t> t_ranks(d_ranks);
+        thrust::device_ptr<float> t_scores(d_f_scores);
+
+        // alternate between sequence ordering techniques
+        if (chainup) {
+            // sort scores and build an array of ranks (node id -> his move's idx in sorted scores)
+            thrust::device_vector<uint32_t> t_indices(curr_num_nodes);
+            thrust::sequence(t_indices.begin(), t_indices.end());
+            // sort scores according to scores themselves and indices in the same way
+            // use node ids as a tie-breaker when sorting moves
+            auto rank_keys_begin = thrust::make_zip_iterator(thrust::make_tuple(t_scores, t_indices.begin()));
+            auto rank_keys_end = rank_keys_begin + curr_num_nodes;
+            thrust::sort(rank_keys_begin, rank_keys_end, [] __device__ (const thrust::tuple<float, uint32_t>& a, const thrust::tuple<float, uint32_t>& b) {
+                    float sa = thrust::get<0>(a), sb = thrust::get<0>(b);
+                    if (sa > sb) return true; // highest score first
+                    if (sa < sb) return false;
+                    return thrust::get<1>(a) < thrust::get<1>(b); // deterministic tie-break
+            });
+            thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks); // invert the permutation such that: ranks[original_index] = sorted_position
+            // free up thrust vectors
+            thrust::device_vector<uint32_t>().swap(t_indices);
+            // sort scores and build an array of ranks (node id -> his move's idx in sorted scores)
+            /*thrust::device_vector<uint32_t> t_indices(curr_num_nodes);
+            thrust::sequence(t_indices.begin(), t_indices.end());
+            // sort scores according to scores themselves and indices in the same way
+            // use node ids as a tie-breaker when sorting moves
+            auto rank_keys_begin = thrust::make_zip_iterator(thrust::make_tuple(t_scores, t_indices.begin()));
+            auto rank_keys_end = rank_keys_begin + curr_num_nodes;
+            thrust::sort(rank_keys_begin, rank_keys_end, [t_nodes_sizes] __device__ (const thrust::tuple<float, uint32_t>& a, const thrust::tuple<float, uint32_t>& b) {
+                    const uint32_t ia = thrust::get<1>(a), ib = thrust::get<1>(b);
+                    const float ra = thrust::get<0>(a) / static_cast<float>(t_nodes_sizes[ia]), rb = thrust::get<0>(b) / static_cast<float>(t_nodes_sizes[ib]);
+                    if (ra > rb) return true;
+                    if (ra < rb) return false;
+                    return ia < ib; // tie-breaker
+            });
+            thrust::scatter(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(curr_num_nodes), t_indices.begin(), t_ranks); // invert the permutation such that: ranks[original_index] = sorted_position
+            // free up thrust vectors
+            thrust::device_vector<uint32_t>().swap(t_indices);*/
+        } else {
+            // build move-chains to approximate high-gain swaps, then sort by chain total gain
+            chaining(
+                d_partitions,
+                d_pairs,
+                d_nodes_sizes,
+                d_f_scores,
+                curr_num_nodes,
+                d_ranks
+            );
+        }
+
+        {
+            // launch configuration - fm-ref cascade kernel
+            // NOTE: choose threads_per_block multiple of WARP_SIZE
+            int threads_per_block = 128; // 128/32 -> 4 warps per block
+            int warps_per_block = threads_per_block / WARP_SIZE;
+            int num_warps_needed = curr_num_nodes ; // 1 warp per node
+            int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+            // launch - fm-ref cascade kernel
+            std::cout << "Running fm-ref cascade kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            fm_refinement_cascade_kernel<<<blocks, threads_per_block>>>(
+                d_hedges,
+                d_hedges_offsets,
+                d_touching,
+                d_touching_offsets,
+                d_hedge_weights,
+                d_ranks,
+                d_pairs,
+                d_partitions,
+                d_pins_per_partitions,
+                num_hedges,
+                curr_num_nodes,
+                num_partitions,
+                encourage,
+                d_f_scores
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        // not re-sorting the scores array means you have the array ordered as per the initial scores,
+        // but now, this scan updates the scores "as if all previous moves were applied"!
+        thrust::inclusive_scan(t_scores, t_scores + curr_num_nodes, t_scores); // in-place (we don't need scores anymore anyway)
+        // Remember: moves never get re-ranked (re-sorted) after the first time with in-isolation gains. Keep them like that and just find the valid sequence of maximum gain! This is an heuristics!
+        // ======================================
+        // extra step: compute moves validity by size (same HP as the kernel above: all previous higher-gain moves will be applied)
+        // explode each move into two events, one decrementing and incrementing the size of the src and dst partition respectively
+        // => seeing each move as two distinct events makes us able to identify sequences of useful events first, then moves
+        uint32_t *d_size_events_partition = nullptr, *d_size_events_index = nullptr;
+        int32_t *d_size_events_delta = nullptr;
+        const uint32_t num_size_events = 2 * curr_num_nodes;
+        CUDA_CHECK(cudaMalloc(&d_size_events_partition, num_size_events * sizeof(uint32_t))); // size_events_partition[ev] -> partition affected by the event
+        CUDA_CHECK(cudaMalloc(&d_size_events_index, num_size_events * sizeof(uint32_t))); // size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
+        CUDA_CHECK(cudaMalloc(&d_size_events_delta, num_size_events * sizeof(int32_t))); // size_events_delta[ev] -> size variation brought by the event
+        thrust::device_ptr<uint32_t> t_size_events_partition(d_size_events_partition);
+        thrust::device_ptr<uint32_t> t_size_events_index(d_size_events_index);
+        thrust::device_ptr<int32_t> t_size_events_delta(d_size_events_delta);
+        {
+            // launch configuration - build size events kernel
+            int threads_per_block = 128;
+            int num_threads_needed = curr_num_nodes; // 1 thread per move
+            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+            // launch - build size events kernel
+            std::cout << "Running build size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // TODO: could filter out null moves (target = -1)?
+            build_size_events_kernel<<<blocks, threads_per_block>>>(
+                d_pairs,
+                d_ranks,
+                d_partitions,
+                d_nodes_sizes,
+                curr_num_nodes,
+                d_size_events_partition,
+                d_size_events_index,
+                d_size_events_delta
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        // sort events by (partition, rank) [in lexicographical order for the tuple] and carry size_events_delta along
+        auto size_events_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_size_events_partition, t_size_events_index));
+        auto size_events_key_end = size_events_key_begin + num_size_events;
+        thrust::sort_by_key(size_events_key_begin, size_events_key_end, t_size_events_delta);
+        // inclusive scan inside each key (= partition) on the event deltas => for each event we get the cumulative size delta for that partition at that point in the sequence
+        thrust::inclusive_scan_by_key(t_size_events_partition, t_size_events_partition + num_size_events, t_size_events_delta, t_size_events_delta);
+        // now mark moves that would violate size constraint if the sequence were to end on them
+        int32_t *d_valid_moves = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_valid_moves, curr_num_nodes * sizeof(int32_t))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
+        CUDA_CHECK(cudaMemset(d_valid_moves, 0, curr_num_nodes * sizeof(int32_t)));
+        thrust::device_ptr<int32_t> t_valid_moves(d_valid_moves);
+        
+        {
+            // launch configuration - flag size events kernel
+            int threads_per_block = 128;
+            int num_threads_needed = num_size_events; // 1 thread per event
+            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+            // launch - flag size events kernel
+            std::cout << "Running flag size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            flag_size_events_kernel<<<blocks, threads_per_block>>>(
+                d_size_events_partition,
+                d_size_events_index,
+                d_size_events_delta,
+                d_partitions_sizes,
+                num_size_events,
+                d_valid_moves
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        CUDA_CHECK(cudaFree(d_size_events_partition));
+        CUDA_CHECK(cudaFree(d_size_events_index));
+        CUDA_CHECK(cudaFree(d_size_events_delta));
+        // compute, as of each event, the cumulative number of partitions that are invalid by summing the count of those made/unmade invalid at each event
+        thrust::inclusive_scan(t_valid_moves, t_valid_moves + curr_num_nodes, t_valid_moves);
+        
+        // ======================================
+        // preparatory step: update pins per partition into inbound (only) pins partition
+        // simultaneously, also correct the calculation for partitions_inbound_sizes by removing outbounds
+        {
+            // launch configuration - inbound pins per partition kernel
+            int threads_per_block = 256;
+            int num_threads_needed = num_hedges; // 1 thread per hedge
+            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+            // launch - inbound pins per partition kernel
+            std::cout << "Running inbound pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // NOTE: inbound-only version of the above used for constraints checks...
+            inbound_pins_per_partition_kernel<<<blocks, threads_per_block>>>(
+                d_hedges,
+                d_hedges_offsets,
+                d_srcs_count,
+                d_partitions,
+                num_hedges,
+                num_partitions,
+                d_pins_per_partitions, // from now it represents inbound sets only
+                d_partitions_inbound_sizes
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        // ======================================
+        // extra step: compute moves validity by inbound set cardinality (same HP as the kernel above: all previous higher-gain moves will be applied)
+        // explode each move into two events for every inbound hedge of the moved node, one decrementing and one incrementing the hedge's
+        // occurrencies in the src partition's inbound set and dst partition's inbound set respectively
+        // => results in n*h events (better than the n*h*p volume of conditions/counters we need to check)
+        uint32_t *d_inbound_count_events_partition = nullptr;
+        uint32_t *d_inbound_count_events_index = nullptr;
+        uint32_t *d_inbound_count_events_hedge = nullptr;
+        int32_t *d_inbound_count_events_delta = nullptr;
+        const uint32_t num_inbound_count_events = 2 * touching_size; // TODO: this is slightly larger than truly needed, because we just use inbound hedges...
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_partition, num_inbound_count_events * sizeof(uint32_t))); // inbound_count_events_partition[ev] -> partition affected by the event
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_index, num_inbound_count_events * sizeof(uint32_t))); // inbound_count_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_hedge, num_inbound_count_events * sizeof(uint32_t))); // d_inbound_count_events_hedge[ev] -> hedge involved in the event
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_delta, num_inbound_count_events * sizeof(int32_t))); // inbound_count_events_delta[ev] -> inbound_count variation brought by the event
+        CUDA_CHECK(cudaMemset(d_inbound_count_events_partition, 0xFF, num_inbound_count_events * sizeof(uint32_t))); // => use inbound_count_events_partition being UINT32_MAX to spot invalid events
+        thrust::device_ptr<uint32_t> t_inbound_count_events_partition(d_inbound_count_events_partition);
+        thrust::device_ptr<uint32_t> t_inbound_count_events_index(d_inbound_count_events_index);
+        thrust::device_ptr<uint32_t> t_inbound_count_events_hedge(d_inbound_count_events_hedge);
+        thrust::device_ptr<int32_t> t_inbound_count_events_delta(d_inbound_count_events_delta);
+        {
+            // launch configuration - build hedge events kernel
+            int threads_per_block = 128; // 128/32 -> 4 warps per block
+            int warps_per_block = threads_per_block / WARP_SIZE;
+            int num_warps_needed = curr_num_nodes ; // 1 warp per move
+            int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+            // launch - build hedge events kernel
+            std::cout << "Running build hedge events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // TODO: could filter out null moves (target = -1)?
+            build_hedge_events_kernel<<<blocks, threads_per_block>>>(
+                d_pairs,
+                d_ranks,
+                d_partitions,
+                d_touching,
+                d_touching_offsets,
+                d_inbound_count,
+                curr_num_nodes,
+                d_inbound_count_events_partition,
+                d_inbound_count_events_index,
+                d_inbound_count_events_hedge,
+                d_inbound_count_events_delta
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        
+        // sort events by (partition, hedge, rank) [in lexicographical order for the tuple] and carry events_delta along
+        // the resulting array will have events sorted by partition, and inside each partition sorted by hedge, and inside each hedge sorted by rank!
+        auto count_events_sort_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_inbound_count_events_partition, t_inbound_count_events_hedge, t_inbound_count_events_index));
+        auto count_events_sort_key_end = count_events_sort_key_begin + num_inbound_count_events;
+        thrust::sort_by_key(count_events_sort_key_begin, count_events_sort_key_end, t_inbound_count_events_delta);
+        // inclusive scan by key of the deltas, the key being (partition, hedge) -> we now have the total number of times each hedge appears in the inbound set as of each move (in order of rank)
+        auto count_events_scan_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_inbound_count_events_partition, t_inbound_count_events_hedge));
+        auto count_events_scan_key_end = count_events_scan_key_begin + num_inbound_count_events;
+        thrust::inclusive_scan_by_key(count_events_scan_key_begin, count_events_scan_key_end, t_inbound_count_events_delta, t_inbound_count_events_delta);
+        
+        // new array of events, one event for each time the counter of an hedge in the inbound set (+ the overall inbounds per partition counter) goes from 0 to >0,
+        // the event carrying a +1 to the inbound set size, one event for each time the counter of an hedge goes from >0 to 0 carrying a -1 to the inbound set size for that partition
+        uint32_t *d_inbound_size_events_offsets = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_offsets, (num_inbound_count_events + 1) * sizeof(uint32_t))); // inbound_size_events_offsets[event idx] -> initially a flag of whether each event will produce an increase/decrese in inbound counts, after the scan it becomes the offset of each new event
+        CUDA_CHECK(cudaMemset(d_inbound_size_events_offsets, 0u, (num_inbound_count_events + 1) * sizeof(uint32_t)));
+        {
+            // launch configuration - count inbound events kernel
+            int threads_per_block = 128;
+            int num_threads_needed = num_inbound_count_events; // 1 thread per hedge event
+            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+            // launch - count inbound events kernel
+            std::cout << "Running count inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            count_inbound_size_events_kernel<<<blocks, threads_per_block>>>(
+                d_pins_per_partitions,
+                d_inbound_count_events_partition,
+                d_inbound_count_events_index,
+                d_inbound_count_events_hedge,
+                d_inbound_count_events_delta,
+                num_inbound_count_events,
+                num_partitions,
+                d_inbound_size_events_offsets
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        // transform the counts in offsets with a scan and find the total count of new size events
+        thrust::device_ptr<uint32_t> t_inbound_size_events_offsets(d_inbound_size_events_offsets);
+        thrust::inclusive_scan(t_inbound_size_events_offsets, t_inbound_size_events_offsets + num_inbound_count_events + 1, t_inbound_size_events_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
+        uint32_t num_inbound_size_events = 0; // last value in the inclusive scan = full reduce = total number of touching hedges among all sets
+        CUDA_CHECK(cudaMemcpy(&num_inbound_size_events, d_inbound_size_events_offsets + num_inbound_count_events, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        uint32_t *d_inbound_size_events_partition = nullptr, *d_inbound_size_events_index = nullptr;
+        int32_t *d_inbound_size_events_delta = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_partition, num_inbound_size_events * sizeof(uint32_t))); // inbound_size_events_partition[ev] -> partition affected by the event
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_index, num_inbound_size_events * sizeof(uint32_t))); // inbound_size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_delta, num_inbound_size_events * sizeof(int32_t))); // inbound_size_events_delta[ev] -> inbound set size variation brought by the event
+        thrust::device_ptr<uint32_t> t_inbound_size_events_partition(d_inbound_size_events_partition);
+        thrust::device_ptr<uint32_t> t_inbound_size_events_index(d_inbound_size_events_index);
+        thrust::device_ptr<int32_t> t_inbound_size_events_delta(d_inbound_size_events_delta);
+
+        {
+            // launch configuration - build inbound events kernel
+            int threads_per_block = 128;
+            int num_threads_needed = num_inbound_count_events; // 1 thread per hedge event
+            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+            // launch - build inbound events kernel
+            std::cout << "Running build inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            build_inbound_size_events_kernel<<<blocks, threads_per_block>>>(
+                d_pins_per_partitions,
+                d_inbound_count_events_partition,
+                d_inbound_count_events_index,
+                d_inbound_count_events_hedge,
+                d_inbound_count_events_delta,
+                d_inbound_size_events_offsets,
+                num_inbound_count_events,
+                num_partitions,
+                d_inbound_size_events_partition,
+                d_inbound_size_events_index,
+                d_inbound_size_events_delta
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        CUDA_CHECK(cudaFree(d_inbound_count_events_partition));
+        CUDA_CHECK(cudaFree(d_inbound_count_events_index));
+        CUDA_CHECK(cudaFree(d_inbound_count_events_hedge));
+        CUDA_CHECK(cudaFree(d_inbound_count_events_delta));
+        CUDA_CHECK(cudaFree(d_inbound_size_events_offsets));
+
+        // sort events by (partition, rank) [in lexicographical order for the tuple] and carry inbound_size_events_delta along
+        auto inbound_size_events_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_inbound_size_events_partition, t_inbound_size_events_index));
+        auto inbound_size_events_key_end = inbound_size_events_key_begin + num_inbound_size_events;
+        thrust::sort_by_key(inbound_size_events_key_begin, inbound_size_events_key_end, t_inbound_size_events_delta);
+        // inclusive scan inside each key (= partition) on the event deltas => for each event we get the cumulative size delta for that partition's inbound set at that point in the sequence
+        thrust::inclusive_scan_by_key(t_inbound_size_events_partition, t_inbound_size_events_partition + num_inbound_size_events, t_inbound_size_events_delta, t_inbound_size_events_delta);
+        
+        // now mark moves that would violate the inbound set size constraint if the sequence were to end on them
+        int32_t *d_inbound_valid_moves = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_inbound_valid_moves, curr_num_nodes * sizeof(int32_t))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
+        CUDA_CHECK(cudaMemset(d_inbound_valid_moves, 0u, curr_num_nodes * sizeof(int32_t)));
+        thrust::device_ptr<int32_t> t_inbound_valid_moves(d_inbound_valid_moves);
+        {
+            // launch configuration - flag inbound events kernel
+            int threads_per_block = 128;
+            int num_threads_needed = num_inbound_size_events; // 1 thread per event
+            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+            // launch - flag inbound events kernel
+            std::cout << "Running flag inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            flag_inbound_events_kernel<<<blocks, threads_per_block>>>(
+                d_inbound_size_events_partition,
+                d_inbound_size_events_index,
+                d_inbound_size_events_delta,
+                d_partitions_inbound_sizes,
+                num_inbound_size_events,
+                d_inbound_valid_moves
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        CUDA_CHECK(cudaFree(d_inbound_size_events_partition));
+        CUDA_CHECK(cudaFree(d_inbound_size_events_index));
+        CUDA_CHECK(cudaFree(d_inbound_size_events_delta));
+        
+        // compute, as of each event, the cumulative number of partitions that are invalid by summing the count of those made/unmade invalid at each event
+        thrust::inclusive_scan(t_inbound_valid_moves, t_inbound_valid_moves + curr_num_nodes, t_inbound_valid_moves);
+        // ======================================
+        // find the move in the sequence that yields both the highest gain and a valid state (when all moves before it are applied)
+        // index space 0..curr_num_nodes - 1
+        auto idx_begin = thrust::make_counting_iterator<uint32_t>(0);
+        // functor comparing sequence entries, skipping invalid ones by inbound size (only 0 allowed), prioritizing size events (zero or negative), and then picking the highest score
+        best_move_functor best_scores { thrust::raw_pointer_cast(t_scores), thrust::raw_pointer_cast(t_valid_moves), thrust::raw_pointer_cast(t_inbound_valid_moves) };
+        // max over valid endpoints only, find the point in the sequence of moves where applying them further never nets a higher gain in a valid state
+        auto best_iterator_entry = thrust::max_element(idx_begin, idx_begin + curr_num_nodes, best_scores);
+        const uint32_t best_rank = *best_iterator_entry;
+        const uint32_t num_good_moves = best_rank + 1; // "+1" to make this the improving moves count, rather than the last improving move's idx
+        // validity double-check
+        int32_t size_validity, inbounds_validity;
+        float acquired_gain;
+        CUDA_CHECK(cudaMemcpy(&size_validity, d_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&inbounds_validity, d_inbound_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&acquired_gain, d_f_scores + best_rank, sizeof(float), cudaMemcpyDeviceToHost));
+        std::cout << "Best fm-ref move:\n  Move rank: " << best_rank << ", Acquired gain: " << acquired_gain << "\n";
+        std::cout << "  Size constraint violations variation amount (in nodes above the limit): " << size_validity << ", Inbound constraint violations variation (in invalid partitions): " << inbounds_validity << "\n";
+        if (size_validity <= 0 && inbounds_validity <= 0 && acquired_gain >= 0) {
+            // launch configuration - fm-ref apply kernel
+            int threads_per_block = 128;
+            int num_threads_needed = curr_num_nodes; // 1 thread per move to apply
+            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+            // launch - fm-ref apply kernel
+            std::cout << "Running fm-ref apply (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            fm_refinement_apply_kernel<<<blocks, threads_per_block>>>(
+                d_touching,
+                d_touching_offsets,
+                d_pairs,
+                d_ranks,
+                d_nodes_sizes,
+                num_hedges,
+                curr_num_nodes,
+                num_partitions,
+                num_good_moves,
+                d_partitions,
+                d_partitions_sizes
+                //d_pins_per_partitions
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            //if (acquired_gain < 0) std::cerr << "WARNING: applied a refinement move with negative gain on level " << level_idx << " !!\n";
+        } else {
+            std::cout << "No valid refinement move found on level " << level_idx << " (reason: " << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : "negative gain")) << ") ...\n";
+            if (size_validity > 0 && !chainup) chainup = true; // enable chaining when no moves are available via greedy sorting because of size constraints
+            else if (fm_repeat < cfg.refine_repeats / 3) fm_repeat = cfg.refine_repeats / 2;
+            else if (fm_repeat < 2 * cfg.refine_repeats / 3) fm_repeat = 2 * cfg.refine_repeats / 3;
+            else fm_repeat = cfg.refine_repeats; // aka break!
+        }
+        CUDA_CHECK(cudaFree(d_ranks));
+        CUDA_CHECK(cudaFree(d_valid_moves));
+        CUDA_CHECK(cudaFree(d_inbound_valid_moves));
     }
 }
 
-// for every inbound hedge event that adds/removes an inbound hedge to a partition, count a new inbound size event
-__global__
-void count_inbound_size_events_kernel(
-    const uint32_t* __restrict__ partitions_inbound_counts, // this is pins_per_partition, index it as [hedge_idx*num_partitions + partition_idx]
-    const uint32_t* __restrict__ ev_partition,
-    const uint32_t* __restrict__ ev_index,
-    const uint32_t* __restrict__ ev_hedge,
-    const int32_t* __restrict__ ev_delta,
-    uint32_t num_events,
-    uint32_t num_partitions,
-    uint32_t* inbound_size_events_offsets // init. to zero
+void logPartitions(
+    const uint32_t *d_partitions,
+    const uint32_t *d_partitions_sizes,
+    const uint32_t curr_num_nodes,
+    const uint32_t num_partitions,
+    const uint32_t h_max_nodes_per_part
 ) {
-    // STYLE: one event per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_events) return;
-
-    const uint32_t part = ev_partition[tid];
-
-    // dispose of invalid events
-    if (part == UINT32_MAX) return;
-
-    const uint32_t hedge = ev_hedge[tid];
-    const uint32_t init_hedge_inbound_count = partitions_inbound_counts[hedge*num_partitions + part];
-
-    uint32_t prev_hedge_inbound_count = init_hedge_inbound_count;
-    if (tid > 0 && ev_partition[tid - 1] == part && ev_hedge[tid - 1] == hedge) // if the previous sum was about the same hedge as mine, consider its updated count in the sequence
-        prev_hedge_inbound_count += ev_delta[tid - 1];
-    uint32_t curr_hedge_inbound_count = init_hedge_inbound_count + ev_delta[tid];
-
-    if (prev_hedge_inbound_count == 0 && curr_hedge_inbound_count > 0 || prev_hedge_inbound_count > 0 && curr_hedge_inbound_count == 0)
-        inbound_size_events_offsets[tid + 1] = 1; // +1 to do an inclusive scan and keep the final count
+    std::vector<uint32_t> partitions_tmp(curr_num_nodes);
+    CUDA_CHECK(cudaMemcpy(partitions_tmp.data(), d_partitions, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    std::vector<uint32_t> partitions_sizes_tmp(num_partitions);
+    CUDA_CHECK(cudaMemcpy(partitions_sizes_tmp.data(), d_partitions_sizes, num_partitions * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    std::unordered_map<uint32_t, int> part_count;
+    std::cout << "Partitioning results:\n";
+    for (uint32_t i = 0; i < curr_num_nodes; ++i) {
+        uint32_t part = partitions_tmp[i];
+        part_count[part]++;
+        if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
+            if (part == UINT32_MAX) std::cout << "node " << i << " -> part=none";
+            else std::cout << "  node " << i << " -> " << part;
+            std::cout << ((i + 1) % 4 == 0 ? "\n" : "\t");
+        }
+    }
+    for (uint32_t i = 0; i < num_partitions; ++i) {
+        uint32_t part_size = partitions_sizes_tmp[i];
+        if (part_size > h_max_nodes_per_part)
+            std::cerr << "  WARNING, max partition size constraint (" << h_max_nodes_per_part << ") violated by part=" << i << " with part_size=" << part_size << " !!\n";
+    }
+    int max_ps = part_count.empty() ? 0 : std::max_element(part_count.begin(), part_count.end(), [](auto &a, auto &b){ return a.second < b.second; })->second;
+    std::cout << "Non-empty partitions count: " << part_count.size() << ", Max partition size: " << max_ps << "\n";
 }
 
-// for every inbound hedge event that adds/removes an inbound hedge to a partition, create a new inbound size event
-__global__
-void build_inbound_size_events_kernel(
-    const uint32_t* __restrict__ partitions_inbound_counts, // this is pins_per_partition, index it as [hedge_idx*num_partitions + partition_idx]
-    const uint32_t* __restrict__ ev_partition,
-    const uint32_t* __restrict__ ev_index,
-    const uint32_t* __restrict__ ev_hedge,
-    const int32_t* __restrict__ ev_delta,
-    const uint32_t* inbound_size_events_offsets,
-    uint32_t num_events,
-    uint32_t num_partitions,
-    uint32_t* __restrict__ new_ev_partition,
-    uint32_t* __restrict__ new_ev_index,
-    int32_t* __restrict__ new_ev_delta
+void logMoves(
+    const uint32_t *d_pairs,
+    const float *d_f_scores,
+    const uint32_t *d_partitions,
+    const uint32_t curr_num_nodes
 ) {
-    // STYLE: one event per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_events) return;
-
-    // TODO: could avoid repeating the check (and all the associated memory accesses) by storing a +1/-1/0 flag between this kernel and the previous counting one
-
-    const uint32_t part = ev_partition[tid];
-
-    // dispose of invalid events
-    if (part == UINT32_MAX) return;
-
-    const uint32_t hedge = ev_hedge[tid];
-    const uint32_t init_hedge_inbound_count = partitions_inbound_counts[hedge*num_partitions + part];
-
-    uint32_t prev_hedge_inbound_count = init_hedge_inbound_count;
-    if (tid > 0 && ev_partition[tid - 1] == part && ev_hedge[tid - 1] == hedge) // if the previous sum was about the same hedge as mine, consider its updated count in the sequence
-        prev_hedge_inbound_count += ev_delta[tid - 1];
-    uint32_t curr_hedge_inbound_count = init_hedge_inbound_count + ev_delta[tid];
-
-    if (prev_hedge_inbound_count == 0 && curr_hedge_inbound_count > 0) {
-        const uint32_t new_ev_offset = inbound_size_events_offsets[tid];
-        new_ev_partition[new_ev_offset] = part;
-        new_ev_index[new_ev_offset] = ev_index[tid];
-        new_ev_delta[new_ev_offset] = 1;
-    } else if (prev_hedge_inbound_count > 0 && curr_hedge_inbound_count == 0) {
-        const uint32_t new_ev_offset = inbound_size_events_offsets[tid];
-        new_ev_partition[new_ev_offset] = part;
-        new_ev_index[new_ev_offset] = ev_index[tid];
-        new_ev_delta[new_ev_offset] = -1;
+    std::vector<uint32_t> moves_tmp(curr_num_nodes);
+    std::vector<float> gains_tmp(curr_num_nodes);
+    std::vector<uint32_t> src_partitions_tmp(curr_num_nodes);
+    CUDA_CHECK(cudaMemcpy(moves_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(gains_tmp.data(), d_f_scores, curr_num_nodes * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(src_partitions_tmp.data(), d_partitions, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    std::cout << "Proposed moves:\n";
+    for (uint32_t i = 0; i < curr_num_nodes; ++i) {
+        if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
+            std::cout << "  node " << i << " : ";
+            uint32_t move = moves_tmp[i];
+            if (move == UINT32_MAX) std::cout << "stay " << src_partitions_tmp[i];
+            else std::cout << src_partitions_tmp[i] << " -> " << move;
+            std::cout << " gain=" << std::fixed << std::setprecision(3) << gains_tmp[i];
+            std::cout << ((i + 1) % 2 == 0 ? "\n" : "\t");
+        }
     }
-}
-
-// mark moves that are valid points in the sequence w.r.t. inbound constraints
-__global__
-void flag_inbound_events_kernel(
-    const uint32_t* __restrict__ ev_partition,
-    const uint32_t* __restrict__ ev_index,
-    const int32_t* __restrict__ ev_delta,
-    const uint32_t* __restrict__ partitions_inbound_sizes, // partitions_inbound_sizes[part] = size of the inbound set for part
-    const uint32_t num_events,
-    int32_t* __restrict__ valid_moves // initialized with 0s
-) {
-    // STYLE: one event per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_events) return;
-
-    /*
-    * Idea:
-    * - for each move, compute how many partitions it brings to be invalid or it brings back to a valid state
-    * - then compute the number of invalid partitions at each point in time as the prefix sum of the number going from ok to not-ok (+1) and not-ok to ok (-1)
-    * 
-    * HP: always start from a VALID state
-    * 
-    * How: very much like 'flag_size_events_kernel'
-    */
-
-    const uint32_t part = ev_partition[tid];
-    const uint32_t rank = ev_index[tid];
-
-    // dispose of invalid moves
-    if (part == UINT32_MAX) {
-        valid_moves[rank] = 1;
-        return;
-    }
-
-    const int32_t base_size = static_cast<int32_t>(partitions_inbound_sizes[part]);
-    const int32_t curr_size = base_size + ev_delta[tid];
-    const int32_t max_size = static_cast<int32_t>(max_inbound_per_part);
-    const bool is_valid = curr_size <= max_size; // true iff after this event the partition's inbound set size is valid
-
-    const uint32_t pred_part = tid > 0 ? ev_partition[tid - 1] : UINT32_MAX; // partition acted upon by the event before this one
-    const bool was_valid = pred_part != part || base_size + ev_delta[tid - 1] <= max_size; // true iff before this event the partition's inbound set size is valid
-
-    if (was_valid && !is_valid) // this event made the partition invalid -> track a +1 in invalid partitions as of this event
-        atomicAdd(&valid_moves[rank], 1);
-    if (!was_valid && is_valid) // this event made the partition invalid -> track a -1 in invalid partitions as of this event
-        atomicSub(&valid_moves[rank], 1);
 }

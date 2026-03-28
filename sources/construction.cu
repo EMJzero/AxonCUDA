@@ -1,804 +1,463 @@
+#include <tuple>
+
+#include "thruster.cuh"
+
+#include <cub/cub.cuh>
+
+#include "runconfig.hpp"
+
+#include "utils.cuh"
+#include "defines.cuh"
 #include "construction.cuh"
 
-// compute the distinct neighbors count of each node, aided by a global hash-set
-// SEQUENTIAL COMPLEXITY: n*h*d
-// PARALLEL OVER: n
-__global__
-void neighborhoods_count_kernel(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ touching,
-    const dim_t* __restrict__ touching_offsets,
+std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
+    const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
     const uint32_t num_nodes,
-    const dim_t max_neighbors,
-    const bool discharge, // if true -> finish by dumping SM into GM too, making GM contain the whole (sparse) set
-    uint32_t* __restrict__ neighbors,
-    dim_t* __restrict__ neighbors_offsets // here filled as counters of "how many neighbors per node" -> then do a prefix sum for the offsets
+    const uint32_t max_neighbors,
+    uint32_t *d_neighbors,
+    dim_t *d_neighbors_offsets
 ) {
-    // STYLE: one node per block, one touching hedge per warp, distinct neighbors in shared memory!
-    const uint32_t node_id = blockIdx.x;
-    // NOTE: the whole block returns, no need to sync
-    if (node_id >= num_nodes) return;
-
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // local per block - coincides with the touching hedge to handle
-    const uint32_t warp_id = threadIdx.x / WARP_SIZE;
-    const uint32_t warps_per_block = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-
-    const uint32_t* my_touching = touching + touching_offsets[node_id];
-    //const uint32_t* not_my_touching = touching + touching_offsets[node_id + 1];
-    const uint32_t my_touching_count = (uint32_t)(touching_offsets[node_id + 1] - touching_offsets[node_id]);
-
-    uint32_t* my_neighbors = neighbors + node_id * max_neighbors;
-
-    // hash-set for deduplication (allows false-negatives, back it up with true deduplication in global memory)
-    __shared__ uint32_t dedupe[SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE];
-    // HP: each node has less than UINT32_MAX neighbors
-    __shared__ uint32_t seen_distinct_total;
-    uint32_t seen_distinct = 0;
+    // HP: no duplicates in neighbors, no one's own self among one's neighbors
+    // uses a two-step method, first just counting, then writing, to allocate exactly the amount of memory needed, since neighborhoods can explode quickly...
+    // if there is enough memory, a speedier version is used, that replaced the scatter with a direct pack from the initial oversized allocation!
+    uint32_t *d_oversized_neighbors = nullptr;
+    dim_t init_max_neighbors = (dim_t)std::ceil(cfg.oversized_multiplier * (float)max_neighbors);
     
-    // initialize shared memory
-    blk_init<uint32_t>(dedupe, SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-    blk_init<uint32_t>(my_neighbors, max_neighbors, HASH_EMPTY);
-    if (threadIdx.x == 0)
-        seen_distinct_total = 0;
-    __syncthreads();
+    size_t free_bytes, total_bytes;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    // check if there could be space to allocate both oversized neighbors and final neighbors at once; with no better guess, use 'max_neighbors' to estimate the final neighbors size...
+    bool direct_scatter_neighbors = (num_nodes * init_max_neighbors /*oversized*/ + num_nodes * max_neighbors /*final upper bound*/) * sizeof(uint32_t) + num_nodes * sizeof(dim_t) /*offsets*/ < free_bytes;
+    // no pack? can spare space in the oversized buffer equal to the amount of shared memory used for fast deduping
+    if (!direct_scatter_neighbors) init_max_neighbors = init_max_neighbors > SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE ? init_max_neighbors - SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE : 0;
+    init_max_neighbors = max(init_max_neighbors, (dim_t)GM_MIN_BLOCK_DEDUPE_BUFFER_SIZE);
     
-    // no touching hedges, return immediately
-    // NOTE: the whole block returns, no need to sync
-    // MUST: return only after helping initializing shared memory
-    if (my_touching_count == 0) {
-        if (threadIdx.x == 0) neighbors_offsets[node_id] = 0;
-        return;
+    if (num_nodes * init_max_neighbors * sizeof(uint32_t) > (1ull << 32))
+        std::cout << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_nodes * init_max_neighbors * sizeof(uint32_t)) / (1 << 30) << " GB for neighbors deduplication ...\n";
+    CUDA_CHECK(cudaMalloc(&d_oversized_neighbors, num_nodes * init_max_neighbors * sizeof(uint32_t))); // space for spilling deduplication hash-sets
+    CUDA_CHECK(cudaMalloc(&d_neighbors_offsets, (num_nodes + 1) * sizeof(dim_t))); // node -> neighbors set start idx in d_neighbors
+    thrust::device_ptr<dim_t> t_neigh_offsets(d_neighbors_offsets);
+    {
+        // launch configuration - neighborhoods count kernel
+        int blocks = num_nodes;
+        int threads_per_block = 256; // 256/32 -> 8 warps per block
+        std::cout << "Running neighborhoods count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        // launch - neighborhoods count kernel
+        neighborhoods_count_kernel<<<blocks, threads_per_block>>>(
+            d_hedges,
+            d_hedges_offsets,
+            d_touching,
+            d_touching_offsets,
+            num_nodes,
+            init_max_neighbors,
+            direct_scatter_neighbors,
+            d_oversized_neighbors,
+            d_neighbors_offsets
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
-    if (warp_id >= my_touching_count && !discharge) return;
-
-    // TODO: could optimize by iterating directly on pointers
-    for (uint32_t touching_hedge_idx = warp_id; touching_hedge_idx < my_touching_count; touching_hedge_idx += warps_per_block) { // the block loops over touching hedges
-        if (touching_hedge_idx < my_touching_count) {
-            const uint32_t my_hedge_idx = my_touching[touching_hedge_idx];
-            const uint32_t* my_hedge = hedges + hedges_offsets[my_hedge_idx];
-            //const uint32_t* not_my_hedge = hedges + hedges_offsets[my_hedge_idx + 1];
-            const uint32_t my_hedge_size = (uint32_t)(hedges_offsets[my_hedge_idx + 1] - hedges_offsets[my_hedge_idx]);
-            for (uint32_t node_idx = lane_id; node_idx < my_hedge_size; node_idx += WARP_SIZE) { // the warp loops over hedge pins
-                uint32_t neighbor = my_hedge[node_idx];
-                if (neighbor == node_id) continue;
-                uint8_t inserted = sm_hashset_try_insert(dedupe, SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE, neighbor);
-                // inserted == 1 -> no need to put into GM what already is in the SM hash-set
-                // inserted == 2 -> SM full, check in GM
-                if (inserted == 1 || inserted == 2 && gm_hashset_insert(my_neighbors, max_neighbors, neighbor)) // triggers an assert if 'max_neighbors' is exceeded
-                    seen_distinct++;
-            }
-        }
-    }
-
-    // reduce distinct counts per-warp
-    seen_distinct = warpReduceSum<uint32_t>(seen_distinct);
-
-    // accumulate counts per-block
-    if (lane_id == 0)
-        atomicAdd(&seen_distinct_total, seen_distinct);
-
-    __syncthreads();
-
-    if (threadIdx.x == 0)
-        neighbors_offsets[node_id] = (dim_t)seen_distinct_total;
-
-    if (discharge) {
-        // dump SM over to GM all at once
-        for (uint32_t i = warp_id * WARP_SIZE + lane_id; i < SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE; i += warps_per_block * WARP_SIZE) {
-            uint32_t neighbor = dedupe[i];
-            if (neighbor != HASH_EMPTY)
-                gm_hashset_insert(my_neighbors, max_neighbors, neighbor);
-        }
-    }
-}
-
-// compute the distinct neighbors of each node (again) and write them at the pre-computed offsets in global memory (handled as a hash-set)
-// SEQUENTIAL COMPLEXITY: n*h*d
-// PARALLEL OVER: n
-__global__
-void neighborhoods_scatter_kernel(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ touching,
-    const dim_t* __restrict__ touching_offsets,
-    const uint32_t num_nodes,
-    const dim_t* __restrict__ neighbors_offsets,
-    uint32_t* __restrict__ neighbors
-) {
-    // STYLE: one node per block, one touching hedge per warp, distinct neighbors in shared memory!
-    const uint32_t node_id = blockIdx.x;
-    if (node_id >= num_nodes) return;
-
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // local per block - coincides with the touching hedge to handle
-    const uint32_t warp_id = threadIdx.x / WARP_SIZE;
-    const uint32_t warps_per_block = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-
-    const uint32_t* my_touching = touching + touching_offsets[node_id];
-    //const uint32_t* not_my_touching = touching + touching_offsets[node_id + 1];
-    const uint32_t my_touching_count = (uint32_t)(touching_offsets[node_id + 1] - touching_offsets[node_id]);
-
-    uint32_t* my_neighbors = neighbors + neighbors_offsets[node_id];
-    const uint32_t my_neighbors_count = (uint32_t)(neighbors_offsets[node_id + 1] - neighbors_offsets[node_id]);
-
-    // hash-set for deduplication
-    __shared__ uint32_t dedupe[SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE];
+    if (!direct_scatter_neighbors) CUDA_CHECK(cudaFree(d_oversized_neighbors)); // no pack? free oversized immediately
     
-    // initialize shared memory
-    blk_init<uint32_t>(dedupe, SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-    blk_init<uint32_t>(my_neighbors, my_neighbors_count, HASH_EMPTY);
-    __syncthreads();
-
-    // can return only after helping initializing shared memory
-    if (warp_id >= my_touching_count) return;
-
-    // TODO: could optimize by iterating directly on pointers
-    for (uint32_t touching_hedge_idx = warp_id; touching_hedge_idx < my_touching_count; touching_hedge_idx += warps_per_block) { // the block loops over touching hedges
-        if (touching_hedge_idx < my_touching_count) {
-            const uint32_t my_hedge_idx = my_touching[touching_hedge_idx];
-            const uint32_t* my_hedge = hedges + hedges_offsets[my_hedge_idx];
-            //const uint32_t* not_my_hedge = hedges + hedges_offsets[my_hedge_idx + 1];
-            const uint32_t my_hedge_size = (uint32_t)(hedges_offsets[my_hedge_idx + 1] - hedges_offsets[my_hedge_idx]);
-            for (uint32_t node_idx = lane_id; node_idx < my_hedge_size; node_idx += WARP_SIZE) { // the warp loops over hedge pins
-                uint32_t neighbor = my_hedge[node_idx];
-                if (neighbor != node_id && sm_hashset_try_insert(dedupe, SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE, neighbor))
-                    gm_hashset_insert(my_neighbors, my_neighbors_count, neighbor); // should never happen, but could trigger an assert if 'my_neighbors_count' is exceeded
-            }
-        }
+    // correct the max neighbors count estimate
+    auto actual_max_neighbors = thrust::max_element(t_neigh_offsets, t_neigh_offsets + num_nodes);
+    dim_t actual_max_neighbors_offset = static_cast<dim_t>(actual_max_neighbors - t_neigh_offsets);
+    dim_t new_max_neighbors;
+    CUDA_CHECK(cudaMemcpy(&new_max_neighbors, d_neighbors_offsets + actual_max_neighbors_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    std::cout << "Max neighbors estimate corrected to " << new_max_neighbors << "\n";
+    
+    // compute final offsets
+    thrust::exclusive_scan(t_neigh_offsets, t_neigh_offsets + (num_nodes + 1), t_neigh_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
+    dim_t total_neighbors;
+    CUDA_CHECK(cudaMemcpy(&total_neighbors, d_neighbors_offsets + num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMalloc(&d_neighbors, total_neighbors * sizeof(uint32_t)));
+    if (direct_scatter_neighbors) {
+        // pack oversized neighbors in their final tight-fit subarrays
+        // launch configuration - neighborhoods pack kernel
+        int threads_per_block = 128; // 128/32 -> 4 warps per block
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        int num_warps_needed = num_nodes ; // 1 warp per node
+        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+        std::cout << "Running neighborhoods pack kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        // launch - neighborhoods scatter kernel
+        pack_segments<<<blocks, threads_per_block>>>(
+            d_oversized_neighbors,
+            d_neighbors_offsets,
+            num_nodes,
+            init_max_neighbors,
+            d_neighbors
+        );
+    } else {
+        // write neighbors at their correct offset
+        // launch configuration - neighborhoods scatter kernel
+        int blocks = num_nodes;
+        int threads_per_block = 256; // 256/32 -> 8 warps per block
+        std::cout << "Running neighborhoods scatter kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        // launch - neighborhoods scatter kernel
+        neighborhoods_scatter_kernel<<<blocks, threads_per_block>>>(
+            d_hedges,
+            d_hedges_offsets,
+            d_touching,
+            d_touching_offsets,
+            num_nodes,
+            d_neighbors_offsets,
+            d_neighbors
+        );
     }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (direct_scatter_neighbors) CUDA_CHECK(cudaFree(d_oversized_neighbors)); // pack? free oversized afterwards
+
+    return std::make_tuple(new_max_neighbors, d_neighbors, d_neighbors_offsets);
 }
 
-// count how many distinct new pins are in each hedge
-// SEQUENTIAL COMPLEXITY: e*d
-// PARALLEL OVER: e
-// WARPS OVER: d
-__global__
-void apply_coarsening_hedges_count(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ srcs_count,
-    const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
+std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
+    const runconfig cfg,
+    const uint32_t *d_groups,
+    const uint32_t *d_ungroups,
+    const dim_t *d_ungroups_offsets,
+    const uint32_t curr_num_nodes,
+    const uint32_t new_num_nodes,
+    const uint32_t max_neighbors,
+    uint32_t *d_neighbors,
+    dim_t *d_neighbors_offsets
+) {
+    // prepare coarse neighbors buffers
+    uint32_t *d_coarse_neighbors = nullptr;
+    uint32_t *d_coarse_oversized_neighbors = nullptr;
+    dim_t *d_coarse_neighbors_offsets = nullptr;
+    dim_t curr_max_neighbors = (dim_t)(cfg.oversized_multiplier * (float)max_neighbors); // add a bit of safety-room to compensate for the flat scaling by 'new_num_nodes / curr_num_nodes'
+    
+    // if there is enough memory for the full oversized buffer, SM dischard included, a speedier version is used, that replaced the scatter with a direct pack from the initial oversized allocation!
+    size_t free_bytes, total_bytes;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    // NOTE: no need to check if there could be space to allocate both oversized neighbors and final neighbors at once, if the oversized fits, then the new neighbors are allocated either after the oversized is freed, or after the original neighbors are freed
+    bool direct_scatter_coarse_neighbors = (curr_num_nodes * curr_max_neighbors /*oversized (SM included)*/ + new_num_nodes * max_neighbors /*final upper bound*/) * sizeof(uint32_t) + new_num_nodes * sizeof(dim_t) /*offsets*/ < free_bytes;
+    // no pack? can spare space in the oversized buffer equal to the amount of shared memory used for fast deduping
+    if (!direct_scatter_coarse_neighbors) curr_max_neighbors = curr_max_neighbors > MAX_SM_WARP_DEDUPE_BUFFER_SIZE ? curr_max_neighbors - MAX_SM_WARP_DEDUPE_BUFFER_SIZE : 0; // save the spaced for the duplicates caught in SM
+    curr_max_neighbors = max(curr_max_neighbors, (dim_t)MIN_GM_WARP_DEDUPE_BUFFER_SIZE); // just some ensurance...
+    
+    if (curr_num_nodes * curr_max_neighbors * sizeof(uint32_t) > (1ull << 32))
+        std::cout << "Allocating " << std::fixed << std::setprecision(1) << (float)(curr_num_nodes * curr_max_neighbors * sizeof(uint32_t)) / (1 << 30) << " GB for neighbors deduplication ...\n";
+    CUDA_CHECK(cudaMalloc(&d_coarse_oversized_neighbors, curr_num_nodes * curr_max_neighbors * sizeof(uint32_t))); // space for spilling deduplication hash-sets
+    CUDA_CHECK(cudaMalloc(&d_coarse_neighbors_offsets, (1 + new_num_nodes) * sizeof(dim_t))); // NOTE: the number nodes decreases!
+    CUDA_CHECK(cudaMemset(d_coarse_neighbors_offsets, 0x00, sizeof(dim_t))); // init. the first offset at 0
+    thrust::device_ptr<dim_t> t_coarse_neigh_offsets(d_coarse_neighbors_offsets);
+    {
+        // launch configuration - coarsening kernel (neighbors - count)
+        int threads_per_block = 128; // 128/32 -> 4 warps per block
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        int num_warps_needed = new_num_nodes ; // 1 warp per group
+        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+        // compute shared memory per block (bytes)
+        size_t bytes_per_warp = MAX_SM_WARP_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
+        size_t shared_bytes = warps_per_block * bytes_per_warp;
+        // launch - coarsening kernel (neighbors - count)
+        std::cout << "Running coarsening kernel (neighbors - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        apply_coarsening_neighbors_count<<<blocks, threads_per_block, shared_bytes>>>(
+            d_neighbors,
+            d_neighbors_offsets,
+            d_groups,
+            d_ungroups,
+            d_ungroups_offsets,
+            new_num_nodes,
+            curr_max_neighbors,
+            direct_scatter_coarse_neighbors,
+            d_coarse_oversized_neighbors,
+            d_coarse_neighbors_offsets
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    if (!direct_scatter_coarse_neighbors) CUDA_CHECK(cudaFree(d_coarse_oversized_neighbors));
+    if (direct_scatter_coarse_neighbors) { CUDA_CHECK(cudaFree(d_neighbors)); CUDA_CHECK(cudaFree(d_neighbors_offsets)); }
+    
+    // correct the max neighbors count estimate
+    auto actual_coarse_max_neighbors = thrust::max_element(t_coarse_neigh_offsets, t_coarse_neigh_offsets + new_num_nodes + 1);
+    dim_t actual_coarse_max_neighbors_offset = static_cast<dim_t>(actual_coarse_max_neighbors - t_coarse_neigh_offsets);
+    dim_t new_max_neighbors;
+    CUDA_CHECK(cudaMemcpy(&new_max_neighbors, d_coarse_neighbors_offsets + actual_coarse_max_neighbors_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    std::cout << "Max neighbors estimate corrected to " << new_max_neighbors << "\n";
+    
+    // compute final offsets
+    thrust::inclusive_scan(t_coarse_neigh_offsets, t_coarse_neigh_offsets + (new_num_nodes + 1), t_coarse_neigh_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
+    dim_t new_neighbors_size = 0; // last value in the inclusive scan = full reduce = total number of neighbors among all sets
+    CUDA_CHECK(cudaMemcpy(&new_neighbors_size, d_coarse_neighbors_offsets + new_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    // NOTE: rebuilding neighbors from scratch makes no sense: if the "oversized" buffer could fit, no reason the new neighbors shouldn't!
+    // this alloc should never fail, since it occurs in the space left by either the oversized buffer or previous neighbors
+    CUDA_CHECK(cudaMalloc(&d_coarse_neighbors, new_neighbors_size * sizeof(uint32_t)));
+    if (direct_scatter_coarse_neighbors) {
+        // pack oversized coarse neighbors in their final tight-fit subarrays
+        // launch configuration - coarsening kernel (neighbors - pack)
+        int threads_per_block = 128; // 128/32 -> 4 warps per block
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        int num_warps_needed = new_num_nodes; // 1 warp per group
+        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+        std::cout << "Running coarsening kernel (neighbors - pack) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        // launch - neighborhoods scatter kernel
+        pack_segments_varsize<<<blocks, threads_per_block>>>(
+            d_coarse_oversized_neighbors,
+            d_ungroups_offsets, // once more, ungroup offsets provide the offsets for the oversized buffer too
+            d_coarse_neighbors_offsets,
+            new_num_nodes,
+            curr_max_neighbors,
+            d_coarse_neighbors
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(d_coarse_oversized_neighbors));
+    } else {
+        // launch configuration - coarsening kernel (neighbors - scatter)
+        int threads_per_block = 128; // 128/32 -> 4 warps per block
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        int num_warps_needed = new_num_nodes ; // 1 warp per group
+        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+        // compute shared memory per block (bytes)
+        size_t bytes_per_warp = MAX_SM_WARP_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
+        size_t shared_bytes = warps_per_block * bytes_per_warp;
+        // launch - coarsening kernel (neighbors - scatter)
+        std::cout << "Running coarsening kernel (neighbors - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        apply_coarsening_neighbors_scatter<<<blocks, threads_per_block, shared_bytes>>>(
+            d_neighbors,
+            d_neighbors_offsets,
+            d_groups,
+            d_ungroups,
+            d_ungroups_offsets,
+            new_num_nodes,
+            d_coarse_neighbors_offsets,
+            d_coarse_neighbors
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        // de-allocate old neighbors and replace them with coarse ones
+        CUDA_CHECK(cudaFree(d_neighbors));
+        CUDA_CHECK(cudaFree(d_neighbors_offsets));
+    }
+
+    return std::make_tuple(new_max_neighbors, d_coarse_neighbors, d_coarse_neighbors_offsets);
+}
+
+std::tuple<dim_t, dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
+    const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_srcs_count,
+    const uint32_t *d_groups,
     const uint32_t num_hedges,
-    const uint32_t max_hedge_size,
-    uint32_t* __restrict__ coarse_oversized_hedges,
-    dim_t* __restrict__ coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
-    uint32_t* __restrict__ coarse_srcs_count
+    const uint32_t max_hedge_size
 ) {
-    // STYLE: one hedge per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the hedge to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_hedges) return;
+    uint32_t *d_coarse_hedges = nullptr;
+    uint32_t *d_coarse_hedges_buffer = nullptr;
+    uint32_t *d_coarse_oversized_hedges = nullptr;
+    dim_t *d_coarse_hedges_offsets = nullptr;
+    uint32_t* d_coarse_srcs_count = nullptr;
+    
+    dim_t curr_max_hedge_size = (dim_t)(cfg.oversized_multiplier * (float)max_hedge_size);
+    curr_max_hedge_size = curr_max_hedge_size > MAX_SM_WARP_DEDUPE_BUFFER_SIZE ? curr_max_hedge_size - MAX_SM_WARP_DEDUPE_BUFFER_SIZE : 0;
+    curr_max_hedge_size = max(curr_max_hedge_size, (dim_t)MIN_GM_WARP_DEDUPE_BUFFER_SIZE);
+    
+    if (num_hedges * curr_max_hedge_size * sizeof(uint32_t) > (1ull << 32))
+        std::cout << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_hedges * curr_max_hedge_size * sizeof(uint32_t)) / (1 << 30) << " GB for hedges deduplication ...\n";
+    CUDA_CHECK(cudaMalloc(&d_coarse_oversized_hedges, num_hedges * curr_max_hedge_size * sizeof(uint32_t))); // space for spilling deduplication hash-sets
+    CUDA_CHECK(cudaMalloc(&d_coarse_hedges_offsets, (1 + num_hedges) * sizeof(dim_t))); // NOTE: the number of hedges never decreases (for now), unlike that of nodes!
+    CUDA_CHECK(cudaMalloc(&d_coarse_srcs_count, num_hedges * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(d_coarse_hedges_offsets, 0x00, sizeof(dim_t))); // init. the first offset at 0
+    thrust::device_ptr<dim_t> t_coarse_hedges_offsets(d_coarse_hedges_offsets);
+    
+    // launch configuration - coarsening kernel (hedges - count)
+    int threads_per_block = 128; // 128/32 -> 4 warps per block
+    int warps_per_block = threads_per_block / WARP_SIZE;
+    int num_warps_needed = num_hedges; // 1 warp per hedge
+    int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+    // compute shared memory per block (bytes)
+    size_t bytes_per_warp = MAX_SM_WARP_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
+    size_t shared_bytes = warps_per_block * bytes_per_warp;
+    // launch - coarsening kernel (hedges - count)
+    std::cout << "Running coarsening kernel (hedges - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    apply_coarsening_hedges_count<<<blocks, threads_per_block, shared_bytes>>>(
+        d_hedges,
+        d_hedges_offsets,
+        d_srcs_count,
+        d_groups,
+        num_hedges,
+        curr_max_hedge_size,
+        d_coarse_oversized_hedges,
+        d_coarse_hedges_offsets,
+        d_coarse_srcs_count
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFree(d_coarse_oversized_hedges));
 
-    /*
-    * Idea:
-    * - first deduplicate inside hedges to count their new, distinct, nodes (count srcs and dsts all together)
-    * - scan the counts per hedge to get the new offsets
-    * - repeat the deduplication and write (scatter) each new hedge to its offset
-    *
-    * TODO, upgrade options:
-    * - instead of three kernels to count distinct nodes, scan offsets, and scatter distinct nodes, can't we do all in one?
-    * - one hedge per warp or block, use the shared memory hash-map to keep a "first-come-first-served" set of counters in shared memory,
-    *   and reditect additional entries to atomically incremented global counters (issue: musre ensure the src is preserved!!)
-    *
-    * Must ensure that:
-    * - there are no self-cycles (remove the >>src<< to break them)
-    * - the same node never appears twice in the same hedge
-    *   => exploited by the coarsening of touching sets
-    */
+    // correct the max hedge size estimate
+    auto actual_coarse_max_hedge_size = thrust::max_element(t_coarse_hedges_offsets, t_coarse_hedges_offsets + num_hedges + 1);
+    dim_t actual_coarse_max_hedge_size_offset = static_cast<dim_t>(actual_coarse_max_hedge_size - t_coarse_hedges_offsets);
+    dim_t new_max_hedge_size;
+    CUDA_CHECK(cudaMemcpy(&new_max_hedge_size, d_coarse_hedges_offsets + actual_coarse_max_hedge_size_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    std::cout << "Max hedges estimate corrected to " << max_hedge_size << "\n";
+    
+    // NOTE: the scan wants the last index EXCLUDED, while the memcopy wants the last index exactly! That's why we use here the +1, and not later!
+    thrust::inclusive_scan(t_coarse_hedges_offsets, t_coarse_hedges_offsets + (num_hedges + 1), t_coarse_hedges_offsets); // in-place exclusive scan (the last element collects the full reduce)
+    dim_t new_hedges_size = 0; // last value in the inclusive scan = full reduce = total number of pins among all hedges
+    CUDA_CHECK(cudaMemcpy(&new_hedges_size, d_coarse_hedges_offsets + num_hedges, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMalloc(&d_coarse_hedges, new_hedges_size * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_coarse_hedges_buffer, new_hedges_size * sizeof(uint32_t)));
+    // launch configuration - coarsening kernel (hedges - scatter - dsts) - same as coarsening kernel (hedges - count)
+    // launch - coarsening kernel (hedges - scatter - dsts)
+    std::cout << "Running coarsening kernel (hedges - scatter - dsts) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    apply_coarsening_hedges_scatter_dsts<<<blocks, threads_per_block, shared_bytes>>>(
+        d_hedges,
+        d_hedges_offsets,
+        d_srcs_count,
+        d_groups,
+        num_hedges,
+        d_coarse_hedges_offsets,
+        d_coarse_hedges
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    const dim_t hedge_start_idx = hedges_offsets[warp_id], hedge_end_idx = hedges_offsets[warp_id + 1];
-    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
-    const uint32_t hedge_srcs_count = srcs_count[warp_id];
-    const uint32_t *hedge_srcs_end = hedges + hedge_start_idx + hedge_srcs_count;
-    uint32_t *oversized_coarse_hedges_start = coarse_oversized_hedges + max_hedge_size * warp_id;
-    uint32_t new_hedges_count = 0, new_srcs_count = 0;
-    wrp_init<uint32_t>(oversized_coarse_hedges_start, max_hedge_size, HASH_EMPTY); // HP: HASH_EMPTY is > than any value that could be inserted
-
-    // SM deduplication hash-set
-    extern __shared__ uint32_t block_new_pins[];
-    uint32_t *new_pins = block_new_pins + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
-    wrp_init<uint32_t>(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-    __syncwarp();
-
-    // go over the hedge's destinations
-    for (const uint32_t* curr = hedge_start + hedge_srcs_count + lane_id; curr < hedge_end; curr += WARP_SIZE) {
-        const uint32_t pin = groups[*curr]; // read and map pin to its new id
-        const uint8_t inserted = sm_hashset_try_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, pin); // check in the SM cache
-        // inserted == 1 -> no need to put into GM what already is in the SM hash-set
-        // inserted == 2 -> SM full, check in GM
-        if (inserted == 1 || inserted == 2 && gm_hashset_insert(oversized_coarse_hedges_start, max_hedge_size, pin)) // actual dedupe
-            new_hedges_count++;
+    // sort destinations (descending)
+    cub::DoubleBuffer<uint32_t> c_coarse_hedges_double_buffer(d_coarse_hedges, d_coarse_hedges_buffer);
+    void* c_hedges_storage = nullptr;
+    size_t c_hedges_storage_bytes = 0;
+    cub::DeviceSegmentedRadixSort::SortKeysDescending(c_hedges_storage, c_hedges_storage_bytes, c_coarse_hedges_double_buffer, new_hedges_size, num_hedges, d_coarse_hedges_offsets, d_coarse_hedges_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
+    std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_hedges_size * sizeof(uint32_t)) / (1 << 30) << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_hedges_storage_bytes) / (1 << 20) << " MB of temporary storage ...\n";
+    cudaMalloc(&c_hedges_storage, c_hedges_storage_bytes);
+    cub::DeviceSegmentedRadixSort::SortKeysDescending(c_hedges_storage, c_hedges_storage_bytes, c_coarse_hedges_double_buffer, new_hedges_size, num_hedges, d_coarse_hedges_offsets, d_coarse_hedges_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
+    if (c_coarse_hedges_double_buffer.Current() != d_coarse_hedges) {
+        uint32_t* tmp = d_coarse_hedges_buffer;
+        d_coarse_hedges_buffer = d_coarse_hedges;
+        d_coarse_hedges = tmp;
     }
 
-    // go over the hedge's sources
-    for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_srcs_end; curr += WARP_SIZE) {
-        const uint32_t pin = groups[*curr];
-        const uint8_t inserted = sm_hashset_try_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, pin);
-        if (inserted == 1 || inserted == 2 && gm_hashset_insert(oversized_coarse_hedges_start, max_hedge_size, pin))
-            new_srcs_count++;
-    }
+    // launch configuration - coarsening kernel (hedges - scatter - srcs) - same as coarsening kernel (hedges - count)
+    // launch - coarsening kernel (hedges - scatter - srcs)
+    std::cout << "Running coarsening kernel (hedges - scatter - srcs) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    apply_coarsening_hedges_scatter_srcs<<<blocks, threads_per_block, shared_bytes>>>(
+        d_hedges,
+        d_hedges_offsets,
+        d_srcs_count,
+        d_groups,
+        num_hedges,
+        d_coarse_hedges_offsets,
+        d_coarse_srcs_count,
+        d_coarse_hedges
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFree(d_coarse_hedges_buffer));
+    CUDA_CHECK(cudaFree(c_hedges_storage));
 
-    new_hedges_count += new_srcs_count;
-
-    new_hedges_count = warpReduceSumLN0<uint32_t>(new_hedges_count);
-    new_srcs_count = warpReduceSumLN0<uint32_t>(new_srcs_count);
-
-    if (lane_id == 0) {
-        coarse_hedges_offsets[warp_id + 1] = (dim_t)new_hedges_count; // leave the first entry to be 0 (offset of the first hedge)
-        coarse_srcs_count[warp_id] = new_srcs_count;
-    }
+    return std::make_tuple(new_hedges_size, new_max_hedge_size, d_coarse_hedges, d_coarse_hedges_offsets, d_coarse_srcs_count);
 }
 
-// write the new distinct destinations of hedges
-// SEQUENTIAL COMPLEXITY: e*d
-// PARALLEL OVER: e
-// WARPS OVER: d
-__global__
-void apply_coarsening_hedges_scatter_dsts(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ srcs_count,
-    const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
-    const uint32_t num_hedges,
-    const dim_t* __restrict__ coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
-    uint32_t* __restrict__ coarse_hedges
+std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
+    const runconfig cfg,
+    const uint32_t *d_coarse_hedges,
+    const dim_t *d_coarse_hedges_offsets,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
+    const uint32_t *d_inbound_count,
+    const uint32_t *d_ungroups,
+    const dim_t *d_ungroups_offsets,
+    const uint32_t new_num_nodes,
+    const uint32_t num_hedges
 ) {
-    // STYLE: one hedge per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the hedge to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_hedges) return;
+    uint32_t *d_coarse_touching = nullptr;
+    uint32_t *d_coarse_touching_buffer = nullptr;
+    dim_t *d_coarse_touching_offsets = nullptr;
+    uint32_t *d_coarse_inbound_count = nullptr;
 
-    /* Idea: second part of "apply_coarsening_hedges_count" -> scatter
-    * 
-    * Must ensure that:
-    * - the source remains the first nodes in each coarse hedge
-    * - self-cycles are broken by removing the src, not the dst
-    */
+    CUDA_CHECK(cudaMalloc(&d_coarse_touching_offsets, (1 + new_num_nodes) * sizeof(dim_t))); // NOTE: the number nodes decreases!
+    CUDA_CHECK(cudaMemset(d_coarse_touching_offsets, 0x00, (1 + new_num_nodes) * sizeof(dim_t))); // remember to leave the first offset at 0
+    CUDA_CHECK(cudaMalloc(&d_coarse_inbound_count, new_num_nodes * sizeof(uint32_t)));
 
-    const dim_t hedge_start_idx = hedges_offsets[warp_id], hedge_end_idx = hedges_offsets[warp_id + 1];
-    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
-    const uint32_t hedge_srcs_count = srcs_count[warp_id];
-    const dim_t coarse_hedge_start_idx = coarse_hedges_offsets[warp_id];
-    const uint32_t coarse_hedge_size = (uint32_t)(coarse_hedges_offsets[warp_id + 1] - coarse_hedges_offsets[warp_id]);
-    uint32_t *coarse_hedge_start = coarse_hedges + coarse_hedge_start_idx;
-    wrp_init<uint32_t>(coarse_hedge_start, coarse_hedge_size, HASH_EMPTY); // HP: HASH_EMPTY is > than any value that could be inserted
-
-    // SM deduplication hash-set
-    extern __shared__ uint32_t block_new_pins[];
-    uint32_t *new_pins = block_new_pins + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
-    wrp_init<uint32_t>(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-
-    // go over the hedge's destinations
-    for (const uint32_t* curr = hedge_start + hedge_srcs_count + lane_id; curr < hedge_end; curr += WARP_SIZE) {
-        const uint32_t pin = groups[*curr]; // read and map pin to its new id
-        if (sm_hashset_try_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, pin)) // check in the SM cache
-            gm_hashset_insert(coarse_hedge_start, coarse_hedge_size, pin); // actual dedupe and final insertion
+    {
+        // launch configuration - coarsening kernel (touching - count)
+        int threads_per_block = 128;
+        int num_threads_needed = num_hedges; // 1 thread per hedge
+        int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+        // launch - coarsening kernel (touching - count)
+        std::cout << "Running coarsening kernel (touching - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        apply_coarsening_touching_count<<<blocks, threads_per_block>>>(
+            d_coarse_hedges,
+            d_coarse_hedges_offsets,
+            num_hedges,
+            d_coarse_touching_offsets
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
-}
 
-// write the new distinct sources of hedges
-// SEQUENTIAL COMPLEXITY: e*d
-// PARALLEL OVER: e
-// WARPS OVER: d
-__global__
-void apply_coarsening_hedges_scatter_srcs(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ srcs_count,
-    const uint32_t* __restrict__ groups, // groups[node idx] -> new group/node id
-    const uint32_t num_hedges,
-    const dim_t* __restrict__ coarse_hedges_offsets, // coarse_hedges_offsets[hedge idx] -> count of distinct groups among its pins
-    const uint32_t* __restrict__ coarse_srcs_count,
-    uint32_t* __restrict__ coarse_hedges
-) {
-    // STYLE: one hedge per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the hedge to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_hedges) return;
+    thrust::device_ptr<dim_t> t_coarse_touching_offsets(d_coarse_touching_offsets);
+    thrust::inclusive_scan(t_coarse_touching_offsets, t_coarse_touching_offsets + (new_num_nodes + 1), t_coarse_touching_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
+    dim_t new_touching_size = 0; // last value in the inclusive scan = full reduce = total number of touching hedges among all sets
+    CUDA_CHECK(cudaMemcpy(&new_touching_size, d_coarse_touching_offsets + new_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMalloc(&d_coarse_touching, new_touching_size * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_coarse_touching_buffer, new_touching_size * sizeof(uint32_t)));
 
-    /* 
-    * Second half of 'apply_coarsening_hedges_scatter_srcs'
-    * => assumes the destinations segments have been now sorted, and can be used for binary search
-    */
+    {
+        // launch configuration - coarsening kernel (touching - scatter - inbound)
+        int threads_per_block = 128; // 128/32 -> 4 warps per block
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        int num_warps_needed = new_num_nodes; // 1 warp per group
+        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+        // compute shared memory per block (bytes)
+        size_t bytes_per_warp = MAX_SM_WARP_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
+        size_t shared_bytes = warps_per_block * bytes_per_warp;
+        // launch - coarsening kernel (touching - scatter - inbound)
+        std::cout << "Running coarsening kernel (touching - scatter - inbound) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        apply_coarsening_touching_scatter_inbound<<<blocks, threads_per_block, shared_bytes>>>(
+            d_touching,
+            d_touching_offsets,
+            d_inbound_count,
+            d_ungroups,
+            d_ungroups_offsets,
+            new_num_nodes,
+            d_coarse_touching_offsets,
+            d_coarse_touching,
+            d_coarse_inbound_count
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    const dim_t hedge_start_idx = hedges_offsets[warp_id];
-    const uint32_t *hedge_start = hedges + hedge_start_idx;
-    const uint32_t hedge_srcs_count = srcs_count[warp_id];
-    const uint32_t *hedge_srcs_end = hedges + hedge_start_idx + hedge_srcs_count;
-    const dim_t coarse_hedge_start_idx = coarse_hedges_offsets[warp_id];
-    const uint32_t coarse_hedge_size = (uint32_t)(coarse_hedges_offsets[warp_id + 1] - coarse_hedges_offsets[warp_id]);
-    const uint32_t coarse_hedge_srcs_count = coarse_srcs_count[warp_id];
-    const uint32_t coarse_hedge_dsts_count = coarse_hedge_size - coarse_hedge_srcs_count;
-    uint32_t *coarse_hedge_srcs_start = coarse_hedges + coarse_hedge_start_idx;
-    uint32_t *coarse_hedge_dsts_start = coarse_hedges + coarse_hedge_start_idx + coarse_hedge_srcs_count;
-
-    // SM deduplication hash-set
-    extern __shared__ uint32_t block_new_pins[];
-    uint32_t *new_pins = block_new_pins + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
-    wrp_init<uint32_t>(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-
-    // go over the hedge's destinations
-    for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_srcs_end; curr += WARP_SIZE) {
-        const uint32_t pin = groups[*curr]; // read and map pin to its new id
-        // insert == 0, 1 -> no need to put into GM what already is in the SM hash-set
-        // insert == 2 -> SM full, check in GM
-        if (sm_hashset_try_insert(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, pin) == 2) { // check in the SM cache
-            if(binary_search<uint32_t, false>(coarse_hedge_dsts_start, coarse_hedge_dsts_count, pin) == UINT32_MAX) // check among destinations (be wary: descending order!)
-                gm_hashset_insert(coarse_hedge_srcs_start, coarse_hedge_srcs_count, pin); // actual dedupe and final insertion
+        // sort each inbound touching set
+        cub::DoubleBuffer<uint32_t> c_coarse_touching_double_buffer(d_coarse_touching, d_coarse_touching_buffer);
+        void* c_touching_storage = nullptr;
+        size_t c_touching_storage_bytes = 0;
+        cub::DeviceSegmentedRadixSort::SortKeys(c_touching_storage, c_touching_storage_bytes, c_coarse_touching_double_buffer, new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
+        std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_touching_size * sizeof(uint32_t)) / (1 << 30) << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_touching_storage_bytes) / (1 << 20) << " MB of temporary storage ...\n";
+        cudaMalloc(&c_touching_storage, c_touching_storage_bytes);
+        cub::DeviceSegmentedRadixSort::SortKeys(c_touching_storage, c_touching_storage_bytes, c_coarse_touching_double_buffer, new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
+        if (c_coarse_touching_double_buffer.Current() != d_coarse_touching) {
+            uint32_t* tmp = d_coarse_touching_buffer;
+            d_coarse_touching_buffer = d_coarse_touching;
+            d_coarse_touching = tmp;
         }
-    }
-    __syncwarp();
-
-    // dump SM over to GM all at once => the deferred flush prevents catastrophic probe lengths in the main loop
-    for (uint32_t i = lane_id; i < MAX_SM_WARP_DEDUPE_BUFFER_SIZE; i += WARP_SIZE) {
-        uint32_t pin = new_pins[i];
-        if (pin != HASH_EMPTY && binary_search<uint32_t, false>(coarse_hedge_dsts_start, coarse_hedge_dsts_count, pin) == UINT32_MAX)
-            gm_hashset_insert(coarse_hedge_srcs_start, coarse_hedge_srcs_count, pin);
-    }
-}
-
-// count how many distinct neighbors there are in each group
-// SEQUENTIAL COMPLEXITY: n*d*h (in reality there are <<d*h neighbors per node)
-// PARALLEL OVER: n
-// WARPS OVER: d*h (neighbors)
-__global__
-void apply_coarsening_neighbors_count(
-    const uint32_t* __restrict__ neighbors,
-    const dim_t* __restrict__ neighbors_offsets,
-    const uint32_t* __restrict__ groups, // groups[node id] -> node's group id
-    const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const dim_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
-    const uint32_t num_groups,
-    const dim_t max_neighbors,
-    const bool discharge, // if true -> finish by dumping SM into GM too, making GM contain the whole (sparse) set
-    uint32_t* __restrict__ oversized_coarse_neighbors, // deduplication buffer, you can use it between oversized_coarse_neighbors[max_neighbors * ungroups_offsets[my idx]] and oversized_coarse_neighbors[max_neighbors * ungroups_offsets[my idx + 1]]
-    dim_t* __restrict__ coarse_neighbors_offsets // group id -> count of distinct neighbors
-) {
-    // STYLE: one group (new node) per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the group to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_groups) return;
-
-    /*
-    * Idea:
-    * - first translate to their new id and deduplicate neighbors inside each group to count their new, distinct, nodes
-    * - scan the counts per group to get the new offsets
-    * - repeat the deduplication and write (scatter) each new neighbor (neighboring group id) to its offset
-    *
-    * Must ensure that:
-    * - a node itself NEVER appears among its own neighbors
-    *
-    * NOTE: by doing this, instead of rebuilding neighborhoods from scratch, we have fewer neighbors to deduplicate,
-    *       since most were already handled at the level above! While this runs we keep allocated both the old and new sets...
-    *
-    * TODO: compare this with rebuilding neighborhoods from scratch, to see if it is faster! (it is worth the memory investment)
-    *
-    * TODO: is it better here to have one group per warp, or one per block, like the initial construction of neighbors?
-    */
-
-    const dim_t ungroups_start_idx = ungroups_offsets[warp_id], ungroups_end_idx = ungroups_offsets[warp_id + 1];
-    const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
-    uint32_t *oversized_coarse_neighbors_start = oversized_coarse_neighbors + max_neighbors * ungroups_start_idx;
-    const dim_t oversized_coarse_neighbors_size = max_neighbors * (ungroups_end_idx - ungroups_start_idx);
-    dim_t new_neighbors_count = 0u;
-    wrp_init<uint32_t>(oversized_coarse_neighbors_start, oversized_coarse_neighbors_size, HASH_EMPTY); // HP: HASH_EMPTY is > than any value that could be inserted
-
-    // SM deduplication hash-set
-    extern __shared__ uint32_t block_new_neighbors[];
-    uint32_t *new_neighbors = block_new_neighbors + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
-    wrp_init<uint32_t>(new_neighbors, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-    __syncwarp();
-
-    // for every original node in the group, go over its touching set
-    // TODO: maybe let threads that finish a node move over to the next in the group as soon as possible
-    for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
-        const uint32_t node = *ungroup;
-        const uint32_t* my_neighbors = neighbors + neighbors_offsets[node];
-        const uint32_t my_neighbors_count = neighbors_offsets[node + 1] - neighbors_offsets[node];
-        for (uint32_t i = lane_id; i < my_neighbors_count; i += WARP_SIZE) {
-            const uint32_t new_neighbor = groups[my_neighbors[i]]; // translate to group id
-            if (warp_id == new_neighbor) continue;
-            const uint8_t inserted = sm_hashset_try_insert(new_neighbors, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, new_neighbor); // check in the SM cache
-            // inserted == 1 -> no need to put into GM what already is in the SM hash-set
-            // inserted == 2 -> SM full, check in GM
-            if (inserted == 1 || inserted == 2 && gm_hashset_insert(oversized_coarse_neighbors_start, oversized_coarse_neighbors_size, new_neighbor)) // triggers an assert if 'max_neighbors' is exceeded
-                new_neighbors_count++;
-        }
+        CUDA_CHECK(cudaFree(d_coarse_touching_buffer));
+        CUDA_CHECK(cudaFree(c_touching_storage));
+        
+        // launch configuration - coarsening kernel (touching - scatter - outbound) - same as coarsening kernel (touching - scatter - inbound)
+        // launch - coarsening kernel (touching - scatter - outbound)
+        std::cout << "Running coarsening kernel (touching - scatter - outbound) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        apply_coarsening_touching_scatter_outbound<<<blocks, threads_per_block, shared_bytes>>>(
+            d_touching,
+            d_touching_offsets,
+            d_inbound_count,
+            d_ungroups,
+            d_ungroups_offsets,
+            new_num_nodes,
+            d_coarse_touching_offsets,
+            d_coarse_inbound_count,
+            d_coarse_touching
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
-    new_neighbors_count = warpReduceSumLN0<dim_t>(new_neighbors_count);
-
-    if (discharge) {
-        // dump SM over to GM all at once; rely on the above warp-reduce as a sync
-        for (uint32_t i = lane_id; i < MAX_SM_WARP_DEDUPE_BUFFER_SIZE; i += WARP_SIZE) {
-            uint32_t neighbor = new_neighbors[i];
-            if (neighbor != HASH_EMPTY)
-                gm_hashset_insert(oversized_coarse_neighbors_start, oversized_coarse_neighbors_size, neighbor);
-        }
-    }
-
-    if (lane_id == 0)
-        coarse_neighbors_offsets[warp_id + 1] = new_neighbors_count; // leave the first entry to be 0 (offset of the first set)
-}
-
-// write distinct neighbors
-// SEQUENTIAL COMPLEXITY: n*d*h (in reality there are <<d*h neighbors per node)
-// PARALLEL OVER: n
-// WARPS OVER: d*h (neighbors)
-__global__
-void apply_coarsening_neighbors_scatter(
-    const uint32_t* __restrict__ neighbors,
-    const dim_t* __restrict__ neighbors_offsets,
-    const uint32_t* __restrict__ groups, // groups[node id] -> node's group id
-    const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const dim_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
-    const uint32_t num_groups,
-    const dim_t* __restrict__ coarse_neighbors_offsets, // group id -> count of distinct neighbors
-    uint32_t* __restrict__ coarse_neighbors
-) {
-    // STYLE: one group (new node) per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the group to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_groups) return;
-
-    // Idea: second part of "apply_coarsening_neighbors_count" -> scatter
-
-    const dim_t ungroups_start_idx = ungroups_offsets[warp_id], ungroups_end_idx = ungroups_offsets[warp_id + 1];
-    const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
-    const dim_t coarse_neighbors_start_idx = coarse_neighbors_offsets[warp_id], coarse_neighbors_end_idx = coarse_neighbors_offsets[warp_id + 1];
-    const uint32_t coarse_neighbors_size = (uint32_t)(coarse_neighbors_end_idx - coarse_neighbors_start_idx);
-    uint32_t *coarse_neighbors_start = coarse_neighbors + coarse_neighbors_start_idx;
-    wrp_init<uint32_t>(coarse_neighbors_start, coarse_neighbors_size, HASH_EMPTY); // HP: HASH_EMPTY is > than any value that could be inserted
-
-    // SM deduplication hash-set
-    extern __shared__ uint32_t block_new_neighbors[];
-    uint32_t *new_neighbors = block_new_neighbors + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
-    wrp_init<uint32_t>(new_neighbors, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-    __syncwarp();
-
-    // for every original node in the group, go over its touching set
-    // TODO: maybe let threads that finish a node move over to the next in the group as soon as possible
-    for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
-        const uint32_t node = *ungroup;
-        const uint32_t* my_neighbors = neighbors + neighbors_offsets[node];
-        const uint32_t my_neighbors_count = neighbors_offsets[node + 1] - neighbors_offsets[node];
-        for (uint32_t i = lane_id; i < my_neighbors_count; i += WARP_SIZE) {
-            const uint32_t new_neighbor = groups[my_neighbors[i]]; // translate to group id
-            if (warp_id == new_neighbor) continue;
-            if (sm_hashset_try_insert(new_neighbors, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, new_neighbor)) // check in the SM cache
-                gm_hashset_insert(coarse_neighbors_start, coarse_neighbors_size, new_neighbor); // actual dedupe and final insertion
-        }
-    }
-}
-
-// count how many hedges touch each node
-// SEQUENTIAL COMPLEXITY: e*d
-// PARALLEL OVER: e
-__global__
-void apply_coarsening_touching_count(
-    const uint32_t* __restrict__ hedges, // already coarsened as of here, thus contain group ids!
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t num_hedges,
-    dim_t* __restrict__ coarse_touching_offsets // here filled as counters of "how many hedges per node" -> then do a prefix sum for the offsets
-) {
-    // STYLE: one hedge per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_hedges) return;
-
-    /*
-    * Idea:
-    * - first coarsen hedge, then going over coarse hedge and counting the occurrencies of each group (new node) should be
-    *   faster than just deduplicating touching hedges between nodes in the same group
-    * - scan the touching counts per group (new node) to get the new offsets
-    * - the scatter operates in a different way, assigning one thread per group, the thread goes over the nodes
-    *   in the group via the "ungroups" and "ungroups_offsets" structures, deduplicates hedges and writes them in the touching set
-    *
-    * NOTE: this exploits the fact that the same pin never appears twice in the same hedge!
-    *
-    * TODO, upgrade options:
-    * - for now we just do atomics towards global memory, because nodes are too many for shared memory, eventually:
-    *   => use the shared memory hash-map to keep a "first-come-first-served" set of counters in shared memory,
-    *     and reditect additional entries to global counters, then atomically increment global memory
-    *
-    * TODO: could partially skip this counting step, because we already have the new distinct inbound count evaluated during the candidates kernel!
-    * 
-    * TODO: could already count inbound and outbound separately, then use singler scatter kernel putting them already in the right place!
-    */
-
-    const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
-    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
-
-    // TODO: initialize shared memory
-    // in utils.cuh : #define SM_MAX_HASHMAP_SIZE 4096u ?
-    //__shared__ hashmap_entry hashmap[SM_MAX_HASHMAP_SIZE];
-    //blk_init<uint32_t>(hashmap, SM_MAX_HASHMAP_SIZE*2, HASH_EMPTY);
-
-    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
-        const uint32_t pin = *curr; // already a group id
-        atomicAdd(&coarse_touching_offsets[pin + 1], 1); // leave the first entry to be 0 (offset of the first set)
-    }
-}
-
-// write distinct inbound touching hedges
-// SEQUENTIAL COMPLEXITY: n*h
-// PARALLEL OVER: n
-// SHUFFLES OVER: h (touching)
-__global__
-void apply_coarsening_touching_scatter_inbound(
-    const uint32_t* __restrict__ touching,
-    const dim_t* __restrict__ touching_offsets,
-    const uint32_t* __restrict__ inbound_count,
-    const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const dim_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
-    const uint32_t num_groups,
-    const dim_t* __restrict__ coarse_touching_offsets, // group id -> count of distinct touching hedges
-    uint32_t* __restrict__ coarse_touching,
-    uint32_t* __restrict__ coarse_inbound_count
-) {
-    // STYLE: one group (new node) per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the group to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_groups) return;
-
-    /*
-    * Idea: second part of "apply_coarsening_touching_scatter" -> scatter inbound
-    * Alternative version: one thread per hedge and dedupe inside each touching set (by linearly going over it, with a CAS at the end)
-    * 
-    * Must ensure that:
-    * - inbound hedges are at the start of the set
-    * - inbound hedges are sorted by id
-    *
-    * TODO upgrade option:
-    * - one warp per node is fine with many nodes, but when nodes are few switch to one node per block!
-    */
-
-    /*
-    * Important: here hedges that are both inbound and outbound are lost on one side, the outbound one specifically.
-    *            In other words, and hedge both entering and leaving a group will only be remembered as an inbound one,
-    *            this is because the deduplication is done for all touching at once, while the inbound count is incremented
-    *            only for the first occurrence, that is, the inbound one!
-    */
-
-    const dim_t ungroups_start_idx = ungroups_offsets[warp_id], ungroups_end_idx = ungroups_offsets[warp_id + 1];
-    const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
-    const dim_t coarse_touching_start_idx = coarse_touching_offsets[warp_id];
-    const uint32_t coarse_touching_size = (uint32_t)(coarse_touching_offsets[warp_id + 1] - coarse_touching_offsets[warp_id]);
-    uint32_t *coarse_touching_start = coarse_touching + coarse_touching_start_idx;
-    uint32_t new_inbound_count = 0u;
-    wrp_init<uint32_t>(coarse_touching_start, coarse_touching_size, HASH_EMPTY); // HP: HASH_EMPTY is > than any value that could be inserted
-
-    // SM deduplication hash-set
-    extern __shared__ uint32_t block_new_touching[];
-    uint32_t *new_touching = block_new_touching + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
-    wrp_init<uint32_t>(new_touching, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-    __syncwarp();
-
-    // for every original node in the group, go over its inbound set
-    for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
-        const uint32_t node = *ungroup;
-        const uint32_t* my_inbound = touching + touching_offsets[node];
-        const uint32_t my_inbound_count = inbound_count[node];
-        for (uint32_t i = lane_id; i < my_inbound_count; i += WARP_SIZE) {
-            const uint32_t hedge_idx = my_inbound[i];
-            if (sm_hashset_try_insert(new_touching, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, hedge_idx)) { // check in the SM cache
-                if (gm_hashset_insert(coarse_touching_start, coarse_touching_size, hedge_idx)) // dedupe among inbound hedges
-                    new_inbound_count++;
-            }
-        }
-    }
-
-    new_inbound_count = warpReduceSumLN0<uint32_t>(new_inbound_count);
-
-    if (lane_id == 0)
-        coarse_inbound_count[warp_id] = new_inbound_count;
-}
-
-// write distinct outbound touching hedges
-// SEQUENTIAL COMPLEXITY: n*h
-// PARALLEL OVER: n
-// SHUFFLES OVER: h (touching)
-__global__
-void apply_coarsening_touching_scatter_outbound(
-    const uint32_t* __restrict__ touching,
-    const dim_t* __restrict__ touching_offsets,
-    const uint32_t* __restrict__ inbound_count,
-    const uint32_t* __restrict__ ungroups, // ungroups[ungroups_offsets[group id] + i] -> i-th original node in the group
-    const dim_t* __restrict__ ungroups_offsets, // group (new node) id -> offset in ungroups where to find its original nodes
-    const uint32_t num_groups,
-    const dim_t* __restrict__ coarse_touching_offsets, // group id -> count of distinct touching hedges
-    const uint32_t* __restrict__ coarse_inbound_count,
-    uint32_t* __restrict__ coarse_touching
-) {
-    // STYLE: one group (new node) per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the group to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_groups) return;
-
-    /* 
-    * Idea: third part of "apply_coarsening_touching_scatter" -> scatter outbound
-    *  => assumes each inbound set has been now sorted, and can be used for binary search
-    */
-
-    const dim_t ungroups_start_idx = ungroups_offsets[warp_id], ungroups_end_idx = ungroups_offsets[warp_id + 1];
-    const uint32_t *ungroups_start = ungroups + ungroups_start_idx, *ungroups_end = ungroups + ungroups_end_idx;
-    const dim_t coarse_touching_start_idx = coarse_touching_offsets[warp_id];
-    const uint32_t coarse_touching_size = (uint32_t)(coarse_touching_offsets[warp_id + 1] - coarse_touching_offsets[warp_id]);
-    const uint32_t new_inbound_count = coarse_inbound_count[warp_id];
-    const uint32_t coarse_outbound_size = coarse_touching_size - new_inbound_count;
-    uint32_t *coarse_touching_start = coarse_touching + coarse_touching_start_idx;
-    uint32_t *coarse_outbound_start = coarse_touching_start + new_inbound_count;
-
-    // SM deduplication hash-set
-    extern __shared__ uint32_t block_new_touching[];
-    uint32_t *new_touching = block_new_touching + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
-    wrp_init<uint32_t>(new_touching, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
-    __syncwarp();
-
-    // for every original node in the group, go over its outbound set
-    for (const uint32_t* ungroup = ungroups_start; ungroup < ungroups_end; ungroup++) {
-        const uint32_t node = *ungroup;
-        const uint32_t* my_outbound = touching + touching_offsets[node] + inbound_count[node];
-        const uint32_t my_outbound_count = (uint32_t)(touching_offsets[node + 1] - touching_offsets[node]) - inbound_count[node];
-        for (uint32_t i = lane_id; i < my_outbound_count; i += WARP_SIZE) {
-            const uint32_t hedge_idx = my_outbound[i];
-            // insert == 0, 1 -> no need to put into GM what already is in the SM hash-set
-            // insert == 2 -> SM full, check in GM
-            if (sm_hashset_try_insert(new_touching, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, hedge_idx) == 2) { // check in the SM cache
-                if(binary_search<uint32_t, true>(coarse_touching_start, new_inbound_count, hedge_idx) == UINT32_MAX) // check among inbound hedges
-                    gm_hashset_insert(coarse_outbound_start, coarse_outbound_size, hedge_idx); // dedupe among outbound hedges
-            }
-        }
-    }
-    __syncwarp();
-
-    // dump SM over to GM all at once => the deferred flush prevents catastrophic probe lengths in the main loop
-    for (uint32_t i = lane_id; i < MAX_SM_WARP_DEDUPE_BUFFER_SIZE; i += WARP_SIZE) {
-        uint32_t hedge_idx = new_touching[i];
-        if (hedge_idx != HASH_EMPTY && binary_search<uint32_t, true>(coarse_touching_start, new_inbound_count, hedge_idx) == UINT32_MAX)
-            gm_hashset_insert(coarse_outbound_start, coarse_outbound_size, hedge_idx);
-    }
-}
-
-// write to each node the partition of its group
-__global__
-void apply_uncoarsening_partitions(
-    const uint32_t* __restrict__ groups, // groups[node id] -> node's group
-    const uint32_t* __restrict__ coarse_partitions, // coarse_partitions[group id] -> group's partition
-    const uint32_t num_nodes,
-    uint32_t* __restrict__ partitions // partitions[node id] -> group's partition
-) {
-    // STYLE: one node per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
-
-    // Idea: gather, each node reads its group, and from it its partition
-
-    const uint32_t my_group = groups[tid];
-    const uint32_t my_partition = coarse_partitions[my_group];
-    partitions[tid] = my_partition;
-}
-
-// for each hyperedge, count how many of its pins are in each partition
-// SEQUENTIAL COMPLEXITY: e*d
-// PARALLEL OVER: e
-__global__
-void pins_per_partition_kernel(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
-    const uint32_t num_hedges,
-    const uint32_t num_partitions,
-    uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
-    uint32_t* __restrict__ partitions_inbound_sizes // partitions_inbound_sizes[part] -> number of inbound_pins_per_partitions for 'part' that are not zero => will be incorrect as of here (also including outbounds)
-) {
-    // STYLE: one hedge per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_hedges) return;
-
-    /*
-    * TODO upgrade:
-    * - one hedge per warp -> go over the hedge in // in the warp
-    * - shared memory histogram per hyperedge
-    */
-
-    /*
-    * TODO alternative upgrade:
-    * - one node per warp -> go over touching in // in the warp
-    * - shared memory histogram per partition
-    * => take the code from 'inbound_pins_per_partition_kernel' as of commit 'f803463'
-    */
-
-    const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
-    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
-    uint32_t *my_pins_per_partitions = pins_per_partitions + tid * num_partitions;
-
-    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
-        const uint32_t part = partitions[*curr];
-        const uint32_t prev = atomicAdd(&my_pins_per_partitions[part], 1);
-        if (prev == 0) atomicAdd(&partitions_inbound_sizes[part], 1);
-    }
-}
-
-// generic kernel to pack oversized/sparse CSR-like subarrays, assumes blank entries to be UINT32_MAX
-// SEQUENTIAL COMPLEXITY: n*sub_size
-// PARALLEL OVER: n
-// SHUFFLES OVER: sub_size
-__global__
-void pack_segments(
-    const uint32_t* __restrict__ oversized, // an array of 'num_subs' subarrays, each of size 'sub_size'
-    const dim_t* __restrict__ offsets, // 'offsets[i]' specifies the starting idx in 'out' where to write the packed i-th subarray of 'oversized'
-    const uint32_t num_subs,
-    const dim_t sub_size,
-    uint32_t* __restrict__ out // packed array of subarrays, each of length 'offsets[i+1] - offsets[i]'
-) {
-    // STYLE: one subarray per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_subs) return;
-
-    dim_t out_start_idx = offsets[warp_id];
-    //const uint32_t out_len = (uint32_t)(offsets[warp_id + 1] - offsets[warp_id]);
-    const dim_t in_start_idx = warp_id * sub_size;
-
-    // Process WARP_SIZE items in rounds
-    for (int i = lane_id; i < sub_size; i += WARP_SIZE) {
-        uint32_t v = oversized[in_start_idx + i];
-        int p = (v != UINT32_MAX);
-        unsigned active = __activemask();
-        unsigned mask = __ballot_sync(active, p); // bit set to 1 for every lane not seeing a null value
-
-        int lane_rank = __popc(mask & ((1u << lane_id) - 1u)); // count how many bits were set to 1 before by lanes before me
-        int p_count = __popc(mask); // total number of non-null value seen by the warp
-
-        if (p) out[out_start_idx + lane_rank] = v;
-
-        out_start_idx += p_count;
-    }
-}
-
-// variant of 'pack_segments' that allows for segments of variable size:
-// each segment is assumed to be of length multiple of 'sub_base_size', starting at offset 'oversized_offsets[i]*sub_base_size'
-__global__
-void pack_segments_varsize(
-    const uint32_t* __restrict__ oversized, // an array of 'num_subs' subarrays, each of size 'sub_size'
-    const dim_t* __restrict__ oversized_offsets, // 'oversized_offsets[i]*sub_base_size' specifies the starting idx in 'oversized' of the i-th sparse subarray
-    const dim_t* __restrict__ offsets, // 'offsets[i]' specifies the starting idx in 'out' where to write the packed i-th subarray of 'oversized'
-    const uint32_t num_subs,
-    const dim_t sub_base_size,
-    uint32_t* __restrict__ out // packed array of subarrays, each of length 'offsets[i+1] - offsets[i]'
-) {
-    // STYLE: one subarray per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_subs) return;
-
-    dim_t out_start_idx = offsets[warp_id];
-    //const uint32_t out_len = (uint32_t)(offsets[warp_id + 1] - offsets[warp_id]);
-    const dim_t in_start_idx = sub_base_size * oversized_offsets[warp_id];
-    // TODO: some warps get large subarrays and work more...not balanced!
-    const dim_t sub_size = sub_base_size * (oversized_offsets[warp_id + 1] - oversized_offsets[warp_id]);
-
-    // process WARP_SIZE items in rounds
-    for (int i = lane_id; i < sub_size; i += WARP_SIZE) {
-        uint32_t v = oversized[in_start_idx + i];
-        int p = (v != UINT32_MAX);
-        unsigned active = __activemask();
-        unsigned mask = __ballot_sync(active, p); // bit set to 1 for every lane not seeing a null value
-
-        int lane_rank = __popc(mask & ((1u << lane_id) - 1u)); // count how many bits were set to 1 before by lanes before me
-        int p_count = __popc(mask); // total number of non-null value seen by the warp
-
-        if (p) out[out_start_idx + lane_rank] = v;
-
-        out_start_idx += p_count;
-    }
+    return std::make_tuple(new_touching_size, d_coarse_touching, d_coarse_touching_offsets, d_coarse_inbound_count);
 }

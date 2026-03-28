@@ -1,9 +1,12 @@
 #pragma once
-#include <cfloat>
-#include <cstdint>
-#include <stdint.h>
+#include <cstdio>
+#include <cassert>
+#include <cstdlib>
 
-#include "constants.cuh"
+#include <cuda_runtime.h>
+
+#include "defines.cuh"
+#include "data_types.cuh"
 
 // REMEMBER: "const" means the data pointed to is not modified, not the pointer itself!
 

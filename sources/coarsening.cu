@@ -1,482 +1,283 @@
+#include <tuple>
+#include <set>
+
+#include "thruster.cuh"
+
+#include "runconfig.hpp"
+
+#include "utils.cuh"
+#include "defines.cuh"
+#include "chaining.cuh"
 #include "coarsening.cuh"
 
-// find the best neighbor for each node to stay with (edge-coarsening)
-// SEQUENTIAL COMPLEXITY: n*h*d + n*(# neighbors)*h
-// PARALLEL OVER: n
-// SHUFFLES OVER: h*d (neighbors)
-__global__
-void candidates_kernel(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ srcs_count,
-    const uint32_t* __restrict__ neighbors,
-    const dim_t* __restrict__ neighbors_offsets,
-    const uint32_t* __restrict__ touching,
-    const dim_t* __restrict__ touching_offsets,
-    const uint32_t* __restrict__ inbound_count,
-    const float* __restrict__ hedge_weights,
-    const uint32_t* __restrict__ nodes_sizes,
-    const uint32_t num_nodes,
-    const uint32_t candidates_count,
-    uint32_t* __restrict__ pairs,
-    uint32_t* __restrict__ scores
+void candidatesProposal(
+    const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_srcs_count,
+    const uint32_t *d_neighbors,
+    const dim_t *d_neighbors_offsets,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
+    const uint32_t *d_inbound_count,
+    const float *d_hedge_weights,
+    const uint32_t *d_nodes_sizes,
+    const uint32_t curr_num_nodes,
+    uint32_t *d_pairs,
+    uint32_t *d_u_scores
 ) {
-    // STYLE: one node per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_nodes) return;
-
-    /*
-    * Idea:
-    * - one node per warp
-    * - histogram (one bin per neighbor) in each shared memory
-    * - iterate hyperedges (with caching in shared memory - either passive or automatic) once per histogram part
-    * - warp primitives to both broadcast reads among threads and find the maximum bin
-    *
-    * It is 100% possible for two neighbors of a node to partake, with that node, in the same hedges! And this makes them peer pairing candidates.
-    * => Use fixed point, not floats, because we need associativity to find those peer candidates!
-    * => In case of a tie, deterministically update the best by lower ID! This is the invariant that was lost in the parallel construction of neighborhoods: the order of neighbors!
-    *
-    * This kernel must give a symmetry invariant, if one node sees a candidate with score "s", then that candidate must also see this node as an option with score "s"!
-    */
-
-    /*
-    * Idea, dramatic coarsening speedup:
-    * - we need to keep connections symmetric -> ids-based and permutation-invariant "deterministic_noise"!
-    * - during pairs construction, nudge up or down the hedge’s weight based on a very fast hash of the two node ids involved (order of the node ids must not matter)
-    * 
-    * TODO: simpler/faster hash, e.g. we could sum the node ids and pick the last 4 bits, adding those to the fixed point weight?
-    */
-
-    const uint32_t* my_neighbors = neighbors + neighbors_offsets[warp_id];
-    const uint32_t* not_my_neighbors = neighbors + neighbors_offsets[warp_id + 1];
-    uint32_t neighbors_count = (uint32_t)(neighbors_offsets[warp_id + 1] - neighbors_offsets[warp_id]);
-    extern __shared__ uint32_t histogram[];
-    uint32_t* histogram_node = histogram + 3 * HIST_SIZE * (threadIdx.x / WARP_SIZE);
-    uint32_t* histogram_score = histogram + 3 * HIST_SIZE * (threadIdx.x / WARP_SIZE) + HIST_SIZE;
-    uint32_t* histogram_inbound = histogram + 3 * HIST_SIZE * (threadIdx.x / WARP_SIZE) + 2 * HIST_SIZE;
-
-    const uint32_t* my_touching = touching + touching_offsets[warp_id];
-    const uint32_t my_touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
-    const uint32_t my_inbound_count = inbound_count[warp_id];
-
-    const uint32_t my_size = nodes_sizes[warp_id];
-
-    // all threads in the warp should agree on those...
-    // TODO: only keep these in lane 0!
-    uint32_t best_score[MAX_CANDIDATES];
-    thr_init<uint32_t>(best_score, MAX_CANDIDATES, 0);
-    uint32_t best_neighbor[MAX_CANDIDATES];
-    thr_init<uint32_t>(best_neighbor, MAX_CANDIDATES, UINT32_MAX);
-
-    // handle HIST_SIZE neighbors at a time
-    for (; my_neighbors < not_my_neighbors; my_neighbors += HIST_SIZE) {
-        // load the first HIST_SIZE neighbors and setup per-thread local histograms, each thread reads and prepares a neighbor
-        // TODO: maybe if you have an invalid node, sample another one to fill its place in the histogram?
-        uint32_t inserted = 0;
-        for (uint32_t nb = lane_id; nb < HIST_SIZE; nb += WARP_SIZE) {
-            uint32_t curr_neighbor = UINT32_MAX;
-            if (nb < neighbors_count) {
-                curr_neighbor = my_neighbors[nb];
-                 // skip incompatible neighbors due to size constraints
-                if (my_size + nodes_sizes[curr_neighbor] <= max_nodes_per_part) {
-                    histogram_node[nb] = curr_neighbor;
-                    inserted++;
-                } else
-                    histogram_node[nb] = UINT32_MAX;
-            } else
-                histogram_node[nb] = UINT32_MAX;
-        }
-        // reduce and sync warp after filling histograms
-        inserted = warpReduceSum<uint32_t>(inserted);
-
-        // sort the histogram by node-id to then rely on binary search
-        wrp_bitonic_sort<uint32_t, HIST_SIZE>(histogram_node);
-        __syncwarp();
-
-        // add a little bit of symmetric deterministic noise
-        for (uint32_t nb = lane_id; nb < inserted; nb += WARP_SIZE) {
-            // NOTE: 'inserted' and the sort already ensure that we only see valid histogram entries
-            uint32_t curr_neighbor = histogram_node[nb];
-            histogram_score[nb] = deterministic_noise<DETERMINISTIC_SCORE_NOISE>(curr_neighbor, warp_id);
-            histogram_inbound[nb] = inbound_count[curr_neighbor];
-        }
-
-        // iterate over touching hyperedges
-        // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
-        for (uint32_t hedge_idx = 0u; hedge_idx < my_touching_count; hedge_idx++) {
-            dim_t my_hedge_offset, not_my_hedge_offset;
-            uint32_t my_hedge_weight, my_hedge_src_count;
-            if (lane_id == 0) {
-                const uint32_t actual_hedge_idx = my_touching[hedge_idx];
-                my_hedge_offset = hedges_offsets[actual_hedge_idx];
-                not_my_hedge_offset = hedges_offsets[actual_hedge_idx + 1];
-                my_hedge_weight = (uint32_t)(hedge_weights[actual_hedge_idx]*FIXED_POINT_SCALE);
-                my_hedge_src_count = srcs_count[actual_hedge_idx];
-            }
-            my_hedge_offset = __shfl_sync(0xFFFFFFFF, my_hedge_offset, 0); // each thread in the warp reads one every WARP_SIZE pins
-            not_my_hedge_offset = __shfl_sync(0xFFFFFFFF, not_my_hedge_offset, 0);
-            my_hedge_weight = __shfl_sync(0xFFFFFFFF, my_hedge_weight, 0);
-            my_hedge_src_count = __shfl_sync(0xFFFFFFFF, my_hedge_src_count, 0);
-            const uint32_t* my_hedge = hedges + my_hedge_offset;
-            const dim_t my_hedge_size = not_my_hedge_offset - my_hedge_offset;
-            for (uint32_t i = lane_id; i < my_hedge_size; i += WARP_SIZE) {
-                uint32_t pin = my_hedge[i];
-                // update local histogram
-                const uint32_t hist_idx = binary_search<uint32_t, true>(histogram_node, inserted, pin);
-                // NOTE: no atomic needed => all threads in the warp advance in sync and there are not duplicates in hedges, no two threads will ever write the same bin!
-                if (hist_idx != UINT32_MAX) {
-                    // normalize hedge weight over size
-                    histogram_score[hist_idx] += my_hedge_weight / my_hedge_size;
-                    if (i >= my_hedge_src_count && hedge_idx < my_inbound_count) // the pin is a destination and the hedge is an inbound-to-me one
-                        histogram_inbound[hist_idx]--;
-                }
-            }
-        }
-
-        // warp sync after computing scores
-        __syncwarp();
-
-        // delete candidates that would lead to invalid clusters
-        // and penalize neighbors by your combined size (symmetric)
-        for (uint32_t nb = lane_id; nb < inserted; nb += WARP_SIZE) {
-            if (histogram_inbound[nb] + my_inbound_count > max_inbound_per_part) {
-                histogram_node[nb] = UINT32_MAX;
-                histogram_score[nb] = 0u;
-            } /* else if (histogram_node[nb] != UINT32_MAX) {
-                uint32_t neigh_size = nodes_sizes[histogram_node[nb]];
-                //histogram_score[nb] /= my_size + neigh_size;
-                histogram_score[nb] = (uint32_t)((float)histogram_score[nb] * (1 + 1/(float)(my_size + neigh_size)));
-                //histogram_score[nb] -= min(my_size + neigh_size, DETERMINISTIC_SCORE_NOISE);
-                //if (histogram_score[nb] == 0) histogram_score[nb] = deterministic_noise<DETERMINISTIC_SCORE_NOISE>(histogram_node[nb], warp_id);
-            } */
-        }
-
-        // sort the histogram by lowest score first (empty bins have score = 0), highest id first as a tiebreaker
-        // TODO: maybe replace with a warp-parallel max per candidate iteration below (dunno tho, the max requires a warp-parallel read of the whole histogram)
-        //wrp_bitonic_sort_by_key<uint32_t, uint32_t, HIST_SIZE>(histogram_score, histogram_node);
-        //__syncwarp();
-
-        // extract the global maximum(s)
-        for (int32_t candidate = inserted - 1; candidate >= 0; candidate--) {
-            // warp sync on updated histogram (after removing invalid candidates and after removing the last extracted max)
-            __syncwarp();
-            uint32_t curr_neighbor = UINT32_MAX;
-            uint32_t curr_score = 0u;
-            uint32_t best_hist_idx = 0u;
-            for (uint32_t nb = lane_id; nb < inserted; nb += WARP_SIZE) {
-                const uint32_t nb_neighbor = histogram_node[nb];
-                const uint32_t nb_score = histogram_score[nb];
-                if (nb_score > curr_score || nb_score == curr_score && nb_neighbor > curr_neighbor) { // tie-breaking here too
-                    curr_neighbor = nb_neighbor;
-                    curr_score = nb_score;
-                    best_hist_idx = nb;
-                }
-            }
-            bin<uint32_t> max_neighbor = warpReduceMax<uint32_t>(curr_score, curr_neighbor); // this also tie-breaks
-            if (max_neighbor.payload == curr_neighbor) {
-                histogram_node[best_hist_idx] = UINT32_MAX;
-                histogram_score[best_hist_idx] = 0u;
-            }
-            curr_neighbor = max_neighbor.payload;
-            if (curr_neighbor == UINT32_MAX) break;
-            curr_score = max_neighbor.val;
-            if (curr_score < best_score[candidates_count - 1]) break;
-
-            // get the best 'candidates_count' candidates out of the histogram
-            for (uint32_t i = 0; i < candidates_count; i++) {
-                // tie-breaker: higher id node wins; invariant: partial neighbors order
-                if (curr_score > best_score[i] || curr_score == best_score[i] && curr_neighbor > best_neighbor[i]) {
-                    for (uint32_t j = candidates_count - 1; j > i; j--) {
-                        best_score[j] = best_score[j - 1];
-                        best_neighbor[j] = best_neighbor[j - 1];
-                    }
-                    best_score[i] = curr_score;
-                    best_neighbor[i] = curr_neighbor;
-                    break;
-                }
-            }
-        }
-        
-        neighbors_count -= HIST_SIZE;
-    }
-
-    if (lane_id == 0) {
-        for (uint32_t i = 0; i < candidates_count; i++) {
-            pairs[warp_id * candidates_count + i] = best_neighbor[i];
-            scores[warp_id * candidates_count + i] = best_score[i]; // stay fixed point for now!
-        }
+    // zero-out candidates kernel's outputs
+    CUDA_CHECK(cudaMemset(d_pairs, 0xFF, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count)); // 0xFF -> UINT32_MAX
+    // NOTE: no need to init. "d_u_scores" if we use "d_pairs" to see which locations are valid
+    
+    {
+        // launch configuration - candidates kernel
+        // NOTE: choose threads_per_block multiple of WARP_SIZE
+        int threads_per_block = 128; // 128/32 -> 4 warps per block
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        int num_warps_needed = curr_num_nodes ; // 1 warp per node
+        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+        // compute shared memory per block (bytes)
+        size_t bytes_per_warp = 3 * HIST_SIZE * sizeof(uint32_t);
+        size_t shared_bytes = warps_per_block * bytes_per_warp;
+        // launch - candidates kernel
+        std::cout << "Running candidates kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        candidates_kernel<<<blocks, threads_per_block, shared_bytes>>>(
+            d_hedges,
+            d_hedges_offsets,
+            d_srcs_count,
+            d_neighbors,
+            d_neighbors_offsets,
+            d_touching,
+            d_touching_offsets,
+            d_inbound_count,
+            d_hedge_weights,
+            d_nodes_sizes,
+            curr_num_nodes,
+            cfg.candidates_count,
+            d_pairs,
+            d_u_scores
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 }
 
-// create groups of at most MAX_GROUP_SIZE ( =2 for now ) nodes, highest score first
-// SEQUENTIAL COMPLEXITY: n*log n
-// PARALLEL OVER: n
-__global__
-void grouping_kernel(
-    const uint32_t* __restrict__ pairs, // pairs[idx] is the partner idx wants to be grouped with (UINT32_MAX if undefined)
-    const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be grouped with pairs[idx] (0 if undefined)
-    const uint32_t* __restrict__ nodes_sizes,
-    const uint32_t num_nodes,
-    const uint32_t num_repeats,
-    const uint32_t candidates_count,
-    slot* __restrict__ group_slots, // initialized with -1 on the id
-    dp_score* __restrict__ dp_scores, // dynamic programming alternating scores, initialize to 0s
-    uint32_t* __restrict__ groups // uninitialized, final group id of each node (non-zero based for now)
+void logCandidates(
+    const runconfig cfg,
+    const uint32_t *d_pairs,
+    const uint32_t *d_u_scores,
+    const uint32_t curr_num_nodes
 ) {
-    // SETUP FOR GLOBAL SYNC
-    cg::grid_group grid = cg::this_grid();
-
-    // STYLE: 'num_repeats' node per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t tcount = gridDim.x * blockDim.x;
-
-    /*
-    * Logic: a walk up (and down) the tree for grouping!
-    *
-    * => big HP: by construction, a node will always propose a pair with score equal or higher than that of pairs formulated
-    *            by others towards him. This HP leaves no room for cycles (longer than two - pairs pointing one to the other)!
-    *            The "pairs" build a tree with "roots" that are pairs pointing to each other!
-    * => in practice, this HP needs to be slightly stronger, imposing the same score to never happen twice, except on the same edge...
-    * 
-    * Thus:
-    * - one thread per node, all doing this walk up the tree in parallel
-    * - go to your target, write (atomically) your ID in its group and write your score IIF your score is higher than what is written there
-    * - go to you target's target, write (atomically) your ID in its group and write your target's score IIF it is higher than what is written there
-    * - continue this chain until you reach either a node with no target, or a node pointing back
-    * - synch once every thread finished the walk
-    * - now descend backwards (exactly the same path) where you came from:
-    * - if the node you were on one step back still contained the ID of the current node you are on, lock the pair by writing the same ID in the
-    *   current node (lit. look one step up the ladder and see if you are still connected)
-    * - otherwise, simply continue and you (on the next step) or someone else will lock the current node
-    *
-    * Nice thing: once a thread descended past a node, you are 100% certain that it knows whether that node already has a pair or not, because every
-    *             thread is walking back from the root, and deterministical builds the entire chain required to take all decisions it needs to.
-    *             Thus, if one thread passed "before me", it would have 100% taken the same decisions, so we end up writing the same things!
-    *
-    * Note: if at the end you find a pair pointing one to the other, your root becomes the second node that points back...
-    * => this is a choke for atomic operations of a shit ton of threads that followed the same tree! Trivialize the solution of the root!
-    *
-    * For multiple slots, this can be iterated after deleting the pairs that were already used! Leaving some nodes pointing to "nothing".
-    *
-    * Required invariant: symmetric connectivity and each node always pick the first, strongest connection (ignore hedge direction when selecting pairs)
-    *   => you get a tree with single roots or 2-cycles as roots
-    *
-    * Could the upward walk be done in a single shot, no path required? Yes! But then you'd loose the ability to deterministially walk back and group by score!
-    *
-    * Note: the only true requirement is that each thread starts going backward from a point that is guaranteed to determine its first decision correctly
-    *       (and failing a max gives this, since you know you will never claim the next node, and so do the other stopping conditions for the upward walk,
-    *       the roots). Every decision that follows the first, if the first is correct, is deterministic and identical for all threads!
-    *       This means it is fine for threads to non-deterministically pass through some atomic max and continue if they came first!
-    *       => the downward pass is designed to "wash out" the fact that multiple threads may have climbed past the same node! The fact that some threads
-    *          climbed "too far" and some stopped early wouldn’t change the logical decisions, only how many redundant times those decisions are re-applied.
-    *
-    * Note: the downward walk could be replaced with a second upward walk, no need to track "path", but requires re-reading pairs...
-    */
-
-    /*
-    * Beyond just pairs, true multi-group upgrade:
-    * - use the "id" from the first slot as the final group reference
-    * - going upward, each node has MAX_GROUP_SIZE slots, you claim the first free one or the first one you beat:
-    *   - if you find a free slot, atomically settle there
-    *   - if your "id" is already there, break (someone else "handled you" already) and continue upward
-    *   - if you atomically beat someone, now repeat the process on the next slot, with your candidate becoming the guy you beat (essentially, go down the ladder,
-    *     atomically), if you exceed the MAX_GROUP_SIZE slots, ditch the candidate and break
-    *     => this should be possible with just atomic_max_on_slot while retrieving the previous slot value, keeping slots sorted from highest to lowest score
-    *   - in both above cases, after you wrote your "id" in your target, you attempt to write there also the "id" of the previous node in your path (that is
-    *     the previous node you visited while going upward, that currently points to you) with the method, and repeat for up to MAX_GROUP_SIZE-1 nodes going back
-    *     - optimization to not be exponential in MAX_GROUP_SIZE: nodes before you will always have a score lower than yours, so you can start searching a slot
-    *       for them starting from where you wrote your own "id", and stop (not even continue back in the path) as soon as you finish the available target slots
-    *   - mutual pairs take each other's first slot, then proceed to agree on the MAX_GROUP_SIZE-1 best slots among all of theirs (slots are always sorted, use
-    *     a routine similar to merge-sort's merge), assuming each also received already the MAX_GROUP_SIZE-1 attempts to slot a node from those that lead to it
-    * - going downward:
-    *  - if your entry is still there in your target, start copying all its slot over yours, as to propagate downward the assembled group's information
-    * Important: at the end of this, all nodes of a group must have IDENTICAL slots (all slots), then the minimum id in the slots will be used to tag the group.
-    *
-    * TODO: for now, nodes_sizes is not used, because we assume pairs are already filtered by the candidates kernel, however allowing larger groups requries
-    *       introducing constraint checks here as well...
-    *
-    * Beyond just the first choice:
-    * - let the candidates kernel return the top-k candidates (sorted) for each node, rather thank just pairs
-    * - run grouping like normal (even with multiple slots), but also propagate scores during the downward walk
-    * - synch after finishing the downward walk, then repeat the whole up-and-down with the next set of pairs; as they will all have lower scores, none of such
-    *   pairs will end up overwriting existing pairings (assumption: a grouping pass only creates optimal pairings)
-    *   - immediately return for nodes that already fulfilled their previous pair
-    *
-    * Note: cycles should still be impossible if I lock previous pairs! Otherwise, looking at all "second pairs" would allow for cycles longer than 2!
-    * Note: the global synch means that if a thread returns, the others are deadlocked? Check this! Otherwise just rerurn after the downward path
-    *
-    * Necessity, this is a cooperative kernel, it must be fully instantiated, even if it means each thread must handle multiple nodes:
-    * - multiple nodes per thread (passed as an argument)
-    * - compute the ceiling of how many nodes each simultaneously loaded thread would need to handle, from that infer back the exact number of threads,
-    *   and run them, each thread repeats the upward and downward walk once for every node it was assigned
-    * - the effective PATH_SIZE available to nodes is thus reduced by the number of nodes per thread, but luckly at the beginning, when there are many nodes,
-    *   paths are also at their shortest...
-    * 
-    * From a greedy technique, to a true maximum matching!
-    * Exact maximum weighted matching with dynamic programming:
-    * - accumulate the score "w/out" on your target
-    * - update your next (that of the previous target) score "with" to your score plus the accumulated "w/out" from your children
-    * - update your next score "w/out" to "with" the accumulated "w/out" from your children, minus the w/out of the children holding the max / slot (may not be "you"), plus the same children's "with" score
-    * => we need to track / accumulate both "with" and "w/out" scores per node as we go up...
-    * - the last thread going up the path, as before sees and consolidate the right sums (no early break now)
-    * => now each node is claimed by the one such that, if the match is formed, the resulting subtree hash maximum score, accumulating alternating tree costs up through each branch, until the root
-    * 
-    * TODO: let only threads on leaves do the walks...
-    */
-
-    int32_t path_length[MAX_REPEATS];
-    uint32_t path[PATH_SIZE];
-    const uint32_t actual_path_size = PATH_SIZE / num_repeats;
-    uint32_t completed_repeats = 0u;
-
-    for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
-        const uint32_t curr_tid = tid + repeat * tcount;
-        // initialize yourself to a one-node group, unless someone already claimed you
-        if (curr_tid < num_nodes) atomicCAS(&reinterpret_cast<unsigned long long*>(group_slots)[curr_tid*MAX_GROUP_SIZE], pack_slot(0u, UINT32_MAX), pack_slot(0u, curr_tid));
-    }
-
-    for (uint32_t i = 0; i < candidates_count; i++) {
-        // repeat for every node that you need to handle
-        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
-            const uint32_t curr_tid = tid + repeat * tcount;
-
-            // if you are not a valid node
-            if (curr_tid >= num_nodes) break;
-            // if you formed a pair, stop
-            if (completed_repeats & (1u << repeat)) continue;
-
-            uint32_t* curr_path = path + actual_path_size * repeat;
-            int32_t curr_path_length = 0;
-
-            uint32_t current = curr_tid; // current node in the tree of pairs
-            uint32_t target = pairs[curr_tid * candidates_count + i]; // target node of "current"
-            // total score in the traversed subtree assuming the current node will be paired with its targed
-            // initialized to the value with which "current" points to "target"
-            uint32_t score_with = scores[curr_tid * candidates_count + i];
-            // total score in the traversed subtree assuming the current node will NOT be paired with its targed
-            uint32_t score_wout = 0u;
-
-            // go up the tree
-            bool outcome = false;
-            if (target != UINT32_MAX) {
-                outcome = true;
-                uint32_t target_target = pairs[target * candidates_count + i]; // target node of "target"
-                while (current != target_target || current > target) { // break the two-cycle, always go up to the node of lowest id in the root pair
-                    const uint32_t prev_target_score_wout_sum = atomicAdd(&dp_scores[target].with, score_wout); // dp_scores[...].with contains the sum of childrens' wouts!
-                    const uint32_t target_score_wout_sum = prev_target_score_wout_sum + score_wout;
-                    slot prev_slot;
-                    // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
-                    outcome = atomic_max_on_slot_ret(group_slots, target, current, score_with - score_wout, prev_slot); // atomic are done with the GAIN from the wout->with transition, wins the subtree with the highest gain if given the target
-                    if (prev_slot.score == UINT32_MAX) break; // alternative root: a node locked in a previous round
-                    //const uint32_t holder_id = outcome ? current : prev_slot.id;
-                    const uint32_t holder_with_minus_wout = outcome ? score_with - score_wout : prev_slot.score;
-                    // DEBUG: prevent cycles longer than 2!
-                    /*bool die = false;
-                    for (uint32_t j = 0; j < curr_path_length; j++) {
-                        if (curr_path[j] == target) {
-                            die = true;
-                            printf("Broke cycle between %d -> %d!\n", current, target);
-                            break;
-                        }
-                    }
-                    if (die) break;*/
-                    assert(curr_path_length < actual_path_size);
-                    curr_path[curr_path_length++] = target;
-                    current = target;
-                    target = target_target;
-                    if (target == UINT32_MAX) break; // alternative root: a node with no target
-                    target_target = pairs[target_target * candidates_count + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
-                    score_wout = target_score_wout_sum + /* + with[holder] - wout[holder] */ holder_with_minus_wout; // if the next node up the tree won't get paired, then his score is that of the best children's "with", and the other "w/out"
-                    score_with = target_score_wout_sum + scores[current * candidates_count + i]; // if the next node up the tree will get paired, then his score is his own candidate score, and all children's "w/out"
-                }
-                // no need to handle root pair, since we already broke the pair and made the lower-id node the sole root
-                // => the result does not change, since the lower-id node will be contended between the gains of the two subtrees
-                // handle "root(s)" as a pair of nodes pointing to each other from the POV of the lower-id node of the two
-                //if (current == target_target && current < target) {
-                    // tie back to your target (other root node) iff there is more to gain
-                    //const uint32_t with_sum = score_with + atomicAdd(&dp_scores[target].with, 0); // sum of the two roots' with dp_score and their score
-                    //const uint32_t holder_with_minus_wout = get_slot(group_slots, target).score;
-                    //const uint32_t wout_sum = score_wout + atomicAdd(&dp_scores[target].with, 0) + holder_with_minus_wout; // sum of the two root's wout dp_scores
-                    //if (with_sum > wout_sum) ...
-                //}
+    std::vector<uint32_t> pairs_tmp(curr_num_nodes * cfg.candidates_count);
+    std::vector<uint32_t> scores_tmp(curr_num_nodes * cfg.candidates_count);
+    std::vector<std::set<uint32_t>> candidates_count(cfg.candidates_count);
+    CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_u_scores, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
+    std::cout << "Pairing results:";
+    for (uint32_t i = 0; i < curr_num_nodes; ++i) {
+        if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH))
+            std::cout << "\n  node " << i << " ->";
+        for (uint32_t j = 0; j < cfg.candidates_count; ++j) {
+            float score = ((float)scores_tmp[i * cfg.candidates_count + j])/FIXED_POINT_SCALE;
+            uint32_t target = pairs_tmp[i * cfg.candidates_count + j];
+            candidates_count[j].insert(target);
+            if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
+                if (target == UINT32_MAX) std::cout << " (" << j << " target=none score=none)";
+                else if (target == i) std::cout << " !!SELF TARGETED!! ";
+                else std::cout << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ")";
             }
-
-            path_length[repeat] = curr_path_length;
+            if (target == UINT32_MAX) continue;
+            // check the symmetry invariant: mutual pairs or the other has found a higher score pair (or one with lower id - tiebreaker) [easy for j = 0, for j > 0 check first that the target wasn't already used at a lower j]
+            if (pairs_tmp[target * cfg.candidates_count + j] != i && pairs_tmp[target * cfg.candidates_count + j] != UINT32_MAX && std::find(pairs_tmp.begin() + target * cfg.candidates_count, pairs_tmp.begin() + target * cfg.candidates_count + j, i) == pairs_tmp.begin() + target * cfg.candidates_count + j && !(scores_tmp[target * cfg.candidates_count + j] > score || scores_tmp[target * cfg.candidates_count + j] == score && pairs_tmp[target * cfg.candidates_count + j] < i))
+                std::cerr << "\n  WARNING, symmetry violated: node " << i << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ") AND node " << target << " (" << j << " target=" << pairs_tmp[target * cfg.candidates_count + j] << " score=" << std::fixed << std::setprecision(3) << scores_tmp[target * cfg.candidates_count + j] << ") !!";
         }
+    }
+    std::cout << "\n";
+    for (uint32_t j = 0; j < cfg.candidates_count; ++j)
+        std::cout << "Candidates count (" << j << "): " << candidates_count[j].size() << "\n";
+}
 
-        // global synch
-        grid.sync();
+std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
+    const runconfig cfg,
+    const cudaDeviceProp props,
+    const uint32_t *d_inbound_count,
+    const uint32_t *d_pairs,
+    const uint32_t *d_u_scores,
+    const uint32_t *d_nodes_sizes,
+    const uint32_t curr_num_nodes,
+    const uint32_t h_max_nodes_per_part,
+    const uint32_t h_max_inbound_per_part,
+    slot *d_slots,
+    dp_score *d_dp_scores
+) {
+    // zero-out grouping kernel's outputs
+    slot init_slot; init_slot.id = UINT32_MAX; init_slot.score = 0u;
+    thrust::device_ptr<slot> d_slots_ptr(d_slots);
+    thrust::fill(d_slots_ptr, d_slots_ptr + curr_num_nodes, init_slot); // upper 32 bits to 0x00, lower 32 to 0xFF
+    CUDA_CHECK(cudaMemset(d_dp_scores, 0x00, curr_num_nodes * sizeof(dp_score)));
+    
+    // prepare this level's coarsening groups
+    uint32_t *d_groups = nullptr; // groups[node idx] -> node's group id (zero-based)
+    CUDA_CHECK(cudaMalloc(&d_groups, curr_num_nodes * sizeof(uint32_t)));
 
-        // repeat for every node that you need to handle
-        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
-            const uint32_t curr_tid = tid + repeat * tcount;
-
-            // if you are not a valid node
-            if (curr_tid >= num_nodes) break;
-            // if you formed a pair, stop
-            if (completed_repeats & (1u << repeat)) continue;
-
-            uint32_t* curr_path = path + actual_path_size * repeat;
-            int32_t curr_path_length = path_length[repeat];
-            path_length[repeat] = 0;
-
-            // go down the tree
-            // it the root had no target, path[path_length - 1] is the root, if the root was a mutual-poiting pair, path[path_length - 1] is the first encountered node of the pair
-            uint32_t current, target;
-            for (curr_path_length = curr_path_length - 2; curr_path_length >= 0; curr_path_length--) {
-                // NOTE: on the first iteration, coming from the upward walk, "current" is the last node that got its slot updated
-                target = curr_path[curr_path_length + 1]; // this is "who current would have liked to be with", the node one step back up the ladder towards root
-                current = curr_path[curr_path_length];
-                if (group_slots[target].id == current) {
-                    // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine
-                    group_slots[current].id = current;
-                    // NOTE: lock groups by setting scores to the maximum
-                    group_slots[current].score = UINT32_MAX;
-                    group_slots[target].score = UINT32_MAX;
-                    // NOTE: after a successful link the next node down the path has already lost its target, so we might as well skip it
-                    curr_path_length--;
-                }
-            }
-            // the path did not include the "curr_tid" node, handle it here iff you did not happen to group path[0] with path[1] during the last iteration above (leading to path_length == -2)
-            if (curr_path_length == -1) {
-                target = curr_path[0];
-                current = curr_tid;
-                if (group_slots[target].id == current) {
-                    group_slots[current].id = current;
-                    // lock groups by setting scores to the maximum
-                    group_slots[current].score = UINT32_MAX;
-                    group_slots[target].score = UINT32_MAX;
-                }
+    // launch configuration - grouping kernel
+    {
+        int threads_per_block = 256;
+        int num_threads_needed = curr_num_nodes; // 1 thread per node
+        int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+        size_t bytes_per_thread = 0; //TODO
+        size_t shared_bytes = threads_per_block * bytes_per_thread;
+        // additional checks for the cooperative kernel mode
+        int blocks_per_SM = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_SM, grouping_kernel, threads_per_block, shared_bytes);
+        int max_blocks = blocks_per_SM * props.multiProcessorCount;
+        uint32_t num_repeats = 1;
+        if (blocks > max_blocks) {
+            num_repeats = (blocks + max_blocks - 1) / max_blocks;
+            std::cout << "NOTE: grouping kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
+            blocks = (blocks + num_repeats - 1) / num_repeats;
+            if (num_repeats > MAX_REPEATS) {
+                std::cout << "ABORTING: grouping kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_REPEATS << " !!\n";
+                abort();
             }
         }
-        
-        // global synch
-        grid.sync();
+        // launch - grouping kernel
+        std::cout << "Running grouping kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        void *kernel_args[] = {
+            (void*)&d_pairs,
+            (void*)&d_u_scores,
+            (void*)&d_nodes_sizes,
+            (void*)&curr_num_nodes,
+            (void*)&num_repeats,
+            (void*)&cfg.candidates_count,
+            (void*)&d_slots,
+            (void*)&d_dp_scores,
+            (void*)&d_groups
+        };
+        cudaLaunchCooperativeKernel((void*)grouping_kernel, blocks, threads_per_block, kernel_args, shared_bytes);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 
-        // anyone not yet selected (score != UINT32_MAX), set your score to 0 to enable the next pairing round, then sync again and continue
-        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
-            const uint32_t curr_tid = tid + repeat * tcount;
-            if (curr_tid >= num_nodes) break;
-            // if you formed a pair, stop
-            if (completed_repeats & (1u << repeat)) continue;
-            if (group_slots[curr_tid].score == UINT32_MAX) {
-                completed_repeats |= (1u << repeat);
-                continue;
+    // for nodes that have no candidate and are left alone (no -valid- neighbors), try to pair them up with each other as to create as many groups as possible
+    // => impose the sum of sizes and the sum of inbound set sizes < constraints
+    // => the idea is to try pairs among non-neighbors, therefore the inbound set size intersection can already be taken as empty (hence, sum set sizes)
+    build_orphan_pairs(
+        d_nodes_sizes,
+        d_inbound_count,
+        d_pairs,
+        curr_num_nodes,
+        h_max_nodes_per_part,
+        h_max_inbound_per_part,
+        cfg.candidates_count,
+        d_groups
+    );
+
+    // prepare uncoarsening map (node ids sorted by group id)
+    uint32_t *d_ungroups = nullptr; // ungroups[ungroups_offsets[group id] + i] -> the group's i-th node (its original idx)
+    CUDA_CHECK(cudaMalloc(&d_ungroups, curr_num_nodes * sizeof(uint32_t)));
+
+    // order groups kernel (parallel label compression)
+    // as of now "d_groups" contains the new non-zero-based group id for every node
+    thrust::device_ptr<uint32_t> t_nodes(d_ungroups);
+    thrust::sequence(t_nodes, t_nodes + curr_num_nodes);
+    // sort by groups, carrying node indices (represented by the sequence) along; after d_groups is sorted, t_nodes tells where each sorted element came from
+    thrust::device_ptr<uint32_t> t_groups(d_groups);
+    thrust::sort_by_key(t_groups, t_groups + curr_num_nodes, t_nodes); // sort groups and carry indices along for a ride
+    // build "head of group flags": 1 at first occurrence of each group in the sorted array, 0 otherwise ( flags[i] = 1 if i == 0 or d_groups[i] != d_groups[i-1] )
+    thrust::device_vector<uint32_t> t_headflags(curr_num_nodes);
+    // the first element is part of groups zero (the initial default)
+    t_headflags[0] = 0;
+    thrust::transform(t_groups + 1, t_groups + curr_num_nodes, t_groups, t_headflags.begin() + 1, [] __device__ (uint32_t curr, uint32_t prev) { return curr != prev ? 1u : 0u; });
+    // the prefix sum of head flags gives the new group id per element (w.r.t. the sorted order) ( new_id[i] = number of heads before position i )
+    thrust::inclusive_scan(t_headflags.begin(), t_headflags.end(), t_headflags.begin()); // in-place
+    // the last flag, after the scan, gives you the total number of distinct groups
+    const uint32_t new_num_nodes = t_headflags.back() + 1;
+    // ======================================
+    // prepare this level's cumulative groups sizes
+    // NOTE: "node sizes" = size of the nodes that entered this level, "group sizes" = cumulative size of groups constructed on this level
+    uint32_t *d_groups_sizes = nullptr; // group_sizes[group id] = sum of sizes of all nodes in that group
+    CUDA_CHECK(cudaMalloc(&d_groups_sizes, new_num_nodes * sizeof(uint32_t)));
+    // extra step: compute cumulative group sizes
+    thrust::device_ptr<uint32_t> t_groups_sizes(d_groups_sizes);
+    thrust::device_ptr<const uint32_t> t_nodes_sizes(d_nodes_sizes);
+    // premute node sizes in "sorted-by-group" order, using indices that already reflect such ordering ( t_nodes[i] tells which original idx got sorted in position i )
+    auto nodes_sizes_values_begin = thrust::make_permutation_iterator(t_nodes_sizes, t_nodes);
+    // reduce (sum) nodes_sizes inside each group (group = key, marked by having the same headflag, that by now corresponds to the zero-based group id) ( headflags[i] is the new group ID for sorted position i )
+    thrust::reduce_by_key(t_headflags.begin(), t_headflags.end(), nodes_sizes_values_begin, thrust::make_discard_iterator(), t_groups_sizes);
+    // => now "d_groups_sizes[idx]" holds the sum of nodes_size over all nodes in group idx, for idx in [0, new_num_nodes)
+    // ======================================
+    // scatter the new ids back to original positions using the sequence; for sorted position i, original index is t_nodes[i]; we want: d_groups[t_nodes[i]] = t_headflags[i]
+    thrust::scatter(t_headflags.begin(), t_headflags.end(), t_nodes, t_groups);
+    // if the number of groups has reached the required threshold, they become the partitions
+    // => now "d_groups[idx]" contains the new zero-based group ID for every node
+
+    // prepare uncoarsening map offsets (offset where each ungroup starts)
+    dim_t *d_ungroups_offsets = nullptr; // ungroups_offsets[node idx] -> node's group id (zero-based)
+    CUDA_CHECK(cudaMalloc(&d_ungroups_offsets, (1 + new_num_nodes) * sizeof(dim_t)));
+    
+    // build reverse multifunction from groups to their original nodes
+    // from above, t_nodes is the list of node idxs sorted by their group id, hence, the reverse list is simply t_nodes, we just need to compute the offsets to reach, from each group id, its original nodes
+    thrust::device_ptr<dim_t> t_ungroups_offsets(d_ungroups_offsets);
+    // predicate to detect group starts: is_group_start(i) = (i == 0) || (headflags[i] != headflags[i-1])
+    auto is_group_start = [heads = t_headflags.begin()] __device__ (uint32_t i) { return (i == 0) || (heads[i] != heads[i - 1]); };
+    // counting iterator over sorted positions
+    auto t_iter_begin = thrust::make_counting_iterator<uint32_t>(0);
+    auto t_iter_end = thrust::make_counting_iterator<uint32_t>(curr_num_nodes);
+    // copy positions of (only) group starts directly into ungroups_offsets
+    thrust::copy_if(t_iter_begin, t_iter_end, t_iter_begin, t_ungroups_offsets, is_group_start);
+    // append the (curr_num_nodes + 1)-th value
+    dim_t dim_t_curr_num_nodes = (dim_t)curr_num_nodes;
+    CUDA_CHECK(cudaMemcpy(d_ungroups_offsets + new_num_nodes, &dim_t_curr_num_nodes, sizeof(dim_t), cudaMemcpyHostToDevice));
+
+    return std::make_tuple(new_num_nodes, d_groups, d_groups_sizes, d_ungroups, d_ungroups_offsets);
+}
+
+void logGroups(
+    const runconfig cfg,
+    const uint32_t *d_pairs,
+    const uint32_t *d_groups,
+    const uint32_t *d_groups_sizes,
+    const uint32_t curr_num_nodes,
+    const uint32_t new_num_nodes,
+    const uint32_t h_max_nodes_per_part
+) {
+    std::vector<uint32_t> pairs_tmp(curr_num_nodes * cfg.candidates_count);
+    std::vector<uint32_t> groups_tmp(curr_num_nodes);
+    std::vector<uint32_t> groups_sizes_tmp(new_num_nodes);
+    CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(groups_tmp.data(), d_groups, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(groups_sizes_tmp.data(), d_groups_sizes, new_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    std::unordered_map<uint32_t, int> groups_count;
+    std::cout << "Grouping results:\n";
+    for (uint32_t i = 0; i < curr_num_nodes; ++i) {
+        uint32_t group = groups_tmp[i];
+        uint32_t group_size = groups_sizes_tmp[group];
+        groups_count[group]++;
+        if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
+            std::cout << "  node " << i << " ->";
+            for (uint32_t j = 0; j < cfg.candidates_count; ++j) {
+                uint32_t target = pairs_tmp[i * cfg.candidates_count + j];
+                if (target == UINT32_MAX) std::cout << " (" << j << " target=none)";
+                else std::cout << " (" << j << " target=" << target << ")";
             }
-            group_slots[curr_tid].score = 0;
-            dp_scores[curr_tid] = (dp_score){ 0u, 0u };
+            std::cout << " group=" << group << " group_size=" << group_size << "\n";
         }
-
-        // global synch
-        grid.sync();
     }
-
-    // write inside "groups" the minimum id among each node's slots, used to identify its group, eventually, zero-base those ids
-    for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
-        const uint32_t curr_tid = tid + repeat * tcount;
-        if (curr_tid >= num_nodes) break;
-        groups[curr_tid] = group_slots[curr_tid].id;
+    long long max_gs = 0, sum_gs = 0;
+    for (uint32_t i = 0; i < new_num_nodes; ++i) {
+        uint32_t group_size = groups_sizes_tmp[i];
+        sum_gs += group_size;
+        if (group_size > max_gs) max_gs = group_size;
+        if (group_size > h_max_nodes_per_part)
+            std::cerr << "  WARNING, max group size constraint (" << h_max_nodes_per_part << ") violated by group=" << i << " with group_size=" << group_size << " !!\n";
     }
+    long long max_cgs = 0, sum_cgs = 0;
+    for (const auto& [group, count] : groups_count) {
+        sum_cgs += count;
+        if (count > max_cgs) max_cgs = count;
+    }
+    std::cout << "Groups count: " << groups_count.size() << "\n  Max coarse group size: " << max_cgs << ", Avg coarse group size: " << std::fixed << std::setprecision(2) << (float)sum_cgs/groups_count.size() << "\n";
+    std::cout << "  Max nodes group size: " << max_gs << ", Avg nodes group size: " << std::fixed << std::setprecision(2) << (float)sum_gs/groups_count.size() << "\n";
 }

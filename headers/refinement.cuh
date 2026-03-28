@@ -1,10 +1,54 @@
 #pragma once
-#include <cuda_runtime.h>
-#include <cooperative_groups.h>
-#include <stdint.h>
+#include <cstdint>
 
-#include "utils.cuh"
-#include "constants.cuh"
+#include <cuda_runtime.h>
+
+#include "defines.cuh"
+#include "data_types.cuh"
+
+struct runconfig;
+
+
+// USED BY: fm refinement kernel
+
+#define PART_HIST_SIZE 64u // best if it is a multiple of WARP_SIZE, best if partitions_per_thread * WARP_SIZE <= num_partitions
+
+
+// STEPS
+
+void refinementRepeats(
+    const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_srcs_count,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
+    const uint32_t *d_inbound_count,
+    const float *d_hedge_weights,
+    const uint32_t *d_nodes_sizes,
+    const uint32_t level_idx,
+    const uint32_t curr_num_nodes,
+    const uint32_t num_hedges,
+    const uint32_t num_partitions,
+    const dim_t touching_size,
+    uint32_t *d_pairs,
+    float *d_f_scores,
+    uint32_t *d_partitions,
+    uint32_t *d_partitions_sizes,
+    uint32_t *d_pins_per_partitions,
+    uint32_t *d_partitions_inbound_sizes
+);
+
+void logPartitions(
+    const uint32_t *d_partitions,
+    const uint32_t *d_partitions_sizes,
+    const uint32_t curr_num_nodes,
+    const uint32_t num_partitions,
+    const uint32_t h_max_nodes_per_part
+);
+
+
+// KERNELS
 
 __global__
 void pins_per_partition_kernel(

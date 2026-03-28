@@ -1,4 +1,12 @@
+#include <algorithm>
+
+#include "thruster.cuh"
+
 #include "chaining.cuh"
+
+#include "utils.cuh"
+#include "constants.cuh"
+
 
 // ================================================================
 // Device helpers
@@ -60,7 +68,7 @@ void build_src_keys(
 //   next[i] : chosen successor edge index (or UINT32_MAX)
 //   prev[j] : chosen predecessor edge index (or UINT32_MAX)
 //
-// each iteration proposes a successor for edges that don't yet have next
+// each iteration proposes a successor for edges that don't yet have next, searching up to "window" candidates
 // candidates are from outgoing list of dst[i] (i.e. edges whose src == dst[i]), preferring high weight and similar node size / inbound set size
 // conflicts are resolved so each successor has at most one predecessor
 __global__
@@ -74,7 +82,7 @@ void propose_successor(
     const int* out_end,
     const uint32_t* prev, // availability of candidate successor (prev[cand] == UINT32_MAX)
     const uint32_t* next, // only propose if next[i] == UINT32_MAX
-    int K,
+    int window,
     float alpha,
     uint32_t* succ_choice,
     float* succ_score
@@ -102,7 +110,7 @@ void propose_successor(
     float best = -1e30f;
     uint32_t best_j = UINT32_MAX;
 
-    int limit = b + K;
+    int limit = b + window;
     if (limit > e) limit = e;
 
     for (int j = b; j < limit; ++j) {
@@ -285,12 +293,6 @@ void chaining(
     const int threads = 256;
     const int blocks = (n + threads - 1) / threads;
 
-    // parameters:
-    const int iters = 4; // multi-iteration greedy chaining
-    const int K = 256; // candidates scanned per node per iteration
-    const float alpha = 1e-6f; // node size penalty scale (adjust based on size magnitude)
-    //const float beta = 1e-7f; // inbound set size penalty scale (adjust based on inbound set size magnitude)
-
     auto exec = thrust::cuda::par.on(stream);
 
     // copy input device arrays into vectors so we can sort/reorder
@@ -338,7 +340,7 @@ void chaining(
     thrust::device_vector<uint32_t> d_best_pred(n);
 
     // multi-iteration greedy build
-    for (int it = 0; it < iters; ++it) {
+    for (int it = 0; it < ITERS; ++it) {
         thrust::fill(exec, d_best_score.begin(), d_best_score.end(), -1e30f);
         CUDA_CHECK(cudaMemsetAsync(thrust::raw_pointer_cast(d_best_pred.data()), 0xFF, n * sizeof(uint32_t), stream)); // init to UINT32_MAX
 
@@ -352,7 +354,7 @@ void chaining(
             thrust::raw_pointer_cast(d_out_end.data()),
             thrust::raw_pointer_cast(d_prev.data()),
             thrust::raw_pointer_cast(d_next.data()),
-            K, alpha,
+            WINDOW, ALPHA,
             thrust::raw_pointer_cast(d_succ_choice.data()),
             thrust::raw_pointer_cast(d_succ_score.data())
         );

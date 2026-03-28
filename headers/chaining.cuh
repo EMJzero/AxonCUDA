@@ -1,25 +1,17 @@
 #pragma once
-#include <stdint.h>
-#include <algorithm>
-
 #include <cuda_runtime.h>
 
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
-#include <thrust/sort.h>
-#include <thrust/sequence.h>
-#include <thrust/iterator/zip_iterator.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/tuple.h>
-#include <thrust/gather.h>
-#include <thrust/scatter.h>
-#include <thrust/reduce.h>
-#include <thrust/transform.h>
-#include <thrust/binary_search.h>
-#include <thrust/copy.h>
-#include <thrust/functional.h>
+#include "defines.cuh"
+#include "data_types.cuh"
 
-#include "utils.cuh"
+
+// USED BY: chaining
+
+#define ITERS 4 // multi-iteration greedy chaining
+#define WINDOW 256 // candidates scanned per node per iteration
+#define ALPHA 1e-6f // node size penalty scale (adjust based on size magnitude)
+//#define BETA 1e-7f // inbound set size penalty scale (adjust based on inbound set size magnitude)
+
 
 void chaining(
     const uint32_t *srcs,

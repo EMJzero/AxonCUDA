@@ -1,45 +1,12 @@
 #pragma once
-#include <map>
-#include <tuple>
-#include <vector>
-#include <string>
-#include <random>
-#include <chrono>
-#include <format>
-#include <cstdint>
-#include <cstdlib>
-#include <numeric>
-#include <iomanip>
-#include <fstream>
-#include <iostream>
-#include <optional>
-#include <algorithm>
-#include <filesystem>
-#include <unordered_map>
-
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
-#include <thrust/sort.h>
-#include <thrust/scan.h>
-#include <thrust/reduce.h>
-#include <thrust/gather.h>
-#include <thrust/scatter.h>
-#include <thrust/sequence.h>
-#include <thrust/transform.h>
-#include <thrust/device_ptr.h>
-#include <thrust/device_vector.h>
-#include <thrust/iterator/discard_iterator.h>
-#include <thrust/iterator/permutation_iterator.h>
+#include "defines.cuh"
+#include "data_types.cuh"
 
-#include <cub/cub.cuh>
 
-#include <omp.h>
-
-#include "utils.cuh"
-#include "constants.cuh"
-#include "refinement.cuh"
-#include "chaining.cuh"
+// USED BY: initial part
 
 #define VERBOSE_INIT false
 #define VERBOSE_INIT_LOG false
@@ -53,7 +20,8 @@
 #define FM_TRIES 64 // number of FM refinement rounds per initial partition to perform
 #define REPAIR_SPEED 1 // by how much to recover size constraints violations per repair repetition
 
-#define MAX_THREADS 16
+#define MAX_OMP_THREADS 16
+
 
 std::tuple<uint32_t*, uint32_t*> initial_partitioning(
     const uint32_t num_nodes,

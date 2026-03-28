@@ -1,10 +1,77 @@
 #pragma once
-#include <cuda_runtime.h>
-#include <cooperative_groups.h>
-#include <stdint.h>
+#include <tuple>
+#include <cstdint>
 
-#include "utils.cuh"
-#include "constants.cuh"
+#include <cuda_runtime.h>
+
+#include "data_types.cuh"
+
+struct runconfig;
+
+
+// USED BY: neighborhoods kernel
+
+#define SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
+#define GM_MIN_BLOCK_DEDUPE_BUFFER_SIZE 256u
+
+
+// USED BY: coarsening routines (all, touching, hedges, and neighbors)
+
+#define MAX_SM_WARP_DEDUPE_BUFFER_SIZE 3072u // the A100 has 48KB of SM, this is (48KB/4B of uint32s)/4 warps per block
+#define MIN_GM_WARP_DEDUPE_BUFFER_SIZE 256u // just for safety, interplays with 'MAX_HASH_PROBE_LENGTH' and 'OVERSIZED_SIZE_MULTIPLIER'
+
+
+// STEPS
+
+std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
+    const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
+    const uint32_t num_nodes,
+    const uint32_t max_neighbors,
+    uint32_t *d_neighbors,
+    dim_t *d_neighbors_offsets
+);
+
+std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
+    const runconfig cfg,
+    const uint32_t *d_groups,
+    const uint32_t *d_ungroups,
+    const dim_t *d_ungroups_offsets,
+    const uint32_t curr_num_nodes,
+    const uint32_t new_num_nodes,
+    const uint32_t max_neighbors,
+    uint32_t *d_neighbors,
+    dim_t *d_neighbors_offsets
+);
+
+std::tuple<dim_t, dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
+    const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_srcs_count,
+    const uint32_t *d_groups,
+    const uint32_t num_hedges,
+    const uint32_t max_hedge_size
+);
+
+std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
+    const runconfig cfg,
+    const uint32_t *d_coarse_hedges,
+    const dim_t *d_coarse_hedges_offsets,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
+    const uint32_t *d_inbound_count,
+    const uint32_t *d_ungroups,
+    const dim_t *d_ungroups_offsets,
+    const uint32_t new_num_nodes,
+    const uint32_t num_hedges
+);
+
+
+// KERNELS
 
 __global__
 void neighborhoods_count_kernel(

@@ -3,7 +3,7 @@
 # ==========================================
 TARGET      := hgraph_gpu.exe
 
-SRC_DIR     := sources
+SRC_DIRS    := sources kernels
 HDR_DIR     := headers
 INC_DIR     := includes
 BUILD_DIR   := build
@@ -13,23 +13,22 @@ NVCC        := nvcc
 ARCH        := native
 
 CXXFLAGS    := -O3 --std=c++20 -Wall -Wextra -fopenmp -I$(HDR_DIR) -I$(INC_DIR)
-NVCCFLAGS   := -O3 --std=c++20 -arch=$(ARCH) -dc -allow-unsupported-compiler --extended-lambda \
+NVCCFLAGS   := -O3 --std=c++20 -arch=$(ARCH) -dc -dlto -allow-unsupported-compiler --extended-lambda \
                -Xcompiler "-Wall -Wextra -Wno-maybe-uninitialized -Wno-unused-function -fopenmp" \
                -I $(HDR_DIR) -I $(INC_DIR)
-LINKFLAGS   := --std=c++20 -arch=$(ARCH) -allow-unsupported-compiler --extended-lambda -lgomp
+LINKFLAGS   := --std=c++20 -arch=$(ARCH) -dlto -allow-unsupported-compiler --extended-lambda -lgomp
 
 # ==========================================
 # Source discovery
 # ==========================================
-SRC_CPPS    := $(wildcard $(SRC_DIR)/*.cpp)
-SRC_CUS     := $(wildcard $(SRC_DIR)/*.cu)
+SRC_CPPS    := $(foreach dir,$(SRC_DIRS),$(wildcard $(dir)/*.cpp))
+SRC_CUS     := $(foreach dir,$(SRC_DIRS),$(wildcard $(dir)/*.cu))
+SRCS        := $(SRC_CPPS) $(SRC_CUS)
 
-OBJ_CPPS    := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(SRC_CPPS))
-OBJ_CUS     := $(patsubst $(SRC_DIR)/%.cu,$(BUILD_DIR)/%.o,$(SRC_CUS))
-OBJS        := $(OBJ_CPPS) $(OBJ_CUS)
+OBJS        := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SRC_CPPS))
+OBJS        += $(patsubst %.cu,$(BUILD_DIR)/%.o,$(SRC_CUS))
 
 DEPS        := $(OBJS:.o=.d)
-
 # ==========================================
 # Build rules
 # ==========================================
@@ -41,10 +40,14 @@ $(TARGET): $(OBJS)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
+# C++ sources
+$(BUILD_DIR)/%.o: %.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cu | $(BUILD_DIR)
+# CUDA sources
+$(BUILD_DIR)/%.o: %.cu | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -MMD -MP -c $< -o $@
 
 -include $(DEPS)

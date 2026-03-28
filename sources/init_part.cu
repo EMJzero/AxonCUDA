@@ -1,4 +1,34 @@
+#include <map>
+#include <tuple>
+#include <vector>
+#include <string>
+#include <random>
+#include <chrono>
+#include <format>
+#include <cstdint>
+#include <cstdlib>
+#include <numeric>
+#include <iomanip>
+#include <fstream>
+#include <iostream>
+#include <optional>
+#include <algorithm>
+#include <filesystem>
+#include <unordered_map>
+
+#include "thruster.cuh"
+
+#include <cub/cub.cuh>
+
+#include <omp.h>
+
 #include "init_part.cuh"
+
+#include "utils.cuh"
+#include "constants.cuh"
+#include "refinement.cuh"
+#include "chaining.cuh"
+
 
 // for each node, randomly assign it to the first partition that still has space
 // SEQUENTIAL COMPLEXITY: n*p (worst case linear scan)
@@ -556,7 +586,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
     CUDA_CHECK(cudaMemcpy(h_node_sizes.data(), d_nodes_sizes, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
     // setup streams for OpenMP parallel random initializations
-    const int max_threads = std::min(omp_get_max_threads(), MAX_THREADS);
+    const int max_threads = std::min(omp_get_max_threads(), MAX_OMP_THREADS);
     omp_set_num_threads(max_threads);
     std::cout << "Spawning " << max_threads << " OpenMP threads ...\n";
     std::vector<cudaStream_t> streams(max_threads);
@@ -1240,8 +1270,8 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
 
     // invoke Mt-KaHyPar
     std::ostringstream command;
-    //command << "mtkahypar -h coarse_tmp.hgr -k " << k << " -e " << std::format("{}", epsilon) << " -t " << MAX_THREADS << " -o km1 -v 0 --write-partition-file 1 --partition-output-folder . --preset-type deterministic_quality --seed " << INIT_SEED;
-    command << "mtkahypar -h coarse_tmp.hgr -k " << k << " -e " << std::format("{}", epsilon) << " -t " << MAX_THREADS << " -o km1 -v 0 -m direct --write-partition-file 1 --partition-output-folder . --preset-type default --seed " << INIT_SEED;
+    //command << "mtkahypar -h coarse_tmp.hgr -k " << k << " -e " << std::format("{}", epsilon) << " -t " << MAX_OMP_THREADS << " -o km1 -v 0 --write-partition-file 1 --partition-output-folder . --preset-type deterministic_quality --seed " << INIT_SEED;
+    command << "mtkahypar -h coarse_tmp.hgr -k " << k << " -e " << std::format("{}", epsilon) << " -t " << MAX_OMP_THREADS << " -o km1 -v 0 -m direct --write-partition-file 1 --partition-output-folder . --preset-type default --seed " << INIT_SEED;
     std::cout << "Running Mt-KaHyPar: " << command.str().c_str() << "\n";
     int command_result = std::system(command.str().c_str());
     std::ostringstream out_filename;
