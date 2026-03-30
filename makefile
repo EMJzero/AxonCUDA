@@ -14,9 +14,12 @@ ARCH        := native
 
 CXXFLAGS    := -O3 --std=c++20 -Wall -Wextra -fopenmp -I$(HDR_DIR) -I$(INC_DIR)
 NVCCFLAGS   := -O3 --std=c++20 -arch=$(ARCH) -dc -dlto -allow-unsupported-compiler --extended-lambda \
-               -Xcompiler "-Wall -Wextra -Wno-maybe-uninitialized -Wno-unused-function -fopenmp" \
+               -Xptxas -O3 -Xcompiler "-Wall -Wextra -Wno-maybe-uninitialized -Wno-unused-function -fopenmp" \
                -I $(HDR_DIR) -I $(INC_DIR)
 LINKFLAGS   := --std=c++20 -arch=$(ARCH) -dlto -allow-unsupported-compiler --extended-lambda -lgomp
+
+NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
+MAKEFLAGS += -j$(NPROC) # run with as many jobs as there are CPU cores
 
 # ==========================================
 # Source discovery

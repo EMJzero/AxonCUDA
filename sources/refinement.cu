@@ -46,7 +46,8 @@ void refinementRepeats(
         uint32_t discount = fm_repeat < cfg.refine_repeats / 3 ? 1u : (fm_repeat < 2 * cfg.refine_repeats / 3 ? 2u : UINT32_MAX);
 
         // prepare this level's pins per partition
-        CUDA_CHECK(cudaMemset(d_pins_per_partitions, 0x00, num_hedges * num_partitions * sizeof(uint32_t)));
+        const size_t pins_per_partitions_bytes = static_cast<size_t>(num_hedges) * num_partitions * sizeof(uint32_t);
+        CUDA_CHECK(cudaMemset(d_pins_per_partitions, 0x00, pins_per_partitions_bytes));
         // while computing pins per partition also compute the distinct inbound counts per partition (number of pins with a count > 0)
         CUDA_CHECK(cudaMemset(d_partitions_inbound_sizes, 0x00, num_partitions * sizeof(uint32_t)));
         
@@ -90,7 +91,7 @@ void refinementRepeats(
             // NOTE: choose threads_per_block multiple of WARP_SIZE
             int threads_per_block = 128; // 128/32 -> 4 warps per block
             int warps_per_block = threads_per_block / WARP_SIZE;
-            int num_warps_needed = curr_num_nodes ; // 1 warp per node
+            int num_warps_needed = curr_num_nodes; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - fm-ref gains kernel
             std::cout << "Running fm-ref gains kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";

@@ -232,16 +232,16 @@ int main(int argc, char** argv) {
     }
 
     // estimated max hedge and neighbors count
-    thrust::device_ptr<dim_t> t_hedges_offsets(d_hedges_offsets);
-    dim_t max_hedge_size =
-    thrust::transform_reduce(
-        thrust::make_zip_iterator(thrust::make_tuple(t_hedges_offsets + 1, t_hedges_offsets)),
-        thrust::make_zip_iterator(thrust::make_tuple(t_hedges_offsets + num_hedges + 1, t_hedges_offsets + num_hedges)),
-        [] __host__ __device__ (const thrust::tuple<dim_t, dim_t>& t) { return thrust::get<0>(t) - thrust::get<1>(t); },
-        dim_t{0}, thrust::maximum<dim_t>()
-    );
-    //dim_t max_neighbors = hg.sampleMaxNeighborhoodSize(NEIGHBORS_SAMPLE_SIZE); // TODO: is 240 enough here? Maybe 2400?
-    dim_t max_neighbors = sampleMaxNeighborhoodSize(
+    //thrust::device_ptr<dim_t> t_hedges_offsets(d_hedges_offsets);
+    //dim_t max_hedge_size =
+    //thrust::transform_reduce(
+    //    thrust::make_zip_iterator(thrust::make_tuple(t_hedges_offsets + 1, t_hedges_offsets)),
+    //    thrust::make_zip_iterator(thrust::make_tuple(t_hedges_offsets + num_hedges + 1, t_hedges_offsets + num_hedges)),
+    //    [] __host__ __device__ (const thrust::tuple<dim_t, dim_t>& t) { return thrust::get<0>(t) - thrust::get<1>(t); },
+    //    dim_t{0}, thrust::maximum<dim_t>()
+    //);
+    //const dim_t max_neighbors = hg.sampleMaxNeighborhoodSize(NEIGHBORS_SAMPLE_SIZE); // TODO: is 240 enough here? Maybe 2400?
+    const dim_t max_neighbors = sampleMaxNeighborhoodSize(
         cfg,
         d_hedges,
         d_hedges_offsets,
@@ -250,7 +250,8 @@ int main(int argc, char** argv) {
         num_nodes,
         NEIGHBORS_SAMPLE_SIZE
     );
-    std::cout << "Max hedges estimate set to " << max_hedge_size << ", neighbors estimate set to " << max_neighbors << "\n";
+    //std::cout << "Max hedges estimate set to " << max_hedge_size << ", neighbors estimate set to " << max_neighbors << "\n";
+    std::cout << "Max neighbors estimate set to: " << max_neighbors << "\n";
 
     std::cout << "Starting core timer...\n";
     cudaEvent_t d_time_core_start, d_time_core_stop;
@@ -259,7 +260,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventRecord(d_time_core_start));
 
     // prepare neighborhoods
-    std::tie(max_neighbors, d_neighbors, d_neighbors_offsets) = buildNeighbors(
+    dim_t neighbors_size;
+    std::tie(neighbors_size, d_neighbors, d_neighbors_offsets) = buildNeighbors(
         cfg,
         d_hedges,
         d_hedges_offsets,
@@ -377,7 +379,8 @@ int main(int argc, char** argv) {
                 h_max_nodes_per_part
             );
             d_partitions_sizes = d_init_partitions_sizes;
-            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, num_hedges * max_parts * sizeof(uint32_t)));
+            const size_t pins_per_partitions_bytes = static_cast<size_t>(num_hedges) * max_parts * sizeof(uint32_t);
+            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, pins_per_partitions_bytes));
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, max_parts * sizeof(uint32_t))); // TODO: remove, not needed in KWAY mode
 
             return std::make_tuple(max_parts, d_init_partitions);
@@ -466,7 +469,8 @@ int main(int argc, char** argv) {
                 h_max_nodes_per_part
             );
             d_partitions_sizes = d_init_partitions_sizes;
-            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, num_hedges * max_parts * sizeof(uint32_t)));
+            const size_t pins_per_partitions_bytes = static_cast<size_t>(num_hedges) * max_parts * sizeof(uint32_t);
+            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, pins_per_partitions_bytes));
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, max_parts * sizeof(uint32_t))); // TODO: remove, not needed in KWAY mode
             CUDA_CHECK(cudaFree(d_groups));
             CUDA_CHECK(cudaFree(d_ungroups));
@@ -503,7 +507,8 @@ int main(int argc, char** argv) {
             d_partitions_sizes = d_groups_sizes;
 
             // NOTE: the inbound counters per partition are just the transposed of pins per partition! No need to compute them separately!
-            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, num_hedges * new_num_nodes * sizeof(uint32_t)));
+            const size_t pins_per_partitions_bytes = static_cast<size_t>(num_hedges) * new_num_nodes * sizeof(uint32_t);
+            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, pins_per_partitions_bytes));
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, new_num_nodes * sizeof(uint32_t)));
 
             // base case, reached the target number of partitions
@@ -540,21 +545,25 @@ int main(int argc, char** argv) {
         // =============================
 
         // update the maximum hedges and neighbors estimate by scaling it by new_num_nodes/curr_num_nodes
-        float scale = (float)new_num_nodes / curr_num_nodes;
-        max_hedge_size = std::ceil(max_hedge_size * scale);
-        max_neighbors = std::ceil(max_neighbors * scale);
-        std::cout << "Max hedges estimate updated to " << max_hedge_size << ", neighbors estimate updated to " << max_neighbors << "\n";
+        //float scale = (float)new_num_nodes / curr_num_nodes;
+        //max_hedge_size = std::ceil(max_hedge_size * scale);
+        //max_neighbors = std::ceil(max_neighbors * scale);
+        //std::cout << "Max hedges estimate updated to " << max_hedge_size << ", neighbors estimate updated to " << max_neighbors << "\n";
 
         // prepare coarse neighbors buffers
         // NOTE: overwrites previous neighbors
-        std::tie(max_neighbors, d_neighbors, d_neighbors_offsets) = coarsenNeighbors(
+        std::tie(neighbors_size, d_neighbors, d_neighbors_offsets) = coarsenNeighbors(
             cfg,
+            d_hedges,
+            d_hedges_offsets,
+            d_touching,
+            d_touching_offsets,
             d_groups,
             d_ungroups,
             d_ungroups_offsets,
             curr_num_nodes,
             new_num_nodes,
-            max_neighbors,
+            neighbors_size,
             d_neighbors,
             d_neighbors_offsets
         );
@@ -564,14 +573,14 @@ int main(int argc, char** argv) {
         uint32_t *d_coarse_hedges = nullptr;
         dim_t *d_coarse_hedges_offsets = nullptr;
         uint32_t* d_coarse_srcs_count = nullptr;
-        std::tie(new_hedges_size, max_hedge_size, d_coarse_hedges, d_coarse_hedges_offsets, d_coarse_srcs_count) = coarsenHedges(
+        std::tie(new_hedges_size, d_coarse_hedges, d_coarse_hedges_offsets, d_coarse_srcs_count) = coarsenHedges(
             cfg,
             d_hedges,
             d_hedges_offsets,
             d_srcs_count,
             d_groups,
             num_hedges,
-            max_hedge_size
+            hedges_size
         );
 
         // prepare coarse touching buffers

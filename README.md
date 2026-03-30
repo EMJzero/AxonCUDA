@@ -78,9 +78,9 @@ Other relevant benchmarks are the ISPD98 suite and SAT14 suite, that we suggest 
 Their size is however relatively small to represent a challenge on GPU, hence we provide the `scale_hgr.py` slop-script to multiply their number of nodes and pins by a user-defined amount (e.g. 16x).
 
 AxonCUDA supports hypergraphs both in the `.hgr` and in its own `.snn` and `.axh` binary formats.<br>
-File format details can be found in comments near the end of [`hgraph.hpp`](./hgraph.hpp).
+File format details can be found in comments near the end of [`hgraph.hpp`](./includes/hgraph.hpp).
 
-Or you could just go under [`hgraphs`](./hgraphs) and run:
+Or you could just go under [`hgraphs`](./includes/hgraphs) and run:
 ```sh
 # make the script executable
 chmod +x procure_hgraphs.sh
@@ -165,7 +165,7 @@ We refer to refinement gains in two ways:
 | LenNet | loihi64 | <code style="color : lime">ok</code> | 3119.209 | 509.088 |  |
 | VGG11 | loihi84 | <code style="color : lime">ok</code> | 56090.449 | 90792.703 |  |
 | AlexNet | loihi84 | <code style="color : lime">ok</code> | 16433.236 | 124265.188 |  |
-| MobileNet | loihi84 | <code style="color : red">ko</code> |  |  | OOM |
+| MobileNet | loihi84 | <code style="color : red">ko</code> |  |  | not even with `-dtc`, `-cnc 16`, `-m 262144 1048576 7056`, and `PATH_SIZE 4096u` |
 | Allen V1 | loihi84 | <code style="color : lime">ok</code> | 6220.164 | 42259.551 | requires `-cnc 16` |
 | 16k-rand | loihi64 | <code style="color : lime">ok</code> | 76390.469 | 902.341 |  |
 | 64k-rand | loihi64 | <code style="color : lime">ok</code> | 651617.500 | 2917.872 |  |
@@ -188,11 +188,15 @@ We refer to refinement gains in two ways:
 
 Well, this implementation isn't bulletproof, there are a few knobs that require tuning upon targeting very large hypergraphs.
 All problems usually manifest as asserts being triggered:
-- `curr_path_length < actual_path_size` in `grouping_kernel`:
+- `idx < extra_path_size + path_size` in `grouping_kernel`:
   - try increasing `PATH_SIZE`, but keep in mind that it should fit in a thread's registers for performance reasons...
+  - check how many repeats the kernel is running, e.g. `NOTE: grouping kernel required []...] repeats=42 ...`, the number of repeats is actively shrinking the available path-length, hence try multiplying `PATH_SIZE` by the same amount...
   - if even with `PATH_SIZE = 1024` the problem persist, the likely suspect is an asymmetric neighbors histogram from `candidates_kernel`, enable `VERBOSE` in `main.cu` for more info. That said, bugs aside, the only reasonable cause is an overflow due to `FIXED_POINT_SCALE`, try lowering it...
 - `GM hash-set full!` in any `apply_X` or `neighbors` kernel, means oversized segments for deduplication were not large enough, increase `-om <mul>` from the CLI...
 - `invalid partitioning returned` in k-way mode after initial Mt-KaHyPar solution means no valid initial partitioning likely existed, try raising `KWAY_INIT_UPPER_THREASHOLD`...
+- too much host RAM usage: add the `-dtc` flag if your device has more VRAM than the host has RAM! Also recommended for a good speedup...
+
+All the mentioned constants can be found either in [`defines.cuh`](./headers/defines.cuh) or in the offending kernel's header file under [`./headers`](./headers/).
 
 # Reference
 

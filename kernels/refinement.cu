@@ -2,6 +2,47 @@
 #include "constants.cuh"
 #include "utils.cuh"
 
+// for each hyperedge, count how many of its pins are in each partition
+// SEQUENTIAL COMPLEXITY: e*d
+// PARALLEL OVER: e
+__global__
+void pins_per_partition_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
+    const uint32_t num_hedges,
+    const uint32_t num_partitions,
+    uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
+    uint32_t* __restrict__ partitions_inbound_sizes // partitions_inbound_sizes[part] -> number of inbound_pins_per_partitions for 'part' that are not zero => will be incorrect as of here (also including outbounds)
+) {
+    // STYLE: one hedge per thread!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_hedges) return;
+
+    /*
+    * TODO upgrade:
+    * - one hedge per warp -> go over the hedge in // in the warp
+    * - shared memory histogram per hyperedge
+    */
+
+    /*
+    * TODO alternative upgrade:
+    * - one node per warp -> go over touching in // in the warp
+    * - shared memory histogram per partition
+    * => take the code from 'inbound_pins_per_partition_kernel' as of commit 'f803463'
+    */
+
+    const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
+    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
+    uint32_t *my_pins_per_partitions = pins_per_partitions + static_cast<dim_t>(tid) * num_partitions;
+
+    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
+        const uint32_t part = partitions[*curr];
+        const uint32_t prev = atomicAdd(&my_pins_per_partitions[part], 1);
+        if (prev == 0) atomicAdd(&partitions_inbound_sizes[part], 1);
+    }
+}
+
 // for each hyperedge, remove its sources from the pins per partition counts
 // SEQUENTIAL COMPLEXITY: e
 // PARALLEL OVER: e
@@ -24,7 +65,7 @@ void inbound_pins_per_partition_kernel(
     const uint32_t *hedge_start = hedges + hedge_start_idx;
     const uint32_t hedge_srcs_count = srcs_count[tid];
     const uint32_t *hedge_srcs_end = hedges + hedge_srcs_count;
-    uint32_t *my_inbound_pins_per_partitions = inbound_pins_per_partitions + tid * num_partitions;
+    uint32_t *my_inbound_pins_per_partitions = inbound_pins_per_partitions + static_cast<dim_t>(tid) * num_partitions;
 
     for (const uint32_t* curr = hedge_start; curr < hedge_srcs_end; curr++) {
         const uint32_t src_part = partitions[*curr];
@@ -100,7 +141,7 @@ void fm_refinement_gains_kernel(
     // handle the current partition first with its own scan of touching hyperedges
     for (const uint32_t* hedge_idx = my_touching + lane_id; hedge_idx < not_my_touching; hedge_idx += WARP_SIZE) {
         const uint32_t actual_hedge_idx = *hedge_idx;
-        const uint32_t* my_pin_per_partition = pins_per_partitions + actual_hedge_idx * num_partitions;
+        const uint32_t* my_pin_per_partition = pins_per_partitions + static_cast<dim_t>(actual_hedge_idx) * num_partitions;
         const float my_hedge_weight = hedge_weights[actual_hedge_idx];
         // hedge connected to my partition: gain the hedge's weight iff moving would disconnect it from my partition (I am its last pin left there)
         if (!encourage_all_moves && my_pin_per_partition[my_partition] == 1)
@@ -128,7 +169,7 @@ void fm_refinement_gains_kernel(
         // NOTE: interpret this as "for each hedge, see if you moving to a certain partition is something that they like or not"
         for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
             const uint32_t actual_hedge_idx = *hedge_idx;
-            const uint32_t* my_pin_per_partition = pins_per_partitions + actual_hedge_idx * num_partitions;
+            const uint32_t* my_pin_per_partition = pins_per_partitions + static_cast<dim_t>(actual_hedge_idx) * num_partitions;
             const float my_hedge_weight = hedge_weights[actual_hedge_idx];
             // each thread in the warp reads partitions_per_thread counters
             for (uint32_t p = 0; p < my_part_count; p++) {
@@ -238,8 +279,9 @@ void fm_refinement_cascade_kernel(
         my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
         const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
         const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-        const uint32_t my_curr_part_counter = pins_per_partitions[actual_hedge_idx * num_partitions + my_partition];
-        const uint32_t my_move_part_counter = pins_per_partitions[actual_hedge_idx * num_partitions + my_move_part];
+        const dim_t part_row_offset = static_cast<dim_t>(actual_hedge_idx) * num_partitions;
+        const uint32_t my_curr_part_counter = pins_per_partitions[part_row_offset + my_partition];
+        const uint32_t my_move_part_counter = pins_per_partitions[part_row_offset + my_move_part];
         int32_t my_curr_part_counter_delta = 0;
         int32_t my_move_part_counter_delta = 0;
         for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
@@ -503,7 +545,7 @@ void count_inbound_size_events_kernel(
     if (part == UINT32_MAX) return;
 
     const uint32_t hedge = ev_hedge[tid];
-    const uint32_t init_hedge_inbound_count = partitions_inbound_counts[hedge*num_partitions + part];
+    const uint32_t init_hedge_inbound_count = partitions_inbound_counts[static_cast<dim_t>(hedge) * num_partitions + part];
 
     uint32_t prev_hedge_inbound_count = init_hedge_inbound_count;
     if (tid > 0 && ev_partition[tid - 1] == part && ev_hedge[tid - 1] == hedge) // if the previous sum was about the same hedge as mine, consider its updated count in the sequence
@@ -541,7 +583,7 @@ void build_inbound_size_events_kernel(
     if (part == UINT32_MAX) return;
 
     const uint32_t hedge = ev_hedge[tid];
-    const uint32_t init_hedge_inbound_count = partitions_inbound_counts[hedge*num_partitions + part];
+    const uint32_t init_hedge_inbound_count = partitions_inbound_counts[static_cast<dim_t>(hedge) * num_partitions + part];
 
     uint32_t prev_hedge_inbound_count = init_hedge_inbound_count;
     if (tid > 0 && ev_partition[tid - 1] == part && ev_hedge[tid - 1] == hedge) // if the previous sum was about the same hedge as mine, consider its updated count in the sequence

@@ -13,6 +13,8 @@
 //#define BETA 1e-7f // inbound set size penalty scale (adjust based on inbound set size magnitude)
 
 
+// STEPS
+
 void chaining(
     const uint32_t *srcs,
     const uint32_t *dsts,

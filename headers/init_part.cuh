@@ -23,6 +23,8 @@
 #define MAX_OMP_THREADS 16
 
 
+// STEPS
+
 std::tuple<uint32_t*, uint32_t*> initial_partitioning(
     const uint32_t num_nodes,
     const uint32_t num_hedges,

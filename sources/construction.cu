@@ -157,7 +157,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouching(
         << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(touching_size * sizeof(uint32_t)) / (1 << 30)
         << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_touching_storage_bytes) / (1 << 20)
         << " MB of temporary storage ...\n";
-    cudaMalloc(&c_touching_storage, c_touching_storage_bytes);
+    CUDA_CHECK(cudaMalloc(&c_touching_storage, c_touching_storage_bytes));
     cub::DeviceSegmentedRadixSort::SortKeys(
         c_touching_storage, c_touching_storage_bytes, c_touching_double_buffer,
         touching_size, num_nodes,
@@ -252,7 +252,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     // if there is enough memory, a speedier version is used, that replaced the scatter with a direct pack from the initial oversized allocation!
     uint32_t *d_oversized_neighbors = nullptr;
     dim_t init_max_neighbors = (dim_t)std::ceil(cfg.oversized_multiplier * (float)max_neighbors);
-    
+
     size_t free_bytes, total_bytes;
     cudaMemGetInfo(&free_bytes, &total_bytes);
     // check if there could be space to allocate both oversized neighbors and final neighbors at once; with no better guess, use 'max_neighbors' to estimate the final neighbors size...
@@ -261,7 +261,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     if (!direct_scatter_neighbors)
         init_max_neighbors = init_max_neighbors > SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE ? init_max_neighbors - SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE : 0;
     init_max_neighbors = max(init_max_neighbors, (dim_t)GM_MIN_BLOCK_DEDUPE_BUFFER_SIZE);
-    
+
     if (num_nodes * init_max_neighbors * sizeof(uint32_t) > (1ull << 32))
         std::cout
             << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_nodes * init_max_neighbors * sizeof(uint32_t)) / (1 << 30)
@@ -271,7 +271,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     thrust::device_ptr<dim_t> t_neigh_offsets(d_neighbors_offsets);
     {
         // launch configuration - neighborhoods count kernel
-        int blocks = num_nodes;
+        int blocks = num_nodes; // 1 block per node
         int threads_per_block = 256; // 256/32 -> 8 warps per block
         std::cout << "Running neighborhoods count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         // launch - neighborhoods count kernel
@@ -292,11 +292,11 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     if (!direct_scatter_neighbors) CUDA_CHECK(cudaFree(d_oversized_neighbors)); // no pack? free oversized immediately
     
     // correct the max neighbors count estimate
-    auto actual_max_neighbors = thrust::max_element(t_neigh_offsets, t_neigh_offsets + num_nodes);
-    dim_t actual_max_neighbors_offset = static_cast<dim_t>(actual_max_neighbors - t_neigh_offsets);
-    dim_t new_max_neighbors;
-    CUDA_CHECK(cudaMemcpy(&new_max_neighbors, d_neighbors_offsets + actual_max_neighbors_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
-    std::cout << "Max neighbors estimate corrected to " << new_max_neighbors << "\n";
+    //auto actual_max_neighbors = thrust::max_element(t_neigh_offsets, t_neigh_offsets + num_nodes);
+    //dim_t actual_max_neighbors_offset = static_cast<dim_t>(actual_max_neighbors - t_neigh_offsets);
+    //dim_t new_max_neighbors;
+    //CUDA_CHECK(cudaMemcpy(&new_max_neighbors, d_neighbors_offsets + actual_max_neighbors_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    //std::cout << "Max neighbors estimate corrected to " << new_max_neighbors << "\n";
     
     // compute final offsets
     thrust::exclusive_scan(t_neigh_offsets, t_neigh_offsets + (num_nodes + 1), t_neigh_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
@@ -322,7 +322,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     } else {
         // write neighbors at their correct offset
         // launch configuration - neighborhoods scatter kernel
-        int blocks = num_nodes;
+        int blocks = num_nodes; // 1 block per node
         int threads_per_block = 256; // 256/32 -> 8 warps per block
         std::cout << "Running neighborhoods scatter kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         // launch - neighborhoods scatter kernel
@@ -340,162 +340,257 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     CUDA_CHECK(cudaDeviceSynchronize());
     if (direct_scatter_neighbors) CUDA_CHECK(cudaFree(d_oversized_neighbors)); // pack? free oversized afterwards
 
-    return std::make_tuple(new_max_neighbors, d_neighbors, d_neighbors_offsets);
+    return std::make_tuple(total_neighbors, d_neighbors, d_neighbors_offsets);
 }
 
 std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
     const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
     const uint32_t *d_groups,
     const uint32_t *d_ungroups,
     const dim_t *d_ungroups_offsets,
     const uint32_t curr_num_nodes,
     const uint32_t new_num_nodes,
-    const uint32_t max_neighbors,
+    const dim_t neighbors_size,
     uint32_t *d_neighbors,
     dim_t *d_neighbors_offsets
 ) {
     // prepare coarse neighbors buffers
-    uint32_t *d_coarse_neighbors = nullptr;
-    uint32_t *d_coarse_oversized_neighbors = nullptr;
-    dim_t *d_coarse_neighbors_offsets = nullptr;
-    dim_t curr_max_neighbors = (dim_t)(cfg.oversized_multiplier * (float)max_neighbors); // add a bit of safety-room to compensate for the flat scaling by 'new_num_nodes / curr_num_nodes'
-    
-    // if there is enough memory for the full oversized buffer, SM dischard included, a speedier version is used, that replaced the scatter with a direct pack from the initial oversized allocation!
-    size_t free_bytes, total_bytes;
-    cudaMemGetInfo(&free_bytes, &total_bytes);
-    // NOTE: no need to check if there could be space to allocate both oversized neighbors and final neighbors at once, if the oversized fits, then the new neighbors are allocated either after the oversized is freed, or after the original neighbors are freed
-    bool direct_scatter_coarse_neighbors = (curr_num_nodes * curr_max_neighbors /*oversized (SM included)*/ + new_num_nodes * max_neighbors /*final upper bound*/) * sizeof(uint32_t) + new_num_nodes * sizeof(dim_t) /*offsets*/ < free_bytes;
-    // no pack? can spare space in the oversized buffer equal to the amount of shared memory used for fast deduping
-    if (!direct_scatter_coarse_neighbors)
-        curr_max_neighbors = curr_max_neighbors > MAX_SM_WARP_DEDUPE_BUFFER_SIZE ? curr_max_neighbors - MAX_SM_WARP_DEDUPE_BUFFER_SIZE : 0; // save the spaced for the duplicates caught in SM
-    curr_max_neighbors = max(curr_max_neighbors, (dim_t)MIN_GM_WARP_DEDUPE_BUFFER_SIZE); // just some ensurance...
-    
-    if (curr_num_nodes * curr_max_neighbors * sizeof(uint32_t) > (1ull << 32))
-        std::cout
-            << "Allocating " << std::fixed << std::setprecision(1) << (float)(curr_num_nodes * curr_max_neighbors * sizeof(uint32_t)) / (1 << 30)
-            << " GB for neighbors deduplication ...\n";
-    CUDA_CHECK(cudaMalloc(&d_coarse_oversized_neighbors, curr_num_nodes * curr_max_neighbors * sizeof(uint32_t))); // space for spilling deduplication hash-sets
-    CUDA_CHECK(cudaMalloc(&d_coarse_neighbors_offsets, (1 + new_num_nodes) * sizeof(dim_t))); // NOTE: the number nodes decreases!
+    uint32_t *d_coarse_neighbors = nullptr; // new compressed coarse neighbors array
+    dim_t *d_coarse_neighbors_offsets = nullptr; // offsets for coarse_neighbors
+    uint32_t *d_coarse_oversized_neighbors = nullptr; // larger array of the same size as the current neighbors array, used for deduplication
+    dim_t *d_coarse_oversized_neighbors_offsets = nullptr; // offsets for new nodes inside coarse_oversized_neighbors
+
+    CUDA_CHECK(cudaMalloc(&d_coarse_neighbors_offsets, (1 + new_num_nodes) * sizeof(dim_t)));
     CUDA_CHECK(cudaMemset(d_coarse_neighbors_offsets, 0x00, sizeof(dim_t))); // init. the first offset at 0
     thrust::device_ptr<dim_t> t_coarse_neigh_offsets(d_coarse_neighbors_offsets);
+
+    dim_t new_neighbors_size;
+
+    CUDA_CHECK(cudaMalloc(&d_coarse_oversized_neighbors_offsets, (1 + new_num_nodes) * sizeof(dim_t))); // NOTE: the number of nodes decreases!
+    CUDA_CHECK(cudaMemset(d_coarse_oversized_neighbors_offsets, 0x00, sizeof(dim_t))); // init. the first offset at 0
+    thrust::device_ptr<dim_t> t_coarse_oversized_neighbors_offsets(d_coarse_oversized_neighbors_offsets);
     {
-        // launch configuration - coarsening kernel (neighbors - count)
-        int threads_per_block = 128; // 128/32 -> 4 warps per block
-        int warps_per_block = threads_per_block / WARP_SIZE;
-        int num_warps_needed = new_num_nodes ; // 1 warp per group
-        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-        // compute shared memory per block (bytes)
-        size_t bytes_per_warp = MAX_SM_WARP_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
-        size_t shared_bytes = warps_per_block * bytes_per_warp;
-        // launch - coarsening kernel (neighbors - count)
-        std::cout << "Running coarsening kernel (neighbors - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        apply_coarsening_neighbors_count<<<blocks, threads_per_block, shared_bytes>>>(
-            d_neighbors,
+        // launch configuration - coarsening kernel (neighbors - sum of group sizes)
+        int threads_per_block = 128;
+        int num_threads_needed = new_num_nodes; // 1 thread per group
+        int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+        // launch - coarsening kernel (neighbors - sum of group sizes)
+        std::cout << "Running coarsening kernel (neighbors - sum of group sizes) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        sum_of_grouped_neighbors_count<<<blocks, threads_per_block>>>(
             d_neighbors_offsets,
-            d_groups,
             d_ungroups,
             d_ungroups_offsets,
             new_num_nodes,
-            curr_max_neighbors,
-            direct_scatter_coarse_neighbors,
-            d_coarse_oversized_neighbors,
-            d_coarse_neighbors_offsets
+            d_coarse_oversized_neighbors_offsets
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
-    if (!direct_scatter_coarse_neighbors) CUDA_CHECK(cudaFree(d_coarse_oversized_neighbors));
-    if (direct_scatter_coarse_neighbors) { CUDA_CHECK(cudaFree(d_neighbors)); CUDA_CHECK(cudaFree(d_neighbors_offsets)); }
+    thrust::inclusive_scan(t_coarse_oversized_neighbors_offsets, t_coarse_oversized_neighbors_offsets + (new_num_nodes + 1), t_coarse_oversized_neighbors_offsets); // in-place exclusive scan (de-facto inclusive, but we wrote the array with a "+1" on indices)
+    dim_t coarse_oversized_neighbors_size = 0u;
+    CUDA_CHECK(cudaMemcpy(&coarse_oversized_neighbors_size, d_coarse_oversized_neighbors_offsets + new_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    assert(coarse_oversized_neighbors_size == neighbors_size); // a grouped sum should still be a sum!
+
+    size_t free_bytes, total_bytes;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
     
-    // correct the max neighbors count estimate
-    auto actual_coarse_max_neighbors = thrust::max_element(t_coarse_neigh_offsets, t_coarse_neigh_offsets + new_num_nodes + 1);
-    dim_t actual_coarse_max_neighbors_offset = static_cast<dim_t>(actual_coarse_max_neighbors - t_coarse_neigh_offsets);
-    dim_t new_max_neighbors;
-    CUDA_CHECK(cudaMemcpy(&new_max_neighbors, d_coarse_neighbors_offsets + actual_coarse_max_neighbors_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
-    std::cout << "Max neighbors estimate corrected to " << new_max_neighbors << "\n";
-    
-    // compute final offsets
-    thrust::inclusive_scan(t_coarse_neigh_offsets, t_coarse_neigh_offsets + (new_num_nodes + 1), t_coarse_neigh_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
-    dim_t new_neighbors_size = 0; // last value in the inclusive scan = full reduce = total number of neighbors among all sets
-    CUDA_CHECK(cudaMemcpy(&new_neighbors_size, d_coarse_neighbors_offsets + new_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
-    // NOTE: rebuilding neighbors from scratch makes no sense: if the "oversized" buffer could fit, no reason the new neighbors shouldn't!
-    // this alloc should never fail, since it occurs in the space left by either the oversized buffer or previous neighbors
-    CUDA_CHECK(cudaMalloc(&d_coarse_neighbors, new_neighbors_size * sizeof(uint32_t)));
-    if (direct_scatter_coarse_neighbors) {
-        // pack oversized coarse neighbors in their final tight-fit subarrays
-        // launch configuration - coarsening kernel (neighbors - pack)
-        int threads_per_block = 128; // 128/32 -> 4 warps per block
-        int warps_per_block = threads_per_block / WARP_SIZE;
-        int num_warps_needed = new_num_nodes; // 1 warp per group
-        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-        std::cout << "Running coarsening kernel (neighbors - pack) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        // launch - neighborhoods scatter kernel
-        pack_segments_varsize<<<blocks, threads_per_block>>>(
-            d_coarse_oversized_neighbors,
-            d_ungroups_offsets, // once more, ungroup offsets provide the offsets for the oversized buffer too
-            d_coarse_neighbors_offsets,
-            new_num_nodes,
-            curr_max_neighbors,
-            d_coarse_neighbors
-        );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaFree(d_coarse_oversized_neighbors));
-    } else {
-        // launch configuration - coarsening kernel (neighbors - scatter)
-        int threads_per_block = 128; // 128/32 -> 4 warps per block
-        int warps_per_block = threads_per_block / WARP_SIZE;
-        int num_warps_needed = new_num_nodes ; // 1 warp per group
-        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-        // compute shared memory per block (bytes)
-        size_t bytes_per_warp = MAX_SM_WARP_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
-        size_t shared_bytes = warps_per_block * bytes_per_warp;
-        // launch - coarsening kernel (neighbors - scatter)
-        std::cout << "Running coarsening kernel (neighbors - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        apply_coarsening_neighbors_scatter<<<blocks, threads_per_block, shared_bytes>>>(
-            d_neighbors,
-            d_neighbors_offsets,
-            d_groups,
-            d_ungroups,
-            d_ungroups_offsets,
-            new_num_nodes,
-            d_coarse_neighbors_offsets,
-            d_coarse_neighbors
-        );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        // de-allocate old neighbors and replace them with coarse ones
+    if (coarse_oversized_neighbors_size * sizeof(uint32_t) <= free_bytes) {
+        // if there is enough memory for an array of the same size as neighbors, deduplicate neighbors there, then run a pack to finalize the array
+        if (coarse_oversized_neighbors_size * sizeof(uint32_t) > (1ull << 30))
+            std::cout
+                << "Allocating " << std::fixed << std::setprecision(1) << (float)(coarse_oversized_neighbors_size * sizeof(uint32_t)) / (1 << 30)
+                << " GB for neighbors deduplication ...\n";
+        CUDA_CHECK(cudaMalloc(&d_coarse_oversized_neighbors, coarse_oversized_neighbors_size * sizeof(uint32_t))); // space for spilling deduplication hash-sets
+        {
+            // launch configuration - coarsening kernel (neighbors - count)
+            int threads_per_block = 128; // 128/32 -> 4 warps per block
+            int warps_per_block = threads_per_block / WARP_SIZE;
+            int num_warps_needed = new_num_nodes ; // 1 warp per group
+            int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+            // compute shared memory per block (bytes)
+            size_t bytes_per_warp = MAX_SM_WARP_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
+            size_t shared_bytes = warps_per_block * bytes_per_warp;
+            // launch - coarsening kernel (neighbors - count)
+            std::cout << "Running coarsening kernel (neighbors - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            apply_coarsening_neighbors_count<<<blocks, threads_per_block, shared_bytes>>>(
+                d_neighbors,
+                d_neighbors_offsets,
+                d_groups,
+                d_ungroups,
+                d_ungroups_offsets,
+                d_coarse_oversized_neighbors_offsets,
+                new_num_nodes,
+                d_coarse_oversized_neighbors,
+                d_coarse_neighbors_offsets
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
         CUDA_CHECK(cudaFree(d_neighbors));
         CUDA_CHECK(cudaFree(d_neighbors_offsets));
-    }
+        
+        // compute final offsets
+        thrust::inclusive_scan(t_coarse_neigh_offsets, t_coarse_neigh_offsets + (new_num_nodes + 1), t_coarse_neigh_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
+        CUDA_CHECK(cudaMemcpy(&new_neighbors_size, d_coarse_neighbors_offsets + new_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost)); // last value in the inclusive scan = full reduce = total number of neighbors among all sets
 
-    return std::make_tuple(new_max_neighbors, d_coarse_neighbors, d_coarse_neighbors_offsets);
+        // this alloc should never fail, since it occurs in the space left by the previous neighbors
+        CUDA_CHECK(cudaMalloc(&d_coarse_neighbors, new_neighbors_size * sizeof(uint32_t)));
+        {
+            // pack oversized coarse neighbors in their final tight-fit subarrays
+            // launch configuration - coarsening kernel (neighbors - pack)
+            int threads_per_block = 128; // 128/32 -> 4 warps per block
+            int warps_per_block = threads_per_block / WARP_SIZE;
+            int num_warps_needed = new_num_nodes; // 1 warp per group
+            int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+            std::cout << "Running coarsening kernel (neighbors - pack) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // launch - neighborhoods scatter kernel
+            pack_segments_varsize<<<blocks, threads_per_block>>>(
+                d_coarse_oversized_neighbors,
+                d_coarse_oversized_neighbors_offsets,
+                d_coarse_neighbors_offsets,
+                new_num_nodes,
+                1ull,
+                d_coarse_neighbors
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        CUDA_CHECK(cudaFree(d_coarse_oversized_neighbors));
+    } else {
+        // if there is not memory to double neighbors, then rebuild them from scratch, overwriting the old ones
+        // => use the old neighbors allocation as the site for deduplication (as neighbors count can only decrease overall - but may increase on a node-by-node basis)
+        d_coarse_oversized_neighbors = d_neighbors;
+
+        // if there is space to allocate simultaneously the new deduped neighbors and keep the old ones allocated, then try to use the faster pack approach
+        // => guess whether there could be enough space based on the fraction of coarsened nodes, if there is a chance, perform the SM->GM discharge in the counting kernel 
+        // => confirm the guess after you counted the exact number of neighbors
+        float coarsening_scale = (float)new_num_nodes / curr_num_nodes;
+        dim_t expected_new_neighbors_size = std::ceil(neighbors_size * coarsening_scale);
+        bool pack_neighbors = expected_new_neighbors_size - curr_num_nodes * sizeof(dim_t) /*freed offsets*/ < free_bytes;
+
+        {
+            // launch configuration - rebuild kernel (neighbors - count)
+            int blocks = new_num_nodes; // 1 block per group
+            int threads_per_block = 256; // 256/32 -> 8 warps per block
+            // launch - rebuild kernel (neighbors - count)
+            std::cout << "Running rebuild kernel (neighbors - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            rebuild_coarsening_neighbors_count<<<blocks, threads_per_block>>>(
+                d_hedges,
+                d_hedges_offsets,
+                d_touching,
+                d_touching_offsets,
+                d_groups,
+                d_ungroups,
+                d_ungroups_offsets,
+                new_num_nodes,
+                pack_neighbors,
+                d_coarse_oversized_neighbors_offsets,
+                d_coarse_oversized_neighbors,
+                d_coarse_neighbors_offsets
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        // compute final offsets
+        thrust::inclusive_scan(t_coarse_neigh_offsets, t_coarse_neigh_offsets + (new_num_nodes + 1), t_coarse_neigh_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
+        CUDA_CHECK(cudaMemcpy(&new_neighbors_size, d_coarse_neighbors_offsets + new_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost)); // last value in the inclusive scan = full reduce = total number of neighbors among all sets
+
+        // refine the decision based on actual new neighbors count
+        pack_neighbors = new_neighbors_size - curr_num_nodes * sizeof(dim_t) /*freed offsets*/ < free_bytes;
+
+        if (pack_neighbors) {
+            // this alloc should never fail, since we updated the check for the pack vs rebuild
+            CUDA_CHECK(cudaMalloc(&d_coarse_neighbors, new_neighbors_size * sizeof(uint32_t)));
+            if (new_neighbors_size * sizeof(uint32_t) > (1ull << 30))
+                std::cout
+                    << "Allocating " << std::fixed << std::setprecision(1) << (float)(new_neighbors_size * sizeof(uint32_t)) / (1 << 30)
+                    << " GB for neighbors reconstruction ...\n";
+            {
+                // pack oversized coarse neighbors in their final tight-fit subarrays
+                // launch configuration - coarsening kernel (neighbors - pack)
+                int threads_per_block = 128; // 128/32 -> 4 warps per block
+                int warps_per_block = threads_per_block / WARP_SIZE;
+                int num_warps_needed = new_num_nodes; // 1 warp per group
+                int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+                std::cout << "Running coarsening kernel (neighbors - pack) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+                // launch - neighborhoods scatter kernel
+                pack_segments_varsize<<<blocks, threads_per_block>>>(
+                    d_coarse_oversized_neighbors,
+                    d_coarse_oversized_neighbors_offsets,
+                    d_coarse_neighbors_offsets,
+                    new_num_nodes,
+                    1ull,
+                    d_coarse_neighbors
+                );
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
+            CUDA_CHECK(cudaFree(d_coarse_oversized_neighbors));
+        } else {
+            // immediately reclaim the space used by old/oversized neighbors
+            CUDA_CHECK(cudaFree(d_coarse_oversized_neighbors));
+            // this alloc should never fail, since it occurs in the space left by either the oversized buffer (aka repurposed previous neighbors)
+            CUDA_CHECK(cudaMalloc(&d_coarse_neighbors, new_neighbors_size * sizeof(uint32_t)));
+            {
+                // launch configuration - rebuild kernel (neighbors - scatter)
+                int blocks = new_num_nodes; // 1 block per group
+                int threads_per_block = 256; // 256/32 -> 8 warps per block
+                // launch - rebuild kernel (neighbors - scatter)
+                std::cout << "Running rebuild kernel (neighbors - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+                rebuild_coarsening_neighbors_scatter<<<blocks, threads_per_block>>>(
+                    d_hedges,
+                    d_hedges_offsets,
+                    d_touching,
+                    d_touching_offsets,
+                    d_groups,
+                    d_ungroups,
+                    d_ungroups_offsets,
+                    d_coarse_neighbors_offsets,
+                    new_num_nodes,
+                    d_coarse_neighbors
+                );
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
+        }
+    }
+    CUDA_CHECK(cudaFree(d_coarse_oversized_neighbors_offsets));
+    
+    // correct the max neighbors count estimate
+    //auto actual_coarse_max_neighbors = thrust::max_element(t_coarse_neigh_offsets, t_coarse_neigh_offsets + new_num_nodes + 1);
+    //dim_t actual_coarse_max_neighbors_offset = static_cast<dim_t>(actual_coarse_max_neighbors - t_coarse_neigh_offsets);
+    //dim_t new_max_neighbors;
+    //CUDA_CHECK(cudaMemcpy(&new_max_neighbors, d_coarse_neighbors_offsets + actual_coarse_max_neighbors_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    //std::cout << "Max neighbors estimate corrected to " << new_max_neighbors << "\n";
+
+    return std::make_tuple(new_neighbors_size, d_coarse_neighbors, d_coarse_neighbors_offsets);
 }
 
-std::tuple<dim_t, dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
+std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
     const runconfig cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t *d_srcs_count,
     const uint32_t *d_groups,
     const uint32_t num_hedges,
-    const uint32_t max_hedge_size
+    const dim_t hedges_size
 ) {
     uint32_t *d_coarse_hedges = nullptr;
     uint32_t *d_coarse_hedges_buffer = nullptr;
-    uint32_t *d_coarse_oversized_hedges = nullptr;
+    uint32_t *d_coarse_oversized_hedges = nullptr; // also indexed with hedges_offsets
     dim_t *d_coarse_hedges_offsets = nullptr;
     uint32_t* d_coarse_srcs_count = nullptr;
-    
-    dim_t curr_max_hedge_size = (dim_t)(cfg.oversized_multiplier * (float)max_hedge_size);
-    curr_max_hedge_size = curr_max_hedge_size > MAX_SM_WARP_DEDUPE_BUFFER_SIZE ? curr_max_hedge_size - MAX_SM_WARP_DEDUPE_BUFFER_SIZE : 0;
-    curr_max_hedge_size = max(curr_max_hedge_size, (dim_t)MIN_GM_WARP_DEDUPE_BUFFER_SIZE);
-    
-    if (num_hedges * curr_max_hedge_size * sizeof(uint32_t) > (1ull << 32))
+
+    if (hedges_size * sizeof(uint32_t) > (1ull << 30))
         std::cout
-            << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_hedges * curr_max_hedge_size * sizeof(uint32_t)) / (1 << 30)
+            << "Allocating " << std::fixed << std::setprecision(1) << (float)(hedges_size * sizeof(uint32_t)) / (1 << 30)
             << " GB for hedges deduplication ...\n";
-    CUDA_CHECK(cudaMalloc(&d_coarse_oversized_hedges, num_hedges * curr_max_hedge_size * sizeof(uint32_t))); // space for spilling deduplication hash-sets
+    CUDA_CHECK(cudaMalloc(&d_coarse_oversized_hedges, hedges_size * sizeof(uint32_t))); // space for spilling deduplication hash-sets
     CUDA_CHECK(cudaMalloc(&d_coarse_hedges_offsets, (1 + num_hedges) * sizeof(dim_t))); // NOTE: the number of hedges never decreases (for now), unlike that of nodes!
     CUDA_CHECK(cudaMalloc(&d_coarse_srcs_count, num_hedges * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(d_coarse_hedges_offsets, 0x00, sizeof(dim_t))); // init. the first offset at 0
@@ -517,7 +612,6 @@ std::tuple<dim_t, dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
         d_srcs_count,
         d_groups,
         num_hedges,
-        curr_max_hedge_size,
         d_coarse_oversized_hedges,
         d_coarse_hedges_offsets,
         d_coarse_srcs_count
@@ -527,11 +621,11 @@ std::tuple<dim_t, dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
     CUDA_CHECK(cudaFree(d_coarse_oversized_hedges));
 
     // correct the max hedge size estimate
-    auto actual_coarse_max_hedge_size = thrust::max_element(t_coarse_hedges_offsets, t_coarse_hedges_offsets + num_hedges + 1);
-    dim_t actual_coarse_max_hedge_size_offset = static_cast<dim_t>(actual_coarse_max_hedge_size - t_coarse_hedges_offsets);
-    dim_t new_max_hedge_size;
-    CUDA_CHECK(cudaMemcpy(&new_max_hedge_size, d_coarse_hedges_offsets + actual_coarse_max_hedge_size_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
-    std::cout << "Max hedges estimate corrected to " << max_hedge_size << "\n";
+    //auto actual_coarse_max_hedge_size = thrust::max_element(t_coarse_hedges_offsets, t_coarse_hedges_offsets + num_hedges + 1);
+    //dim_t actual_coarse_max_hedge_size_offset = static_cast<dim_t>(actual_coarse_max_hedge_size - t_coarse_hedges_offsets);
+    //dim_t new_max_hedge_size;
+    //CUDA_CHECK(cudaMemcpy(&new_max_hedge_size, d_coarse_hedges_offsets + actual_coarse_max_hedge_size_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
+    //std::cout << "Max hedges estimate corrected to " << max_hedge_size << "\n";
     
     // NOTE: the scan wants the last index EXCLUDED, while the memcopy wants the last index exactly! That's why we use here the +1, and not later!
     thrust::inclusive_scan(t_coarse_hedges_offsets, t_coarse_hedges_offsets + (num_hedges + 1), t_coarse_hedges_offsets); // in-place exclusive scan (the last element collects the full reduce)
@@ -597,7 +691,7 @@ std::tuple<dim_t, dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
     CUDA_CHECK(cudaFree(d_coarse_hedges_buffer));
     CUDA_CHECK(cudaFree(c_hedges_storage));
 
-    return std::make_tuple(new_hedges_size, new_max_hedge_size, d_coarse_hedges, d_coarse_hedges_offsets, d_coarse_srcs_count);
+    return std::make_tuple(new_hedges_size, d_coarse_hedges, d_coarse_hedges_offsets, d_coarse_srcs_count);
 }
 
 std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(

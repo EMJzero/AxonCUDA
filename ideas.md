@@ -655,3 +655,44 @@ Ordering IDEA:
 - each hedge ranks its pins by the total occurrencies of other hedges in the histogram that every pin owns -> a higher-up pin will have the highest overlapping incidence set with the hedge
 - and then what!? Aggreate ranks per node and use them as proxies for their resulting overlap when together?
 => I am just doing random bullshit at this point...
+
+IDEAS:
+- instead of going p\*2 and p\*2+1, split partitions in p and p+num_p, this way you can “fold in half” events and start the right number of threads to add those of the p+num_p over their p counter part
+- permanently allocate arrays for events outside the loop, sized as nodes
+  => this way you can have a third array encoding the second node in every pair, and “pack” every two events in one while you recompute scores (use atomics to add scores?)
+NAHHH! Too tedious!
+
+----
+
+How to run mobile net:
+Build inbound sets on the GPU! Disable their construction the host (remove the call).
+-> iterate hedges and their pins, count how many times each node is a pin (incident set size) and how many times is a source (source count)
+-> there are NO duplicates, use pins count to size a segment for each node
+-> keep two counters for each node, seen sources and seen destinations
+=>=> HP: hedges have had their sources already deduplicated wrt destinations (keep the dst)
+-> go over hedges and their pins again, insert sources and destinations per node at the offset given by their counter, after atomically incrementing the counter (the beauty of no dedupe)
+
+New neighbors dedupe:
+- mini kernel to add together set sizes from d_ungroup
+- if there is space, allocate a new array, merge sets (with SM buffer) and pack
+- if there’s no space, clear the existing array, access it with the new offsets, and like that re-run the build neighbors from touching sets and hedge
+- check that the pack can work with arbitrary-sized offsets
+
+In coarsenNeighbors, if cfg.sum_of_merged is true:
+ - compute sum of sizes for each group, from neigh_offsets
+ - initialize coarse_neigh_offsets to that sum
+ - pass coarse_neigh_offsets to the kernel to access the hash-sets through it
+ - if cfg.sum_of_merged is false, write coarse_neigh_offsets with all curr_max_neighbors
+- do the same for hedges (no need for touching...)
+
+----
+
+How to fix all the crap in ordering.cu:
+- build from the start two set of event arrays, one for odd-events one for even-events, like "d_even_event_node" and similar
+- this way, you fill them at once, switching based on partition id
+- then they go through patters in parallel, with each kernel running once for each of odd and even
+- access both at once by simply doing >>1 to your partition id
+- infer minimim events count per pair by doing the minimum of the difference between part_offsets on each array set
+- sum from one array to the other directly, set to zero past the end, and a single scan is enough
+- apply moves starting from the array where the sum, scan, and max occurred, fetch the paired move from the other array by adding your distance from the offset to the other array's offset for the same p>>1
+=> what currently broke me is just the concatenation of odd and even

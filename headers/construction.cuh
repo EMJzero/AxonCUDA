@@ -65,24 +65,28 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
 
 std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
     const runconfig cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
     const uint32_t *d_groups,
     const uint32_t *d_ungroups,
     const dim_t *d_ungroups_offsets,
     const uint32_t curr_num_nodes,
     const uint32_t new_num_nodes,
-    const uint32_t max_neighbors,
+    const dim_t neighbors_size,
     uint32_t *d_neighbors,
     dim_t *d_neighbors_offsets
 );
 
-std::tuple<dim_t, dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
+std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
     const runconfig cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t *d_srcs_count,
     const uint32_t *d_groups,
     const uint32_t num_hedges,
-    const uint32_t max_hedge_size
+    const dim_t hedges_size
 );
 
 std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
@@ -139,147 +143,172 @@ void neighbors_sample_kernel(
 
 __global__
 void neighborhoods_count_kernel(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
     const uint32_t num_nodes,
     const dim_t max_neighbors,
     const bool discharge,
-    uint32_t* neighbors,
-    dim_t* neighbors_offsets
+    uint32_t* __restrict__ neighbors,
+    dim_t* __restrict__ neighbors_offsets
 );
 
 __global__
 void neighborhoods_scatter_kernel(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
     const uint32_t num_nodes,
-    const dim_t* neighbors_offsets,
-    uint32_t* neighbors
+    const dim_t* __restrict__ neighbors_offsets,
+    uint32_t* __restrict__ neighbors
 );
 
 __global__
 void apply_coarsening_hedges_count(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
-    const uint32_t* groups,
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const uint32_t* __restrict__ groups,
     const uint32_t num_hedges,
-    const uint32_t max_hedge_size,
     uint32_t *coarse_oversized_hedges,
-    dim_t* coarse_hedges_offsets,
-    uint32_t* coarse_srcs_count
+    dim_t* __restrict__ coarse_hedges_offsets,
+    uint32_t* __restrict__ coarse_srcs_count
 );
 
 __global__
 void apply_coarsening_hedges_scatter_dsts(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
-    const uint32_t* groups,
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const uint32_t* __restrict__ groups,
     const uint32_t num_hedges,
-    const dim_t* coarse_hedges_offsets,
-    uint32_t* coarse_hedges
+    const dim_t* __restrict__ coarse_hedges_offsets,
+    uint32_t* __restrict__ coarse_hedges
 );
 
 __global__
 void apply_coarsening_hedges_scatter_srcs(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
-    const uint32_t* srcs_count,
-    const uint32_t* groups,
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const uint32_t* __restrict__ groups,
     const uint32_t num_hedges,
-    const dim_t* coarse_hedges_offsets,
-    const uint32_t* coarse_srcs_count,
-    uint32_t* coarse_hedges
+    const dim_t* __restrict__ coarse_hedges_offsets,
+    const uint32_t* __restrict__ coarse_srcs_count,
+    uint32_t* __restrict__ coarse_hedges
+);
+
+__global__
+void sum_of_grouped_neighbors_count(
+    const dim_t* __restrict__ neighbors_offsets,
+    const uint32_t* __restrict__ ungroups,
+    const dim_t* __restrict__ ungroups_offsets,
+    const uint32_t num_groups,
+    dim_t* __restrict__ grouped_neighbors_offsets
 );
 
 __global__
 void apply_coarsening_neighbors_count(
-    const uint32_t* neighbors,
-    const dim_t* neighbors_offsets,
-    const uint32_t* groups,
-    const uint32_t* ungroups,
-    const dim_t* ungroups_offsets,
+    const uint32_t* __restrict__ neighbors,
+    const dim_t* __restrict__ neighbors_offsets,
+    const uint32_t* __restrict__ groups,
+    const uint32_t* __restrict__ ungroups,
+    const dim_t* __restrict__ ungroups_offsets,
+    const dim_t* __restrict__ coarse_oversized_neighbors_offsets,
     const uint32_t num_groups,
-    const dim_t max_neighbors,
-    const bool discharge,
-    uint32_t* oversized_coarse_neighbors,
-    dim_t* coarse_neighbors_offsets
+    uint32_t* __restrict__ oversized_coarse_neighbors,
+    dim_t* __restrict__ coarse_neighbors_offsets
 );
 
 __global__
-void apply_coarsening_neighbors_scatter(
-    const uint32_t* neighbors,
-    const dim_t* neighbors_offsets,
-    const uint32_t* groups,
-    const uint32_t* ungroups,
-    const dim_t* ungroups_offsets,
+void rebuild_coarsening_neighbors_count(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t* __restrict__ groups,
+    const uint32_t* __restrict__ ungroups,
+    const dim_t* __restrict__ ungroups_offsets,
     const uint32_t num_groups,
-    const dim_t* coarse_neighbors_offsets,
-    uint32_t* coarse_neighbors
+    const bool discharge,
+    const dim_t* __restrict__ coarse_oversized_neighbors_offsets,
+    uint32_t* __restrict__ coarse_oversized_neighbors,
+    dim_t* __restrict__ coarse_neighbors_offsets
+);
+
+__global__
+void rebuild_coarsening_neighbors_scatter(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t* __restrict__ groups,
+    const uint32_t* __restrict__ ungroups,
+    const dim_t* __restrict__ ungroups_offsets,
+    const dim_t* __restrict__ coarse_neighbors_offsets,
+    const uint32_t num_groups,
+    uint32_t* __restrict__ coarse_neighbors
 );
 
 __global__
 void apply_coarsening_touching_count(
-    const uint32_t* hedges,
-    const dim_t* hedges_offsets,
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
     const uint32_t num_hedges,
-    dim_t* coarse_touching_offsets
+    dim_t* __restrict__ coarse_touching_offsets
 ) ;
 
 __global__
 void apply_coarsening_touching_scatter_inbound(
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
-    const uint32_t* inbound_count,
-    const uint32_t* ungroups,
-    const dim_t* ungroups_offsets,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t* __restrict__ inbound_count,
+    const uint32_t* __restrict__ ungroups,
+    const dim_t* __restrict__ ungroups_offsets,
     const uint32_t num_groups,
-    const dim_t* coarse_touching_offsets,
-    uint32_t* coarse_touching,
-    uint32_t* coarse_inbound_count
+    const dim_t* __restrict__ coarse_touching_offsets,
+    uint32_t* __restrict__ coarse_touching,
+    uint32_t* __restrict__ coarse_inbound_count
 );
 
 __global__
 void apply_coarsening_touching_scatter_outbound(
-    const uint32_t* touching,
-    const dim_t* touching_offsets,
-    const uint32_t* inbound_count,
-    const uint32_t* ungroups,
-    const dim_t* ungroups_offsets,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t* __restrict__ inbound_count,
+    const uint32_t* __restrict__ ungroups,
+    const dim_t* __restrict__ ungroups_offsets,
     const uint32_t num_groups,
-    const dim_t* coarse_touching_offsets,
-    const uint32_t* coarse_inbound_count,
-    uint32_t* coarse_touching
+    const dim_t* __restrict__ coarse_touching_offsets,
+    const uint32_t* __restrict__ coarse_inbound_count,
+    uint32_t* __restrict__ coarse_touching
 );
 
 __global__
 void apply_uncoarsening_partitions(
-    const uint32_t* groups,
-    const uint32_t* coarse_partitions,
+    const uint32_t* __restrict__ groups,
+    const uint32_t* __restrict__ coarse_partitions,
     const uint32_t num_nodes,
-    uint32_t* partitions
+    uint32_t* __restrict__ partitions
 );
 
 __global__
 void pack_segments(
-    const uint32_t* oversized,
-    const dim_t* offsets,
+    const uint32_t* __restrict__ oversized,
+    const dim_t* __restrict__ offsets,
     const uint32_t num_subs,
     const dim_t sub_size,
-    uint32_t* out
+    uint32_t* __restrict__ out
 );
 
 __global__
 void pack_segments_varsize(
-    const uint32_t* oversized,
-    const dim_t* oversized_offsets,
-    const dim_t* offsets,
+    const uint32_t* __restrict__ oversized,
+    const dim_t* __restrict__ oversized_offsets,
+    const dim_t* __restrict__ offsets,
     const uint32_t num_subs,
     const dim_t base_sub_size,
-    uint32_t* out
+    uint32_t* __restrict__ out
 );

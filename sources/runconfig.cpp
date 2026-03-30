@@ -34,6 +34,7 @@ void printHelp() {
         "  -m <> <> <> Constraints set to use, in order: max part. size, max part. distinct inbound hedges, max num. of part.s (overrides '-c')\n"
         "  -k <k> <ε>  K-way balanced constraints set to use (overrides '-c' and '-m')\n"
         "  -om <mult>  Set the deduplication oversized segment size multiplier (increase to avoid the 'GM hash-set full!' assert)\n"
+        //"  -som        Set the deduplication segment size to the sum of the merged set sizes (set to avoid the 'GM hash-set full!' assert)\n"
         "  -cnc <num>  Set the count of candidates proposed per node during coarsening\n"
         "  -rfr <num>  Set the number of refinement repetitions per level\n"
         "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
