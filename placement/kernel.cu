@@ -2,7 +2,7 @@
 #include <cooperative_groups.h>
 #include <stdint.h>
 
-#include "../utils.cuh"
+#include "../headers/utils.cuh"
 #include "utils.cuh"
 
 namespace cg = cooperative_groups;
@@ -225,9 +225,9 @@ void exclusive_swaps_kernel(
     * Note: tension is SYMMETRIC!
     */
 
-    int32_t path_length[MAX_REPEATS];
-    uint32_t path[PATH_SIZE];
-    const uint32_t actual_path_size = PATH_SIZE / num_repeats;
+    int32_t path_length[MAX_SWAPS_MATCHING_REPEATS];
+    uint32_t path[SWAPS_PATH_SIZE];
+    const uint32_t actual_path_size = SWAPS_PATH_SIZE / num_repeats;
     uint32_t completed_repeats = 0u;
 
     for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {

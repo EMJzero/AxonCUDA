@@ -290,14 +290,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
         CUDA_CHECK(cudaDeviceSynchronize());
     }
     if (!direct_scatter_neighbors) CUDA_CHECK(cudaFree(d_oversized_neighbors)); // no pack? free oversized immediately
-    
-    // correct the max neighbors count estimate
-    //auto actual_max_neighbors = thrust::max_element(t_neigh_offsets, t_neigh_offsets + num_nodes);
-    //dim_t actual_max_neighbors_offset = static_cast<dim_t>(actual_max_neighbors - t_neigh_offsets);
-    //dim_t new_max_neighbors;
-    //CUDA_CHECK(cudaMemcpy(&new_max_neighbors, d_neighbors_offsets + actual_max_neighbors_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
-    //std::cout << "Max neighbors estimate corrected to " << new_max_neighbors << "\n";
-    
+
     // compute final offsets
     thrust::exclusive_scan(t_neigh_offsets, t_neigh_offsets + (num_nodes + 1), t_neigh_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
     dim_t total_neighbors;
@@ -560,13 +553,6 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
         }
     }
     CUDA_CHECK(cudaFree(d_coarse_oversized_neighbors_offsets));
-    
-    // correct the max neighbors count estimate
-    //auto actual_coarse_max_neighbors = thrust::max_element(t_coarse_neigh_offsets, t_coarse_neigh_offsets + new_num_nodes + 1);
-    //dim_t actual_coarse_max_neighbors_offset = static_cast<dim_t>(actual_coarse_max_neighbors - t_coarse_neigh_offsets);
-    //dim_t new_max_neighbors;
-    //CUDA_CHECK(cudaMemcpy(&new_max_neighbors, d_coarse_neighbors_offsets + actual_coarse_max_neighbors_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
-    //std::cout << "Max neighbors estimate corrected to " << new_max_neighbors << "\n";
 
     return std::make_tuple(new_neighbors_size, d_coarse_neighbors, d_coarse_neighbors_offsets);
 }
@@ -620,13 +606,6 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaFree(d_coarse_oversized_hedges));
 
-    // correct the max hedge size estimate
-    //auto actual_coarse_max_hedge_size = thrust::max_element(t_coarse_hedges_offsets, t_coarse_hedges_offsets + num_hedges + 1);
-    //dim_t actual_coarse_max_hedge_size_offset = static_cast<dim_t>(actual_coarse_max_hedge_size - t_coarse_hedges_offsets);
-    //dim_t new_max_hedge_size;
-    //CUDA_CHECK(cudaMemcpy(&new_max_hedge_size, d_coarse_hedges_offsets + actual_coarse_max_hedge_size_offset, sizeof(dim_t), cudaMemcpyDeviceToHost));
-    //std::cout << "Max hedges estimate corrected to " << max_hedge_size << "\n";
-    
     // NOTE: the scan wants the last index EXCLUDED, while the memcopy wants the last index exactly! That's why we use here the +1, and not later!
     thrust::inclusive_scan(t_coarse_hedges_offsets, t_coarse_hedges_offsets + (num_hedges + 1), t_coarse_hedges_offsets); // in-place exclusive scan (the last element collects the full reduce)
     dim_t new_hedges_size = 0; // last value in the inclusive scan = full reduce = total number of pins among all hedges

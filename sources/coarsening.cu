@@ -146,8 +146,8 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
             num_repeats = (blocks + max_blocks - 1) / max_blocks;
             std::cout << "NOTE: grouping kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
             blocks = (blocks + num_repeats - 1) / num_repeats;
-            if (num_repeats > MAX_REPEATS) {
-                std::cout << "ABORTING: grouping kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_REPEATS << " !!\n";
+            if (num_repeats > MAX_MATCHING_REPEATS) {
+                std::cout << "ABORTING: grouping kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_MATCHING_REPEATS << " !!\n";
                 abort();
             }
         }

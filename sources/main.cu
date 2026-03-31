@@ -231,15 +231,7 @@ int main(int argc, char** argv) {
         );
     }
 
-    // estimated max hedge and neighbors count
-    //thrust::device_ptr<dim_t> t_hedges_offsets(d_hedges_offsets);
-    //dim_t max_hedge_size =
-    //thrust::transform_reduce(
-    //    thrust::make_zip_iterator(thrust::make_tuple(t_hedges_offsets + 1, t_hedges_offsets)),
-    //    thrust::make_zip_iterator(thrust::make_tuple(t_hedges_offsets + num_hedges + 1, t_hedges_offsets + num_hedges)),
-    //    [] __host__ __device__ (const thrust::tuple<dim_t, dim_t>& t) { return thrust::get<0>(t) - thrust::get<1>(t); },
-    //    dim_t{0}, thrust::maximum<dim_t>()
-    //);
+    // estimated max neighbors count
     //const dim_t max_neighbors = hg.sampleMaxNeighborhoodSize(NEIGHBORS_SAMPLE_SIZE); // TODO: is 240 enough here? Maybe 2400?
     const dim_t max_neighbors = sampleMaxNeighborhoodSize(
         cfg,
@@ -250,7 +242,6 @@ int main(int argc, char** argv) {
         num_nodes,
         NEIGHBORS_SAMPLE_SIZE
     );
-    //std::cout << "Max hedges estimate set to " << max_hedge_size << ", neighbors estimate set to " << max_neighbors << "\n";
     std::cout << "Max neighbors estimate set to: " << max_neighbors << "\n";
 
     std::cout << "Starting core timer...\n";
@@ -498,6 +489,17 @@ int main(int argc, char** argv) {
             // NOTE: just like groups, partitions need to ordered, as they be used as indices; however, partitions are few, and if one becomes
             //       empty we can just discard its index and leave a few empty spots in the data structures, it's cheaper to compress at the end
 
+            // base case, reached the target number of partitions
+            if (new_num_nodes <= target_parts) {
+                std::cout << "Minimal initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
+            } else if (new_num_nodes <= max_parts) {
+                std::cout << "Initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
+                std::cerr << "WARNING: the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ")...\n";
+            } else { // base case, failure to coarsen further
+                std::cerr << "FAILED TO COARSEN FURTHER at level " << level_idx << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << new_num_nodes << " max allowed partitions=" << max_parts << "\n";
+                std::cerr << "WARNING: falling back to returning current groups as individual partitions...\n";
+            }
+
             // neighbors are no longer needed after coarsening is done
             CUDA_CHECK(cudaFree(d_neighbors));
             CUDA_CHECK(cudaFree(d_neighbors_offsets));
@@ -510,17 +512,6 @@ int main(int argc, char** argv) {
             const size_t pins_per_partitions_bytes = static_cast<size_t>(num_hedges) * new_num_nodes * sizeof(uint32_t);
             CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, pins_per_partitions_bytes));
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, new_num_nodes * sizeof(uint32_t)));
-
-            // base case, reached the target number of partitions
-            if (new_num_nodes <= target_parts) {
-                std::cout << "Minimal initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
-            } else if (new_num_nodes <= max_parts) {
-                std::cout << "Initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
-                std::cerr << "WARNING: the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ")...\n";
-            } else { // base case, failure to coarsen further
-                std::cerr << "FAILED TO COARSEN FURTHER at level " << level_idx << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << new_num_nodes << " max allowed partitions=" << max_parts << "\n";
-                std::cerr << "WARNING: falling back to returning current groups as individual partitions...\n";
-            }
 
             CUDA_CHECK(cudaFree(d_ungroups));
             CUDA_CHECK(cudaFree(d_ungroups_offsets));
@@ -543,12 +534,6 @@ int main(int argc, char** argv) {
         );
         #endif
         // =============================
-
-        // update the maximum hedges and neighbors estimate by scaling it by new_num_nodes/curr_num_nodes
-        //float scale = (float)new_num_nodes / curr_num_nodes;
-        //max_hedge_size = std::ceil(max_hedge_size * scale);
-        //max_neighbors = std::ceil(max_neighbors * scale);
-        //std::cout << "Max hedges estimate updated to " << max_hedge_size << ", neighbors estimate updated to " << max_neighbors << "\n";
 
         // prepare coarse neighbors buffers
         // NOTE: overwrites previous neighbors

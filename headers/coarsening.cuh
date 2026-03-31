@@ -23,7 +23,7 @@ namespace cg = cooperative_groups;
 
 // #define MAX_GROUP_SIZE 1u // => MAX_GROUP_SIZE - 1 slots per node; 2 means pairs [IDEA NOT WORTH IT]
 #define PATH_SIZE 224u // initial slots for nodes to see while traversing the pairs tree, TODO: automatically extend if needed (costly...)
-#define MAX_REPEATS 64u // maximum number of nodes a single thread can handle, must be less than 32 (due to using one-hot anti-repeat encoding)
+#define MAX_MATCHING_REPEATS 64u // maximum number of nodes a single thread can handle, must be less than 32 (due to using one-hot anti-repeat encoding)
 
 
 // STEPS

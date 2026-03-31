@@ -328,7 +328,8 @@ void grouping_kernel(
     * TODO: let only threads on leaves do the walks...
     */
 
-    int32_t path_length[MAX_REPEATS];
+    int32_t path_length[MAX_MATCHING_REPEATS];
+
     uint32_t path[PATH_SIZE];
     const uint32_t actual_path_size = PATH_SIZE / num_repeats;
     uint32_t completed_repeats = 0u;

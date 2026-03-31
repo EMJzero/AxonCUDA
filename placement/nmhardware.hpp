@@ -11,7 +11,7 @@
 #include <unordered_set>
 #include <unordered_map>
 
-#include "../hgraph.hpp"
+#include "../includes/hgraph.hpp"
 
 // GEOMETRY HELPERS
 

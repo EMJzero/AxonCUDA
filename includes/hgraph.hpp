@@ -384,10 +384,10 @@ namespace hgraph {
         // return a greedy order of nodes that maximizes high-locality
         // -> frontier expansion starting from nodes with minimal inbound connections
         // -> iteratively add to the frontier the node most strongly connected to those already part of it
-        std::vector<int32_t> feedForwardOrder() const {
+        std::vector<uint32_t> feedForwardOrder() const {
             if (!incidences_built_) throw std::runtime_error("Call to feedForwardOrder(). Incidence sets not built. Call buildIncidenceSets() first.");
 
-            std::vector<int32_t> new_id(node_count_, -1);
+            std::vector<uint32_t> new_id(node_count_, UINT32_MAX);
             std::vector<float> priority(node_count_, 0.0f);
             std::vector<bool> active(node_count_, false);
 
@@ -419,7 +419,7 @@ namespace hgraph {
                 std::vector<uint32_t> fallback;
 
                 for (uint32_t n = 0; n < node_count_; ++n) {
-                    if (new_id[n] != -1) continue;
+                    if (new_id[n] != UINT32_MAX) continue;
 
                     uint32_t deg = inbound_[n].size();
                     if (deg == 0) {
@@ -443,7 +443,7 @@ namespace hgraph {
                     auto [p, n] = heap.top();
                     heap.pop();
 
-                    if (new_id[n] != -1) continue;
+                    if (new_id[n] != UINT32_MAX) continue;
                     if (p != priority[n]) continue;
 
                     new_id[n] = next_id++;
@@ -455,7 +455,7 @@ namespace hgraph {
 
                         for (uint32_t i = 0; i < he.length(); ++i) {
                             uint32_t m = hedges_flat_[he.offset() + i];
-                            if (new_id[m] == -1)
+                            if (new_id[m] == UINT32_MAX)
                                 activate(m, w);
                         }
                     }
@@ -466,7 +466,7 @@ namespace hgraph {
         }
 
         // renames nodes according to a new id give for each of them
-        HyperGraph renameNodes(std::vector<int32_t> new_id) const {
+        HyperGraph renameNodes(std::vector<uint32_t> new_id) const {
             if (new_id.size() != node_count_) throw std::runtime_error("The number of new ids did not match the number of existing nodes");
 
             std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> new_hedges;

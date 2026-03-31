@@ -8,20 +8,14 @@
 #include <algorithm>
 #include <filesystem>
 
-#include </home/mronzani/cuda/include/cuda_runtime.h>
+#include <cuda_runtime.h>
 
-#include </home/mronzani/cuda/include/thrust/sort.h>
-#include </home/mronzani/cuda/include/thrust/scan.h>
-#include </home/mronzani/cuda/include/thrust/scatter.h>
-#include </home/mronzani/cuda/include/thrust/sequence.h>
-#include </home/mronzani/cuda/include/thrust/transform.h>
-#include </home/mronzani/cuda/include/thrust/device_ptr.h>
-#include </home/mronzani/cuda/include/thrust/device_vector.h>
-#include </home/mronzani/cuda/include/thrust/iterator/discard_iterator.h>
-#include </home/mronzani/cuda/include/thrust/iterator/permutation_iterator.h>
+#include "../headers/thruster.cuh"
 
-#include "../hgraph.hpp"
-#include "../utils.cuh"
+#include <cub/cub.cuh>
+
+#include "../includes/hgraph.hpp"
+#include "../headers/utils.cuh"
 #include "nmhardware.hpp"
 #include "utils.cuh"
 
@@ -38,9 +32,9 @@ extern __global__ void inverse_placement_kernel(
 
 extern __global__ void forces_kernel(
     const uint32_t* hedges,
-    const uint32_t* hedges_offsets,
+    const dim_t* hedges_offsets,
     const uint32_t* touching,
-    const uint32_t* touching_offsets,
+    const dim_t* touching_offsets,
     const float* hedge_weights,
     const coords* placement,
     const uint32_t num_nodes,
@@ -81,9 +75,9 @@ extern __global__ void scatter_ranks_kernel(
 
 extern __global__ void cascade_kernel(
     const uint32_t* hedges,
-    const uint32_t* hedges_offsets,
+    const dim_t* hedges_offsets,
     const uint32_t* touching,
-    const uint32_t* touching_offsets,
+    const dim_t* touching_offsets,
     const float* hedge_weights,
     const coords* placement,
     const swap* ev_swaps,
@@ -97,6 +91,17 @@ extern __global__ void apply_swaps_kernel(
     const uint32_t num_good_swaps,
     coords* placement,
     uint32_t* inv_placement
+);
+
+extern uint32_t* locality_ordering(
+    const uint32_t num_nodes,
+    const uint32_t num_hedges,
+    const uint32_t* d_hedges,
+    const dim_t* d_hedges_offsets,
+    const float* d_hedge_weights,
+    const uint32_t* d_touching,
+    const dim_t* d_touching_offsets,
+    const uint64_t seed
 );
 
 extern __constant__ uint32_t max_width;
@@ -125,6 +130,8 @@ void printHelp() {
         "  -r <file>   Reload hypergraph from file\n"
         "  -s <file>   Save placement data to file\n"
         "  -c <name>   Constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024 - default is loihi64)\n"
+        "  -ff         Replaces the 1D ordering heuristic with host-side sequential feedforward ordering\n"
+        "  -seed <num> Set the algorithm's seed to <num> (default: 86) (ignored when '-ff' is passed)\n"
         "  -h          Show this help\n";
 }
 
@@ -238,6 +245,8 @@ int main(int argc, char** argv) {
     std::string load_path;
     std::string save_path;
     std::string constraints;
+    bool feedforward_order = false; // NB: runs sequentially on the HOST!
+    uint64_t seed = 86u;
 
     // CLI handling
     for (int i = 1; i < argc; ++i) {
@@ -246,45 +255,56 @@ int main(int argc, char** argv) {
         else if (arg == "-r") {
             if (i + 1 >= argc) { std::cerr << "Error: -r requires a file path\n"; return 1; }
             load_path = argv[++i];
-        }
-        else if (arg == "-s") {
+        } else if (arg == "-s") {
             if (i + 1 >= argc) { std::cerr << "Error: -s requires a file path\n"; return 1; }
             save_path = argv[++i];
-        }
-        else if (arg == "-c") {
+        } else if (arg == "-c") {
             if (i + 1 >= argc) { std::cerr << "Error: -c requires a config name\n"; return 1; }
             constraints = argv[++i];
-        }
-        else { std::cerr << "Unknown option: " << arg << "\n"; return 1; }
+        } else if (arg == "-ff") {
+            feedforward_order = true;
+        } else if (arg == "-seed") {
+            if (i + 1 >= argc) { std::cerr << "Error: -seed requires a positive integer value\n"; return 1; }
+            seed = std::stoull(argv[++i]);
+        } else { std::cerr << "Unknown option: " << arg << "\n"; return 1; }
     }
 
     // load hypergraph
     HyperGraph hg(0, {}, {}); // placeholder -> overwritten if "-r" is given
-    bool loaded = false;
 
     if (!load_path.empty()) {
         try {
-            std::cout << "Loading hypergraph from: " << load_path << " ...\n";
-            if (!std::filesystem::is_regular_file(load_path)) throw std::runtime_error("The provided path is not a file.");
-            std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
-            HyperGraph hg_tmp = HyperGraph::loadSNN(load_path);
-            std::cout << "Loading complete, ordering nodes ...\n";
-            hg = hg_tmp.feedForwardOrder();
-            loaded = true;
+            if (!std::filesystem::is_regular_file(load_path)) throw std::runtime_error("Failed to load hypergraph, the provided path is not a file.");
+            std::filesystem::path file_path(load_path);
+            if (file_path.extension() == ".hgr") {
+                std::cout << "Loading hypergraph from: " << load_path << " (hMETIS format) ...\n";
+                std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
+                hg = HyperGraph::loadhMETIS(load_path);
+            } else if (file_path.extension() == ".snn") {
+                std::cout << "Loading hypergraph from: " << load_path << " (SNN format) ...\n";
+                std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
+                hg = HyperGraph::loadSNN(load_path);
+            } else if (file_path.extension() == ".axh") {
+                std::cout << "Loading hypergraph from: " << load_path << " (AXH format) ...\n";
+                std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(load_path)) / (1 << 20) << " MB\n";
+                hg = HyperGraph::loadAXH(load_path);
+            } else {
+                throw std::runtime_error("Failed to load hypergraph, unsupported file format (supported: '.hgr', '.snn', '.axh').");
+            }
         } catch (const std::exception& e) {
             std::cerr << "Error loading file: " << e.what() << "\n";
-            return 1;
+            std::exit(1);
         }
-
-        // print statistics
-        std::cout << "Loaded hypergraph:\n";
-        std::cout << "  Nodes:       " << hg.nodes() << "\n";
-        std::cout << "  Hyperedges:  " << hg.hedges().size() << "\n";
-        std::cout << "  Total pins:  " << hg.hedgesFlat().size() << "\n";
-        std::cout << "  Total Spike Frequency: " << std::fixed << std::setprecision(3) << hg.connectivity() << "\n";
     } else {
-        std::cout << "WARNING, no hypergraph provided (-r), performing a dry-run !!\n";
+        std::cerr << "WARNING, no hypergraph provided (-r), performing a dry-run !!\n";
     }
+
+    // print statistics
+    std::cout << "Loaded hypergraph:\n";
+    std::cout << "  Nodes:      " << hg.nodes() << "\n";
+    std::cout << "  Hyperedges: " << hg.hedges().size() << "\n";
+    std::cout << "  Total pins: " << hg.hedgesFlat().size() << "\n";
+    std::cout << "  Total connections weight: " << std::fixed << std::setprecision(3) << hg.connectivity() << "\n";
 
     // setup the hardware model
     std::optional<HardwareModel> hw_tmp;
@@ -315,10 +335,7 @@ int main(int argc, char** argv) {
         std::cerr << "ERROR, the hypergraph has more nodes (" << hg.nodes() << ") than the 2D lattice has points (" << hw.coresAlongX() * hw.coresAlongY() << "), placement would fail !!\n";
         return 1;
     }
-
-    // ============================
-    // === CUDA STUFF GOES HERE ===
-
+    
     std::cout << "CUDA device:\n";
     
     // get device properties
@@ -333,30 +350,28 @@ int main(int argc, char** argv) {
     std::cout << "  Max. grid size: " << props.maxGridSize[0] << " x " << props.maxGridSize[1] << " x " << props.maxGridSize[2] << "\n";
     std::cout << "  Max. block size: " << props.maxThreadsDim[0] << " x " << props.maxThreadsDim[1] << " x " << props.maxThreadsDim[2] << "\n";
     
-    std::cout << "Starting timer...\n";
-    auto time_start = std::chrono::high_resolution_clock::now();
-    cudaEvent_t d_time_start, d_time_stop;
-    CUDA_CHECK(cudaEventCreate(&d_time_start));
-    CUDA_CHECK(cudaEventCreate(&d_time_stop));
-    CUDA_CHECK(cudaEventRecord(d_time_start));
-
-    std::cout << "Setting up GPU memory...\n";
+    std::cout << "Preparing hypergraph data...\n";
 
     uint32_t num_hedges = static_cast<uint32_t>(hg.hedges().size());
-    std::vector<uint32_t> hedges_offsets; // hedge idx -> hedge start index in the contiguous hedges array
+    std::vector<dim_t> hedges_offsets; // hedge idx -> hedge start index in the contiguous hedges array
+    std::vector<uint32_t> srcs_count;
     hedges_offsets.reserve(num_hedges + 1);
+    //srcs_count.reserve(num_hedges);
 
     // prepare hedge offsets
-    for (uint32_t i = 0; i < num_hedges; ++i)
-        hedges_offsets.push_back(hg.hedges()[i].offset());
-    hedges_offsets.push_back(static_cast<uint32_t>(hg.hedgesFlat().size()));
+    for (uint32_t i = 0; i < num_hedges; ++i) {
+        hedges_offsets.push_back(static_cast<dim_t>(hg.hedges()[i].offset()));
+        //srcs_count.push_back(hg.hedges()[i].src_count());
+    }
+    hedges_offsets.push_back(hg.hedgesFlat().size());
 
     std::vector<uint32_t> touching_hedges;
-    std::vector<uint32_t> touching_hedges_offsets;
+    std::vector<dim_t> touching_hedges_offsets;
     touching_hedges.reserve(hg.hedgesFlat().size()); // with one outbound hedge per node, the total number of pins (e*d) is the total number of connections (n*h)
     touching_hedges_offsets.reserve(hg.nodes() + 1);
 
     // prepare touching sets
+    hg.buildIncidenceSets();
     for (uint32_t n = 0; n < hg.nodes(); ++n) {
         touching_hedges_offsets.push_back(touching_hedges.size());
         // NOTE: must put in inbounds first!
@@ -380,22 +395,40 @@ int main(int argc, char** argv) {
     const uint32_t h_max_width = hw.coresAlongX();
     const uint32_t h_max_height = hw.coresAlongY();
 
+    std::cout << "Starting timer...\n";
+    auto time_start = std::chrono::high_resolution_clock::now();
+    cudaEvent_t d_time_start, d_time_stop;
+    CUDA_CHECK(cudaEventCreate(&d_time_start));
+    CUDA_CHECK(cudaEventCreate(&d_time_stop));
+    CUDA_CHECK(cudaEventRecord(d_time_start));
+
+    // ============================
+    // === CUDA STUFF GOES HERE ===
+
+    std::cout << "Setting up GPU memory...\n";
+
     // device pointers
-    uint32_t *d_hedges_offsets = nullptr, *d_hedges = nullptr;
-    uint32_t *d_touching = nullptr, *d_touching_offsets = nullptr, *d_inbound_count = nullptr;
-    float *d_hedge_weights = nullptr;
-    coords *d_placement = nullptr;
-    uint32_t *d_inv_placement = nullptr;
+    // hypergraph
+    uint32_t *d_hedges = nullptr; // contigous hedges array (each hedge must be stored as src+destinations, with the src in the first position)
+    dim_t *d_hedges_offsets = nullptr; // hedges_offsets[hedge idx] -> hedge start idx in d_hedges
+    //uint32_t *d_srcs_count = nullptr; // srcs_count[hedge idx] -> number of sources of hedge idx
+    uint32_t *d_touching = nullptr; // contigous inbound+outbout sets array (first inbound, then outbound)
+    dim_t *d_touching_offsets = nullptr; // touching_offsets[node idx] -> touching set start idx in d_touching
+    //uint32_t *d_inbound_count = nullptr; // inbound_count[node idx] -> how many hedge of touching[node idx] are inbound (inbound hedges are before inbound_count[node idx], then outbound)
+    float *d_hedge_weights = nullptr; // hedge_weights[hedge idx] -> weight
+    // placement
+    coords *d_placement = nullptr; // placement[node idx] -> x and y placement coordinates of node
+    uint32_t *d_inv_placement = nullptr; // inv_placement[y * h_max_width + x] -> idx of the node occupying such place, or UINT32_MAX
     // refinement structures
-    float *d_forces = nullptr;
-    uint32_t *d_pairs = nullptr;
-    uint32_t *d_scores = nullptr;
-    slot *d_swap_slots = nullptr;
-    uint32_t *d_swap_flags = nullptr;
+    float *d_forces = nullptr; // forces[4*node idx + 0 for dx, + 1 for sx, +2 for up, +2 for down] -> direction of the node's two proposed moves
+    uint32_t *d_pairs = nullptr; // pairs[4*node idx + 0..] -> nodes the current one wants to swap with, ordered by decreasing score
+    uint32_t *d_scores = nullptr; // scores[4*node idx + 0..] -> score with which node wants to pair with other nodes
+    slot *d_swap_slots = nullptr; // slot to finalize node pairs while computing exclusive swaps (true dtype: "slot")
+    uint32_t *d_swap_flags = nullptr; // swap_flag[node idx] -> set to 1 for the lower-id of each node in a swap-pair, in order to create swap-events
     // events structures
-    swap *d_ev_swaps = nullptr;
-    float *d_ev_scores = nullptr;
-    uint32_t *d_nodes_rank = nullptr;
+    swap *d_ev_swaps = nullptr; // ev_swaps[event idx] -> pair of nodes involved in the event's swap
+    float *d_ev_scores = nullptr; // ev_scores[event idx] -> score (cost gain) achieved by the event's swap
+    uint32_t *d_nodes_rank = nullptr; // node_rank[node idx] -> rank (index) in the sorted events by score of the node
 
      // kernel dimensions
     int blocks, threads_per_block, warps_per_block;
@@ -404,34 +437,35 @@ int main(int argc, char** argv) {
     int blocks_per_SM, max_blocks;
 
     // allocate device memory
-    CUDA_CHECK(cudaMalloc(&d_hedges, hg.hedgesFlat().size() * sizeof(uint32_t))); // contigous hedges array (each hedge must be stored as src+destinations, with the src in the first position)
-    CUDA_CHECK(cudaMalloc(&d_hedges_offsets, (num_hedges + 1) * sizeof(uint32_t))); // hedges_offsets[hedge idx] -> hedge start idx in d_hedges
-    CUDA_CHECK(cudaMalloc(&d_touching, touching_hedges.size() * sizeof(uint32_t))); // contigous inbound+outbout sets array (first inbound, then outbound)
-    CUDA_CHECK(cudaMalloc(&d_touching_offsets, (num_nodes + 1) * sizeof(uint32_t))); // touching_offsets[node idx] -> touching set start idx in d_touching
-    CUDA_CHECK(cudaMalloc(&d_inbound_count, num_nodes * sizeof(uint32_t))); // inbound_count[node idx] -> how many hedge of touching[node idx] are inbound (inbound hedges are before inbound_count[node idx], then outbound)
-    CUDA_CHECK(cudaMalloc(&d_hedge_weights, num_hedges * sizeof(float))); // hedge_weights[hedge idx] -> weight
-    CUDA_CHECK(cudaMalloc(&d_placement, num_nodes * sizeof(coords))); // placement[node idx] -> x and y placement coordinates of node
-    CUDA_CHECK(cudaMalloc(&d_inv_placement, h_max_width * h_max_height * sizeof(uint32_t))); // inv_placement[y * h_max_width + x] -> idx of the node occupying such place, or UINT32_MAX
-    CUDA_CHECK(cudaMalloc(&d_forces, 4 * num_nodes * sizeof(float))); // forces[4*node idx + 0 for dx, + 1 for sx, +2 for up, +2 for down] -> direction of the node's two proposed moves
-    CUDA_CHECK(cudaMalloc(&d_pairs, MAX_CANDIDATE_MOVES * num_nodes * sizeof(uint32_t))); // pairs[4*node idx + 0..] -> nodes the current one wants to swap with, ordered by decreasing score
-    CUDA_CHECK(cudaMalloc(&d_scores, MAX_CANDIDATE_MOVES * num_nodes * sizeof(uint32_t))); // scores[4*node idx + 0..] -> score with which node wants to pair with other nodes
-    CUDA_CHECK(cudaMalloc(&d_swap_slots, num_nodes * sizeof(slot))); // slot to finalize node pairs while computing exclusive swaps (true dtype: "slot")
-    //CUDA_CHECK(cudaMalloc(&d_swaps, num_nodes * sizeof(uint32_t))); // swaps[node idx] -> other node the current one can be swapped with (only contains mutually-pointing pairs)
-    CUDA_CHECK(cudaMalloc(&d_swap_flags, (num_nodes + 1) * sizeof(uint32_t))); // swap_flag[node idx] -> set to 1 for the lower-id of each node in a swap-pair, in order to create swap-events
-    CUDA_CHECK(cudaMalloc(&d_ev_swaps, num_nodes * sizeof(swap))); // ev_swaps[event idx] -> pair of nodes involved in the event's swap
-    CUDA_CHECK(cudaMalloc(&d_ev_scores, num_nodes * sizeof(float))); // ev_scores[event idx] -> score (cost gain) achieved by the event's swap
-    CUDA_CHECK(cudaMalloc(&d_nodes_rank, num_nodes * sizeof(uint32_t))); // node_rank[node idx] -> rank (index) in the sorted events by score of the node
+    CUDA_CHECK(cudaMalloc(&d_hedges, hg.hedgesFlat().size() * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_hedges_offsets, (num_hedges + 1) * sizeof(dim_t)));
+    //CUDA_CHECK(cudaMalloc(&d_srcs_count, num_hedges * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_touching, touching_hedges.size() * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_touching_offsets, (num_nodes + 1) * sizeof(dim_t)));
+    //CUDA_CHECK(cudaMalloc(&d_inbound_count, num_nodes * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_hedge_weights, num_hedges * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_placement, num_nodes * sizeof(coords)));
+    CUDA_CHECK(cudaMalloc(&d_inv_placement, h_max_width * h_max_height * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_forces, 4 * num_nodes * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_pairs, MAX_CANDIDATE_MOVES * num_nodes * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_scores, MAX_CANDIDATE_MOVES * num_nodes * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_swap_slots, num_nodes * sizeof(slot)));
+    CUDA_CHECK(cudaMalloc(&d_swap_flags, (num_nodes + 1) * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_ev_swaps, num_nodes * sizeof(swap)));
+    CUDA_CHECK(cudaMalloc(&d_ev_scores, num_nodes * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_nodes_rank, num_nodes * sizeof(uint32_t)));
 
     // copy to device
     CUDA_CHECK(cudaMemcpy(d_hedges, hg.hedgesFlat().data(), hg.hedgesFlat().size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_hedges_offsets, hedges_offsets.data(), (num_hedges + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_hedges_offsets, hedges_offsets.data(), (num_hedges + 1) * sizeof(dim_t), cudaMemcpyHostToDevice));
+    //CUDA_CHECK(cudaMemcpy(d_srcs_count, srcs_count.data(), num_hedges * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_touching, touching_hedges.data(), touching_hedges.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_touching_offsets, touching_hedges_offsets.data(), (num_nodes + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_touching_offsets, touching_hedges_offsets.data(), (num_nodes + 1) * sizeof(dim_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_hedge_weights, hedge_weights.data(), num_hedges * sizeof(float), cudaMemcpyHostToDevice));
 
     // thrust pointers
-    thrust::device_ptr<uint32_t> t_touching_offsets(d_touching_offsets);
-    thrust::device_ptr<uint32_t> t_inbound_count(d_inbound_count);
+    thrust::device_ptr<dim_t> t_touching_offsets(d_touching_offsets);
+    //thrust::device_ptr<uint32_t> t_inbound_count(d_inbound_count);
     thrust::device_ptr<slot> t_swap_slots(d_swap_slots);
     thrust::device_ptr<uint32_t> t_swap_flags(d_swap_flags);
     thrust::device_ptr<swap> t_ev_swaps(d_ev_swaps);
@@ -439,7 +473,7 @@ int main(int argc, char** argv) {
 
     // initialize
     // each initial node has one outbound hyperedge -> init. inbound counts to the number of touching - 1
-    thrust::transform(t_touching_offsets + 1, t_touching_offsets + 1 + num_nodes, t_touching_offsets, t_inbound_count, [] __device__ (int next, int curr) { return next - curr - 1; });
+    //thrust::transform(t_touching_offsets + 1, t_touching_offsets + 1 + num_nodes, t_touching_offsets, t_inbound_count, [] __device__ (int next, int curr) { return next - curr - 1; });
 
     // copy constants to device
     CUDA_CHECK(cudaMemcpyToSymbol(max_width, &h_max_width, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
@@ -450,10 +484,45 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // initial placement
-    // TODO: TOPOLOGICAL NODES ORDER BEFORE THIS! OR SPECTRAL LAYOUT !!
+    uint32_t* d_order_idx = nullptr;  // order_idx[node] -> position in the 1D ordering for node
+    if (feedforward_order) {
+        CUDA_CHECK(cudaMalloc(&d_order_idx, num_nodes * sizeof(uint32_t)));
+        std::cout << "Ordering nodes (sequential - might take a while) ...\n";
+        std::vector<uint32_t> nodes_order_idx = hg.feedForwardOrder();
+        CUDA_CHECK(cudaMemcpy(d_order_idx, nodes_order_idx.data(), num_nodes * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    } else {
+        std::cout << "Ordering nodes (parallel - recursive bisection) ...\n";
+        d_order_idx = locality_ordering(
+            num_nodes,
+            num_hedges,
+            d_hedges,
+            d_hedges_offsets,
+            d_hedge_weights,
+            d_touching,
+            d_touching_offsets,
+            seed
+        );
+    }
+
+    // generate a 1D to 2D map for lattice points
     std::vector<coords> init_placement = hilbertPlacement(num_nodes, h_max_width, h_max_height);
     CUDA_CHECK(cudaMemcpy(d_placement, init_placement.data(), num_nodes * sizeof(coords), cudaMemcpyHostToDevice));
+
+    // assign (scatter) to the nodes their respective placement following both 1D orders (from ordered nodes through the lattice points map)
+    coords *d_tmp_placement = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_tmp_placement, num_nodes * sizeof(coords)));
+    thrust::device_ptr<coords> t_placement(d_placement);
+    thrust::device_ptr<coords> t_tmp_placement(d_tmp_placement);
+    thrust::device_ptr<uint32_t> t_order_idx(d_order_idx);
+    thrust::scatter(t_placement, t_placement + num_nodes, t_order_idx, t_tmp_placement);
+    CUDA_CHECK(cudaFree(d_order_idx));
+    CUDA_CHECK(cudaFree(d_placement));
+    d_placement = d_tmp_placement;
     
+    // =============================
+    // print some temporary results
+    #if VERBOSE
+    CUDA_CHECK(cudaMemcpy(init_placement.data(), d_placement, num_nodes * sizeof(coords), cudaMemcpyDeviceToHost));
     std::vector<Coord2D> h_init_placement(num_nodes);
     for (uint32_t i = 0; i < num_nodes; i++) {
         h_init_placement[i] = Coord2D(
@@ -479,9 +548,6 @@ int main(int argc, char** argv) {
     }
     std::vector<Coord2D>().swap(h_init_placement);
 
-    // =============================
-    // print some temporary results
-    #if VERBOSE
     std::cout << "Initial placement:\n";
     for (uint32_t i = 0; i < num_nodes; ++i) {
         if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
@@ -642,8 +708,8 @@ int main(int argc, char** argv) {
             num_repeats = (blocks + max_blocks - 1) / max_blocks;
             std::cout << "NOTE: exclusive swaps kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
             blocks = (blocks + num_repeats - 1) / num_repeats;
-            if (num_repeats > MAX_REPEATS) {
-                std::cout << "ABORTING: exclusive swaps kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_REPEATS << " !!\n";
+            if (num_repeats > MAX_SWAPS_MATCHING_REPEATS) {
+                std::cout << "ABORTING: exclusive swaps kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_SWAPS_MATCHING_REPEATS << " !!\n";
                 abort();
             }
         }
@@ -855,9 +921,10 @@ int main(int argc, char** argv) {
     // cleanup device memory
     CUDA_CHECK(cudaFree(d_hedges));
     CUDA_CHECK(cudaFree(d_hedges_offsets));
+    //CUDA_CHECK(cudaFree(d_srcs_count));
     CUDA_CHECK(cudaFree(d_touching));
     CUDA_CHECK(cudaFree(d_touching_offsets));
-    CUDA_CHECK(cudaFree(d_inbound_count));
+    //CUDA_CHECK(cudaFree(d_inbound_count));
     CUDA_CHECK(cudaFree(d_hedge_weights));
     CUDA_CHECK(cudaFree(d_placement));
     CUDA_CHECK(cudaFree(d_inv_placement));
@@ -914,7 +981,7 @@ int main(int argc, char** argv) {
 
         // save hypergraph
         if (!save_path.empty()) {
-            if (!loaded) {
+            if (load_path.empty()) {
                 std::cerr << "Error: -s used without loading a hypergraph first.\n";
                 return 1;
             }
