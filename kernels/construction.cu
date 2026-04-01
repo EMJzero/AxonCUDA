@@ -63,8 +63,8 @@ void touching_build_kernel(
     /*
     * Idea:
     * - every warp visits an hedge
-    * - for every source, it claims a slot by atomically incrementing the pin's count of seen srcs, then inserts the src in the pin's inbound set
-    * - for every destination, same mechanism, with a separate atomic counter
+    * - for every source, it claims a slot by atomically incrementing the pin's count of seen srcs, then inserts the hedge in the pin's outbound set
+    * - for every destination, same mechanism, with a separate atomic counter, on the inbound set
     */
 
     const uint32_t* hedge = hedges + hedges_offsets[warp_id];

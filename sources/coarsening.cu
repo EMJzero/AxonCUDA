@@ -10,6 +10,8 @@
 #include "chaining.cuh"
 #include "coarsening.cuh"
 
+using namespace config;
+
 void candidatesProposal(
     const runconfig cfg,
     const uint32_t *d_hedges,

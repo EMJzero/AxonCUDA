@@ -6,7 +6,11 @@
 #include "defines.cuh"
 #include "data_types.cuh"
 
-struct runconfig;
+namespace config {
+    struct runconfig;
+}
+
+using namespace config;
 
 
 // USED BY: fm refinement kernel

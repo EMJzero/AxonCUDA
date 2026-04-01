@@ -7,9 +7,12 @@
 #include "hgraph.hpp"
 #include "runconfig.hpp"
 
+#include "construction.cuh"
+
 #include "utils.cuh"
 #include "defines.cuh"
-#include "construction.cuh"
+
+using namespace config;
 
 std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouchingHost(
     const HyperGraph& hg

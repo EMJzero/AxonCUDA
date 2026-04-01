@@ -7,7 +7,11 @@
 
 #include "data_types.cuh"
 
-struct runconfig;
+namespace config {
+    struct runconfig;
+}
+
+using namespace config;
 
 namespace cg = cooperative_groups;
 

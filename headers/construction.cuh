@@ -6,12 +6,15 @@
 
 #include "data_types.cuh"
 
-struct runconfig;
+namespace config {
+    struct runconfig;
+}
 
 namespace hgraph {
     class HyperGraph;
 }
 
+using namespace config;
 using namespace hgraph;
 
 // USED BY: neighborhoods kernel

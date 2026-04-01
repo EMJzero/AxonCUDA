@@ -4,10 +4,13 @@
 
 #include "runconfig.hpp"
 
+#include "refinement.cuh"
+
 #include "utils.cuh"
 #include "defines.cuh"
 #include "chaining.cuh"
-#include "refinement.cuh"
+
+using namespace config;
 
 void refinementRepeats(
     const runconfig cfg,

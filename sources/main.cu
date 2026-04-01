@@ -30,6 +30,7 @@
 
 using namespace hgraph;
 using namespace constraints;
+using namespace config;
 
 
 int main(int argc, char** argv) {

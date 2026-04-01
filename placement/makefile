@@ -2,21 +2,38 @@
 # Project settings
 # ==========================================
 TARGET      := hplace_gpu.exe
+
+SRC_DIRS    := sources kernels
+HDR_DIR     := headers
+INC_DIR     := includes
+ROOT_DIR    := ..
+BUILD_DIR   := build
+
 CXX         := g++
 NVCC        := nvcc
+ARCH        := native
 
-# TODO: change to -O3 for the final version, keep -O1 for fast compilation during development
-CXXFLAGS    := -O1 --std=c++20 -Wall -Wextra -I.
-NVCCFLAGS   := -O1 --std=c++20 -arch=native -dc -allow-unsupported-compiler --extended-lambda -Xcompiler "-Wall -Wextra -Wno-maybe-uninitialized -Wno-unused-function" -I .
-LINKFLAGS   := --std=c++20 -arch=native -allow-unsupported-compiler --extended-lambda -lcurand
+INCLUDES    := -I. -I$(HDR_DIR) -I$(INC_DIR) -I$(ROOT_DIR)/headers -I$(ROOT_DIR)/includes
+CXXFLAGS    := -O3 --std=c++20 -Wall -Wextra -fopenmp $(INCLUDES)
+NVCCFLAGS   := -O3 --std=c++20 -arch=$(ARCH) -dc -dlto -allow-unsupported-compiler --extended-lambda \
+               -Xptxas -O3 -Xcompiler "-Wall -Wextra -Wno-maybe-uninitialized -Wno-unused-function -fopenmp" \
+               $(INCLUDES)
+LINKFLAGS   := --std=c++20 -arch=$(ARCH) -dlto -allow-unsupported-compiler --extended-lambda -lgomp -lcurand
 
-SRC_CPPS    := #main.cpp
-SRC_CUS     := main.cu kernel.cu ordering.cu
+NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
+MAKEFLAGS += -j$(NPROC) # run with as many jobs as there are CPU cores
 
-OBJ_CPPS    := $(SRC_CPPS:.cpp=.o)
-OBJ_CUS     := $(SRC_CUS:.cu=.o)
+# ==========================================
+# Source discovery
+# ==========================================
+SRC_CPPS    := $(wildcard *.cpp) $(foreach dir,$(SRC_DIRS),$(wildcard $(dir)/*.cpp))
+SRC_CUS     := $(wildcard *.cu) $(foreach dir,$(SRC_DIRS),$(wildcard $(dir)/*.cu))
+SRCS        := $(SRC_CPPS) $(SRC_CUS)
 
-OBJS        := $(OBJ_CPPS) $(OBJ_CUS)
+OBJS        := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SRC_CPPS))
+OBJS        += $(patsubst %.cu,$(BUILD_DIR)/%.o,$(SRC_CUS))
+
+DEPS        := $(OBJS:.o=.d)
 
 # ==========================================
 # Build rules
@@ -26,11 +43,20 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(NVCC) $(LINKFLAGS) -o $@ $^
 
-%.o: %.cpp ../includes/hgraph.hpp nmhardware.hpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
 
-%.o: %.cu ../includes/hgraph.hpp nmhardware.hpp utils.cuh ../headers/utils.cuh ../headers/thruster.cuh
-	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+# C++ sources
+$(BUILD_DIR)/%.o: %.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+# CUDA sources
+$(BUILD_DIR)/%.o: %.cu | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) -MMD -MP -c $< -o $@
+
+-include $(DEPS)
 
 # ==========================================
 # Argument extraction (for run and profile)
@@ -41,7 +67,7 @@ PROFILE_ARG_1 := $(word 2, $(MAKECMDGOALS))
 PROFILE_ARG_2 := $(word 3, $(MAKECMDGOALS))
 
 # Dummy rule to avoid "No rule to make target 'filename'"
-$(RUN_ARG1) $(RUN_ARG2) $(PROFILE_ARG1) $(PROFILE_ARG2):
+$(RUN_ARG_1) $(RUN_ARG_2) $(PROFILE_ARG_1) $(PROFILE_ARG_2):
 	@:
 
 # ==========================================
@@ -84,5 +110,6 @@ profile: $(TARGET)
 # ==========================================
 clean:
 	rm -f $(TARGET) *.o *.qdrep *.nsys-rep *.sqlite
+	rm -rf $(BUILD_DIR)
 
 .PHONY: all run run64k profile clean

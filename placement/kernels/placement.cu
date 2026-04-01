@@ -1,11 +1,6 @@
-#include <cuda_runtime.h>
-#include <cooperative_groups.h>
-#include <stdint.h>
-
-#include "../headers/utils.cuh"
+#include "placement.cuh"
+#include "utils_plc.cuh"
 #include "utils.cuh"
-
-namespace cg = cooperative_groups;
 
 // DEVICE CONSTANTS:
 __constant__ uint32_t max_width;
