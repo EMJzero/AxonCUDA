@@ -3,6 +3,8 @@
 
 #include "thruster.cuh"
 
+#include "runconfig_plc.hpp"
+
 #include "utils.cuh"
 #include "utils_plc.cuh"
 #include "ordering.cuh"
@@ -76,6 +78,7 @@ void split_partitions_rand(
 
 // return a high-locality, seeded 1D ordering of nodes
 uint32_t* locality_ordering(
+    const runconfig cfg,
     const uint32_t num_nodes,
     const uint32_t num_hedges,
     const uint32_t* d_hedges,
@@ -161,7 +164,7 @@ uint32_t* locality_ordering(
 
         num_parts *= 2;
 
-        for (uint32_t lp_repeat = 0u; lp_repeat < LABELPROP_REPEATS; lp_repeat++) {
+        for (uint32_t lp_repeat = 0u; lp_repeat < cfg.fd_iterations; lp_repeat++) {
             // compute gains (and moves) in-isolation
             // NOTE: no need to init. "d_moves" and "d_scores", they are overwritten anyway
             {

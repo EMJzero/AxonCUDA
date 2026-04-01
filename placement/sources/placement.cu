@@ -7,12 +7,15 @@
 
 #include "thruster.cuh"
 
+#include "runconfig_plc.hpp"
+
 #include "utils.cuh"
 #include "utils_plc.cuh"
 #include "defines_plc.cuh"
 #include "placement.cuh"
 
 void force_directed_refinement(
+    const runconfig cfg,
     const cudaDeviceProp props,
     const uint32_t* d_hedges,
     const dim_t* d_hedges_offsets,
@@ -36,8 +39,8 @@ void force_directed_refinement(
     uint32_t *d_nodes_rank = nullptr; // node_rank[node idx] -> rank (index) in the sorted events by score of the node
 
     CUDA_CHECK(cudaMalloc(&d_forces, 4 * num_nodes * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_pairs, MAX_CANDIDATE_MOVES * num_nodes * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_scores, MAX_CANDIDATE_MOVES * num_nodes * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_pairs, cfg.candidates_count * num_nodes * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_scores, cfg.candidates_count * num_nodes * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_swap_slots, num_nodes * sizeof(slot)));
     CUDA_CHECK(cudaMalloc(&d_swap_flags, (num_nodes + 1) * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_ev_swaps, num_nodes * sizeof(swap)));
@@ -50,7 +53,7 @@ void force_directed_refinement(
     thrust::device_ptr<swap> t_ev_swaps(d_ev_swaps);
     thrust::device_ptr<float> t_ev_scores(d_ev_scores);
 
-    for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+    for (int iter = 0; iter < cfg.fd_iterations; iter++) {
         std::cout << "Force-directed refinement, iteration " << iter << "\n";
 
         /*
@@ -111,6 +114,7 @@ void force_directed_refinement(
                 d_inv_placement,
                 d_forces,
                 num_nodes,
+                cfg.candidates_count,
                 d_pairs,
                 d_scores
             );
@@ -122,6 +126,7 @@ void force_directed_refinement(
         // print some temporary results
         #if VERBOSE
         logTensions(
+            cfg,
             d_pairs,
             d_scores,
             num_nodes
@@ -162,6 +167,7 @@ void force_directed_refinement(
                 (void*)&d_scores,
                 (void*)&num_nodes,
                 (void*)&num_repeats,
+                (void*)&cfg.candidates_count,
                 (void*)&d_swap_slots,
                 (void*)&d_swap_flags
             };
@@ -355,22 +361,23 @@ void logForces(
 }
 
 void logTensions(
+    const runconfig cfg,
     const uint32_t *d_pairs,
     const uint32_t *d_scores,
     const uint32_t num_nodes
 ) {
-    std::vector<uint32_t> pairs_tmp(num_nodes * MAX_CANDIDATE_MOVES);
-    std::vector<uint32_t> scores_tmp(num_nodes * MAX_CANDIDATE_MOVES);
-    CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, num_nodes * sizeof(uint32_t) * MAX_CANDIDATE_MOVES, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_scores, num_nodes * sizeof(uint32_t) * MAX_CANDIDATE_MOVES, cudaMemcpyDeviceToHost));
+    std::vector<uint32_t> pairs_tmp(num_nodes * cfg.candidates_count);
+    std::vector<uint32_t> scores_tmp(num_nodes * cfg.candidates_count);
+    CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_scores, num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
     std::unordered_map<uint32_t, int> groups_count;
     std::cout << "Tensions:\n";
     for (uint32_t i = 0; i < num_nodes; ++i) {
         if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
             std::cout << "  node " << i << " ->";
-            for (uint32_t j = 0; j < MAX_CANDIDATE_MOVES; ++j) {
-                uint32_t target = pairs_tmp[i * MAX_CANDIDATE_MOVES + j];
-                uint32_t score = scores_tmp[i * MAX_CANDIDATE_MOVES + j];
+            for (uint32_t j = 0; j < cfg.candidates_count; ++j) {
+                uint32_t target = pairs_tmp[i * cfg.candidates_count + j];
+                uint32_t score = scores_tmp[i * cfg.candidates_count + j];
                 if (target == UINT32_MAX) std::cout << " (" << j << " target=none score=" << score << ")";
                 else if (target == UINT32_MAX - LEFT) std::cout << " (" << j << " target=LEFT score=" << score << ")";
                 else if (target == UINT32_MAX - RIGHT) std::cout << " (" << j << " target=RIGHT score=" << score << ")";

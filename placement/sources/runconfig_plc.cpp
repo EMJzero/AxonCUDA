@@ -32,6 +32,9 @@ namespace config_plc {
             "  -r <file>   Reload hypergraph from file\n"
             "  -s <file>   Save placement data to file\n"
             "  -c <name>   Constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024 - default is loihi64)\n"
+            "  -lpr <num>  Set the number of label propagation repeats during recursive bisection initial partitioning\n"
+            "  -fdi <num>  Set the number of force-directed refinement iterations\n"
+            "  -cnc <num>  Set the count of candidate swaps proposed per node during force-directed refinement\n"
             "  -ff         Replaces the 1D ordering heuristic with host-side sequential feedforward ordering\n"
             "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
             "  -seed <num> Set the algorithm's seed to <num> (default: " << SEED << ") (ignored when '-ff' is passed)\n"
@@ -43,6 +46,9 @@ namespace config_plc {
         std::string load_path;
         std::string save_path;
         std::string constraints;
+        uint32_t labelprop_repeats = LABELPROP_REPEATS;
+        uint32_t fd_iterations = FD_ITERATIONS;
+        uint32_t candidates_count = MAX_CANDIDATE_MOVES;
         bool feedforward_order = false; // NB: runs sequentially on the HOST!
         bool device_touching_construction = false;
         uint64_t seed = SEED;
@@ -60,6 +66,16 @@ namespace config_plc {
             } else if (arg == "-c") {
                 if (i + 1 >= argc) { std::cerr << "Error: -c requires a config name\n"; std::exit(1); }
                 constraints = argv[++i];
+            } else if (arg == "-lpr") {
+                if (i + 1 >= argc) { std::cerr << "Error: -lpr requires a positive integer value\n"; std::exit(1); }
+                labelprop_repeats = std::stoul(argv[++i]);
+            } else if (arg == "-fdi") {
+                if (i + 1 >= argc) { std::cerr << "Error: -fdi requires a positive integer value\n"; std::exit(1); }
+                fd_iterations = std::stoul(argv[++i]);
+            } else if (arg == "-cnc") {
+                if (i + 1 >= argc) { std::cerr << "Error: -cnc requires a positive integer value\n"; std::exit(1); }
+                candidates_count = std::stoul(argv[++i]);
+                if (candidates_count > MAX_CANDIDATE_MOVES) { std::cerr << "Error: -cnc must be less or equal to " << MAX_CANDIDATE_MOVES << "\n"; std::exit(1); }
             } else if (arg == "-ff") {
                 feedforward_order = true;
             } else if (arg == "-dtc") {
@@ -74,6 +90,9 @@ namespace config_plc {
             load_path,
             save_path,
             constraints,
+            labelprop_repeats,
+            fd_iterations,
+            candidates_count,
             feedforward_order,
             device_touching_construction,
             seed

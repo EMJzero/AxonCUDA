@@ -108,6 +108,7 @@ void tensions_kernel(
     const uint32_t* __restrict__ inv_placement,
     const float* __restrict__ forces,
     const uint32_t num_nodes,
+    const uint32_t candidates_count,
     uint32_t* __restrict__ pairs,
     uint32_t* __restrict__ scores
 ) {
@@ -169,9 +170,9 @@ void tensions_kernel(
         my_scores[DOWN] = 0.0f;
 
     // write pairs and scores, from highest to lowest score
-    uint32_t* final_pairs = pairs + tid * MAX_CANDIDATE_MOVES;
-    uint32_t* final_scores = scores + tid * MAX_CANDIDATE_MOVES;
-    for (uint32_t i = 0; i < MAX_CANDIDATE_MOVES; i++) {
+    uint32_t* final_pairs = pairs + tid * candidates_count;
+    uint32_t* final_scores = scores + tid * candidates_count;
+    for (uint32_t i = 0; i < candidates_count; i++) {
         uint32_t max_pair = UINT32_MAX;
         float max_score = 0.0f;
         uint32_t max_idx = 0;
@@ -198,6 +199,7 @@ void exclusive_swaps_kernel(
     const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be swapped with pairs[idx]
     const uint32_t num_nodes,
     const uint32_t num_repeats,
+    const uint32_t candidates_count,
     slot* __restrict__ swap_slots, // initialized with -1 on the id
     uint32_t* __restrict__ swap_flags // initialized to 0, set to 1 for the lower-id node of a swap-pair
 ) {
@@ -231,7 +233,7 @@ void exclusive_swaps_kernel(
         if (curr_tid < num_nodes) atomicCAS(&reinterpret_cast<unsigned long long*>(swap_slots)[curr_tid], pack_slot(0u, UINT32_MAX), pack_slot(0u, curr_tid));
     }
 
-    for (uint32_t i = 0; i < MAX_CANDIDATE_MOVES; i++) {
+    for (uint32_t i = 0; i < candidates_count; i++) {
         // repeat for every node that you need to handle
         for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
             const uint32_t curr_tid = tid + repeat * tcount;
@@ -245,8 +247,8 @@ void exclusive_swaps_kernel(
             int32_t curr_path_length = 0;
 
             uint32_t current = curr_tid; // current node in the tree of pairs
-            uint32_t target = pairs[curr_tid * MAX_CANDIDATE_MOVES + i]; // target node of "current"
-            uint32_t score = scores[curr_tid * MAX_CANDIDATE_MOVES + i]; // score with which "current" points to "target"
+            uint32_t target = pairs[curr_tid * candidates_count + i]; // target node of "current"
+            uint32_t score = scores[curr_tid * candidates_count + i]; // score with which "current" points to "target"
 
             // go up the tree
             bool outcome = false;
@@ -255,7 +257,7 @@ void exclusive_swaps_kernel(
                 set_slot(swap_slots, current, target, UINT32_MAX - i);
             } else if (target != UINT32_MAX) {
                 outcome = true;
-                uint32_t target_target = pairs[target * MAX_CANDIDATE_MOVES + i]; // target node of "target"
+                uint32_t target_target = pairs[target * candidates_count + i]; // target node of "target"
                 while (current != target_target) {
                     // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
                     outcome = atomic_max_on_slot(swap_slots, target, current, score);
@@ -265,12 +267,12 @@ void exclusive_swaps_kernel(
                     current = target;
                     target = target_target;
                     if (target >= UINT32_MAX - 4) break; // alternative root: a node with no target
-                    target_target = pairs[target_target * MAX_CANDIDATE_MOVES + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
-                    score = scores[current * MAX_CANDIDATE_MOVES + i];
+                    target_target = pairs[target_target * candidates_count + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
+                    score = scores[current * candidates_count + i];
                 }
             }
             // handle "root(s)" as a pair of nodes pointing to each other
-            if (outcome && target < UINT32_MAX - 4 && swap_slots[target].score <= UINT32_MAX - MAX_CANDIDATE_MOVES) {
+            if (outcome && target < UINT32_MAX - 4 && swap_slots[target].score <= UINT32_MAX - candidates_count) {
                 set_slot(swap_slots, current, target, UINT32_MAX - i); // mutually-pointing pair
                 set_slot(swap_slots, target, current, UINT32_MAX - i);
             }
@@ -327,7 +329,7 @@ void exclusive_swaps_kernel(
             if (curr_tid >= num_nodes) break;
             // if you formed a pair, stop
             if (completed_repeats & (1u << repeat)) continue;
-            if (swap_slots[curr_tid].score > UINT32_MAX - MAX_CANDIDATE_MOVES) {
+            if (swap_slots[curr_tid].score > UINT32_MAX - candidates_count) {
                 completed_repeats |= (1u << repeat);
                 continue;
             }
@@ -343,15 +345,15 @@ void exclusive_swaps_kernel(
         const uint32_t curr_tid = tid + repeat * tcount;
         if (curr_tid >= num_nodes) break;
         // lowest-id node sets the create-event flag
-        if (swap_slots[curr_tid].score > UINT32_MAX - MAX_CANDIDATE_MOVES) {
+        if (swap_slots[curr_tid].score > UINT32_MAX - candidates_count) {
             const uint32_t other_tid = swap_slots[curr_tid].id;
             if (other_tid > curr_tid) swap_flags[curr_tid] = 1;
             // TODO: we could encode in the score "who locked who" in order not to need the maximum!
             // TODO: only the lower-id node actually needs to right score to generate the event!
             const uint32_t i_of_pair_formation = UINT32_MAX - swap_slots[curr_tid].score; // reconstruct the 'i' of the pair that caused the swap-pair
-            uint32_t swap_score = scores[curr_tid * MAX_CANDIDATE_MOVES + i_of_pair_formation];
+            uint32_t swap_score = scores[curr_tid * candidates_count + i_of_pair_formation];
             if (other_tid < UINT32_MAX - 4)
-                swap_score = max(swap_score, scores[other_tid * MAX_CANDIDATE_MOVES + i_of_pair_formation]);
+                swap_score = max(swap_score, scores[other_tid * candidates_count + i_of_pair_formation]);
             swap_slots[curr_tid].score = swap_score;
         }
     }

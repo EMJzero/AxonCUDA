@@ -9,17 +9,17 @@
 #include "data_types_plc.cuh"
 #include "defines_plc.cuh"
 
-namespace cg = cooperative_groups;
+namespace config_plc {
+    struct runconfig;
+}
 
-
-// USED BY: recursive bipartitioning
-
-#define LABELPROP_REPEATS 16
+using namespace config_plc;
 
 
 // STEPS
 
 uint32_t* locality_ordering(
+    const runconfig cfg,
     const uint32_t num_nodes,
     const uint32_t num_hedges,
     const uint32_t* d_hedges,

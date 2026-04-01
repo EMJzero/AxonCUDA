@@ -143,10 +143,6 @@ int main(int argc, char** argv) {
     // allocate device memory
     CUDA_CHECK(cudaMalloc(&d_hedges, hg.hedgesFlat().size() * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_hedges_offsets, (num_hedges + 1) * sizeof(dim_t)));
-    //CUDA_CHECK(cudaMalloc(&d_srcs_count, num_hedges * sizeof(uint32_t)));
-    //CUDA_CHECK(cudaMalloc(&d_touching, touching_hedges.size() * sizeof(uint32_t)));
-    //CUDA_CHECK(cudaMalloc(&d_touching_offsets, (num_nodes + 1) * sizeof(dim_t)));
-    //CUDA_CHECK(cudaMalloc(&d_inbound_count, num_nodes * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_hedge_weights, num_hedges * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_placement, num_nodes * sizeof(coords)));
     CUDA_CHECK(cudaMalloc(&d_inv_placement, h_max_width * h_max_height * sizeof(uint32_t)));
@@ -154,18 +150,7 @@ int main(int argc, char** argv) {
     // copy to device
     CUDA_CHECK(cudaMemcpy(d_hedges, hg.hedgesFlat().data(), hg.hedgesFlat().size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_hedges_offsets, hedges_offsets.data(), (num_hedges + 1) * sizeof(dim_t), cudaMemcpyHostToDevice));
-    //CUDA_CHECK(cudaMemcpy(d_srcs_count, srcs_count.data(), num_hedges * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    //CUDA_CHECK(cudaMemcpy(d_touching, touching_hedges.data(), touching_hedges.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    //CUDA_CHECK(cudaMemcpy(d_touching_offsets, touching_hedges_offsets.data(), (num_nodes + 1) * sizeof(dim_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_hedge_weights, hedge_weights.data(), num_hedges * sizeof(float), cudaMemcpyHostToDevice));
-
-    // thrust pointers
-    //thrust::device_ptr<dim_t> t_touching_offsets(d_touching_offsets);
-    //thrust::device_ptr<uint32_t> t_inbound_count(d_inbound_count);
-
-    // initialize
-    // each initial node has one outbound hyperedge -> init. inbound counts to the number of touching - 1
-    //thrust::transform(t_touching_offsets + 1, t_touching_offsets + 1 + num_nodes, t_touching_offsets, t_inbound_count, [] __device__ (int next, int curr) { return next - curr - 1; });
 
     // copy constants to device
     CUDA_CHECK(cudaMemcpyToSymbol(max_width, &h_max_width, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
@@ -206,6 +191,7 @@ int main(int argc, char** argv) {
     } else {
         std::cout << "Ordering nodes (parallel - recursive bisection) ...\n";
         d_order_idx = locality_ordering(
+            cfg,
             num_nodes,
             num_hedges,
             d_hedges,
@@ -302,6 +288,7 @@ int main(int argc, char** argv) {
 
     // run force-directed refinement
     force_directed_refinement(
+        cfg,
         props,
         d_hedges,
         d_hedges_offsets,

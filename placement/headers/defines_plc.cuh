@@ -10,11 +10,10 @@
 #define VERBOSE false
 #define VERBOSE_LENGTH 20
 
+
 // USED BY: everyone
 
 #define SEED 86u
-
-#define MAX_ITERATIONS 32 // 1024
 
 #define LEFT 0
 #define RIGHT 1
@@ -24,3 +23,19 @@
 // TODO: infer this at runtime, make it a device-side constant
 //       => infer it especially from the hardware width/height, that determine the manhattan distance range
 #define FORCE_FIXED_POINT_SCALE 262144u
+
+
+// USED BY: recursive bipartitioning
+
+#define LABELPROP_REPEATS 16
+
+
+// USED BY: candidate moves kernel
+
+// TODO: go exotic with the stencil, not just a "+", but extend this beyond 4 with the 8-point stencil for instance!!
+#define MAX_CANDIDATE_MOVES 4 // must be between 1 and 4
+
+
+// USED BY: force-directed refinement
+
+#define FD_ITERATIONS 32 // 1024

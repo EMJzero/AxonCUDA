@@ -9,16 +9,17 @@
 #include "data_types_plc.cuh"
 #include "defines_plc.cuh"
 
+namespace config_plc {
+    struct runconfig;
+}
+
+using namespace config_plc;
+
 namespace cg = cooperative_groups;
 
 // DEVICE CONSTANTS:
 extern __constant__ uint32_t max_width;
 extern __constant__ uint32_t max_height;
-
-
-// USED BY: candidate moves kernel
-
-#define MAX_CANDIDATE_MOVES 4 // must be between 1 and 4
 
 
 // USED BY: exclusive swaps kernel
@@ -30,6 +31,7 @@ extern __constant__ uint32_t max_height;
 // STEPS
 
 void force_directed_refinement(
+    const runconfig cfg,
     const cudaDeviceProp props,
     const uint32_t* d_hedges,
     const dim_t* d_hedges_offsets,
@@ -93,6 +95,7 @@ void tensions_kernel(
     const uint32_t* inv_placement,
     const float* forces,
     const uint32_t num_nodes,
+    const uint32_t candidates_count,
     uint32_t* pairs,
     uint32_t* scores
 );
@@ -103,6 +106,7 @@ void exclusive_swaps_kernel(
     const uint32_t* scores,
     const uint32_t num_nodes,
     const uint32_t num_repeats,
+    const uint32_t candidates_count,
     slot* swap_slots,
     uint32_t* swap_flags
 );

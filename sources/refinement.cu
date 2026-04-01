@@ -472,7 +472,6 @@ void refinementRepeats(
         CUDA_CHECK(cudaMemcpy(&inbounds_validity, d_inbound_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(&acquired_gain, d_f_scores + best_rank, sizeof(float), cudaMemcpyDeviceToHost));
         std::cout << "Best fm-ref move:\n  Move rank: " << best_rank << ", Acquired gain: " << acquired_gain << "\n";
-        std::cout << "  Size constraint violations variation amount (in nodes above the limit): " << size_validity << ", Inbound constraint violations variation (in invalid partitions): " << inbounds_validity << "\n";
         if (size_validity <= 0 && inbounds_validity <= 0 && acquired_gain >= 0) {
             // launch configuration - fm-ref apply kernel
             int threads_per_block = 128;
@@ -498,7 +497,10 @@ void refinementRepeats(
             CUDA_CHECK(cudaDeviceSynchronize());
             //if (acquired_gain < 0) std::cerr << "WARNING: applied a refinement move with negative gain on level " << level_idx << " !!\n";
         } else {
-            std::cout << "No valid refinement move found on level " << level_idx << " (reason: " << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : "negative gain")) << ") ...\n";
+            std::cout << "No valid refinement move found on level " << level_idx << "- reason: "
+                << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : "negative gain")) << "\n";
+            if (size_validity > 0) std::cout << "  Size constraint violations variation amount (in nodes above the limit): " << size_validity << "\n";
+            if (inbounds_validity > 0) std::cout << "  Inbound constraint violations variation (in invalid partitions): " << inbounds_validity << "\n";
             if (size_validity > 0 && !chainup) chainup = true; // enable chaining when no moves are available via greedy sorting because of size constraints
             else if (fm_repeat < cfg.refine_repeats / 3) fm_repeat = cfg.refine_repeats / 2;
             else if (fm_repeat < 2 * cfg.refine_repeats / 3) fm_repeat = 2 * cfg.refine_repeats / 3;
