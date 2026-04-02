@@ -22,6 +22,9 @@
 // TODO: this is just a good guess on how much more memory give to oversized buffers during deduplication, refine it!
 #define OVERSIZED_SIZE_MULTIPLIER 1.5f
 
+#define SHRINK_RATIO_LIMIT 0.95f // coarsening ratio between levels above which to stop and start uncoarsening
+#define NUMBER_OF_LEVELS_WITH_NO_SHRINK_LIMIT 32u // number of coarsening levels that are performed even if the 'SHRINK_RATIO_LIMIT' was reached
+
 #define SAVE_MEMORY_UP_TO_LEVEL 2 // number of coarsening levels for which to spill non-coarse data structures to the host, set to 0 to disable the feature
 
 #define SMALL_PART_MERGE_SIZE_THRESHOLD 15 // number of nodes below which partitions are considered "small" and an attempt is done at merging them with one-another

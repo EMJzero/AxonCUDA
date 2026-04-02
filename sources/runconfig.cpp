@@ -38,6 +38,7 @@ namespace config {
             "  -om <mult>  Set the deduplication oversized segment size multiplier (increase to avoid the 'GM hash-set full!' assert)\n"
             "  -cnc <num>  Set the count of candidates proposed per node during coarsening\n"
             "  -rfr <num>  Set the number of refinement repetitions per level\n"
+            "  -smh <lvl>  Recover device memory by migrating to the host the pre-coarsening hypergraph up the provided level\n"
             "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
             "  -h          Show this help message\n";
     }
@@ -55,6 +56,7 @@ namespace config {
         float oversized_multiplier = OVERSIZED_SIZE_MULTIPLIER;
         uint32_t candidates_count = MAX_CANDIDATES;
         uint32_t refine_repeats = REFINE_REPEATS;
+        uint32_t save_memory_up_to_level = SAVE_MEMORY_UP_TO_LEVEL;
         bool device_touching_construction = false;
 
         // CLI handling
@@ -99,6 +101,9 @@ namespace config {
             } else if (arg == "-rfr") {
                 if (i + 1 >= argc) { std::cerr << "Error: -rfr requires a positive integer value\n"; std::exit(1); }
                 refine_repeats = std::stoul(argv[++i]);
+            } else if (arg == "-smh") {
+                if (i + 1 >= argc) { std::cerr << "Error: -smh requires a positive integer value\n"; std::exit(1); }
+                save_memory_up_to_level = std::stoul(argv[++i]);
             } else if (arg == "-dtc") {
                 device_touching_construction = true;
             } else { std::cerr << "Unknown option: " << arg << "\n"; std::exit(1); }
@@ -117,6 +122,7 @@ namespace config {
             oversized_multiplier,
             candidates_count,
             refine_repeats,
+            save_memory_up_to_level,
             device_touching_construction
         };
     }

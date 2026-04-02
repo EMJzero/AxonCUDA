@@ -479,7 +479,13 @@ int main(int argc, char** argv) {
         //       => what this does now is equivalent to using the coarsening algorithm also as the algorithm to perform the initial partitioning
         // NOTE: with the current setup, we stop as soon as we clear "max_parts" and let refinement eventually empty some if they are too many
         //       => and alternative solution could be to always wait for "new_num_nodes == curr_num_nodes" and then enforce "max_parts" to spot failures
-        if (new_num_nodes <= target_parts || new_num_nodes == curr_num_nodes) {
+        // NOTE: if not enough coarse nodes are formed after after a while, stop anyway
+        float coarsening_ratio = (float)new_num_nodes / curr_num_nodes;
+        if (
+            new_num_nodes <= target_parts
+            || new_num_nodes == curr_num_nodes
+            || (level_idx >= NUMBER_OF_LEVELS_WITH_NO_SHRINK_LIMIT && coarsening_ratio > SHRINK_RATIO_LIMIT && new_num_nodes <= max_parts)
+        ) {
             // HERE we repurpose the coarsening routine as the routine for initial partitions:
             // - num_partitions = new_num_nodes
             // - partitions = groups
@@ -493,9 +499,12 @@ int main(int argc, char** argv) {
             // base case, reached the target number of partitions
             if (new_num_nodes <= target_parts) {
                 std::cout << "Minimal initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
-            } else if (new_num_nodes <= max_parts) {
+            } else if (new_num_nodes <= max_parts) { // still valid but not minimal partitions count
                 std::cout << "Initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
-                std::cerr << "WARNING: the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ")...\n";
+                if (new_num_nodes == curr_num_nodes) // impossible to coarsen further
+                    std::cerr << "WARNING: could not coarsen any further, the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ") ...\n";
+                if (coarsening_ratio > SHRINK_RATIO_LIMIT) // too little pairs created, too expensive to coarsen further
+                    std::cerr << "WARNING: coarsening rate too low (" << std::fixed << std::setprecision(2) << 1/coarsening_ratio << " < " << 1/SHRINK_RATIO_LIMIT << ") the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ") ...\n";
             } else { // base case, failure to coarsen further
                 std::cerr << "FAILED TO COARSEN FURTHER at level " << level_idx << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << new_num_nodes << " max allowed partitions=" << max_parts << "\n";
                 std::cerr << "WARNING: falling back to returning current groups as individual partitions...\n";
@@ -594,7 +603,7 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> h_touching;
         std::vector<dim_t> h_touching_offsets;
         std::vector<uint32_t> h_inbound_count;
-        if (level_idx < SAVE_MEMORY_UP_TO_LEVEL) {
+        if (level_idx < cfg.save_memory_up_to_level) {
             // TODO: make these async, move everything out of the default stream and use a "compute" and a "transfer" stream
             // TODO: spill inbound counts and src counts too!
             h_hedges.resize(hedges_size);
@@ -638,7 +647,7 @@ int main(int argc, char** argv) {
         std::cout << "Uncoarsening level " << level_idx << ", remaining nodes=" << curr_num_nodes << "\n";
 
         // un-spill non-coarse data structures to device
-        if (level_idx < SAVE_MEMORY_UP_TO_LEVEL) {
+        if (level_idx < cfg.save_memory_up_to_level) {
             std::cout << "Unspilling " << std::fixed << std::setprecision(3) << (float)((hedges_size + touching_size) * sizeof(uint32_t) + (num_hedges + 1 + curr_num_nodes + 1) * sizeof(dim_t)) / (1 << 30) << " GB from host to device at level " << level_idx << " ...\n";
             CUDA_CHECK(cudaMalloc(&d_hedges, hedges_size * sizeof(uint32_t)));
             CUDA_CHECK(cudaMalloc(&d_hedges_offsets, (num_hedges + 1) * sizeof(dim_t)));

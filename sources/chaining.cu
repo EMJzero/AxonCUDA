@@ -8,419 +8,189 @@
 #include "constants.cuh"
 
 
-// ================================================================
-// Device helpers
-// ================================================================
-
-__device__ __forceinline__
-uint32_t size_bucket(uint32_t s) {
-    return (s == 0) ? 0u : (31u - __clz(s));
-}
-
-__device__ inline
-float atomicMaxFloat(float* addr, float value) {
-    int* addr_i = reinterpret_cast<int*>(addr);
-    int old = *addr_i;
-    int assumed;
-
-    while (__int_as_float(old) < value) {
-        assumed = old;
-        old = atomicCAS(addr_i, assumed, __float_as_int(value));
-        if (assumed == old) {
-            break;
-        }
-    }
-    return __int_as_float(old);
-}
-
-// sorting key for (src, -weight) to group outgoing lists by src, heavier edges going first inside each src group
-struct SrcNegWKey {
-    uint32_t src;
-    float negw;
-};
-
-struct SrcNegWLess {
-    __host__ __device__
-    bool operator()(const SrcNegWKey& a, const SrcNegWKey& b) const {
-        if (a.src != b.src) return a.src < b.src;
-        return a.negw < b.negw;
-    }
-};
-
-__global__
-void build_src_keys(
-    int n,
-    const uint32_t* src,
-    const float* w,
-    SrcNegWKey* keys
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        keys[i].src = src[i];
-        keys[i].negw = -w[i];
-    }
-}
-
-
-// multi-iteration greedy chaining
-//
-// data structures:
-//   next[i] : chosen successor edge index (or UINT32_MAX)
-//   prev[j] : chosen predecessor edge index (or UINT32_MAX)
-//
-// each iteration proposes a successor for edges that don't yet have next, searching up to "window" candidates
-// candidates are from outgoing list of dst[i] (i.e. edges whose src == dst[i]), preferring high weight and similar node size / inbound set size
-// conflicts are resolved so each successor has at most one predecessor
-__global__
-void propose_successor(
-    int n,
-    const uint32_t* dst,
-    const uint32_t* size,
-    //const uint32_t* icnt,
-    const float* w,
-    const int* out_begin,
-    const int* out_end,
-    const uint32_t* prev, // availability of candidate successor (prev[cand] == UINT32_MAX)
-    const uint32_t* next, // only propose if next[i] == UINT32_MAX
-    int window,
-    float alpha,
-    uint32_t* succ_choice,
-    float* succ_score
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-
-    if (next[i] != UINT32_MAX) {
-        succ_choice[i] = UINT32_MAX;
-        succ_score[i] = -1e30f;
-        return;
-    }
-
-    int b = out_begin[i];
-    int e = out_end[i];
-    if (b >= e) {
-        succ_choice[i] = UINT32_MAX;
-        succ_score[i] = -1e30f;
-        return;
-    }
-
-    uint32_t si = size[i];
-    uint32_t bi = size_bucket(si);
-
-    float best = -1e30f;
-    uint32_t best_j = UINT32_MAX;
-
-    int limit = b + window;
-    if (limit > e) limit = e;
-
-    for (int j = b; j < limit; ++j) {
-        if ((uint32_t)j == (uint32_t)i) continue;
-        if (prev[j] != UINT32_MAX) continue; // candidate successor already taken
-
-        uint32_t sj = size[j];
-        uint32_t bj = size_bucket(sj);
-        if (abs((int)bi - (int)bj) > 1) continue;
-
-        float penalty = alpha * fabsf((float)si - (float)sj);
-        float sc = w[j] - penalty;
-
-        if (sc > best) {
-            best = sc;
-            best_j = (uint32_t)j;
-        }
-    }
-
-    succ_choice[i] = best_j;
-    succ_score[i] = best;
-}
-
-__global__
-void resolve_successor_conflicts(
-    int n,
-    const uint32_t* succ_choice,
-    const float* succ_score,
-    const uint32_t* prev, // only allow assignment if prev[succ] == UINT32_MAX at time of resolve
-    float* best_score_for_succ,
-    uint32_t* best_pred_for_succ
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-
-    uint32_t s = succ_choice[i];
-    if (s == UINT32_MAX) return;
-    if (prev[s] != UINT32_MAX) return;
-
-    float sc = succ_score[i];
-    float old = atomicMaxFloat(&best_score_for_succ[s], sc);
-    if (sc > old) {
-        best_pred_for_succ[s] = (uint32_t)i;
-    }
-}
-
-__global__
-void commit_links(
-    int n,
-    uint32_t* next,
-    uint32_t* prev,
-    const uint32_t* best_pred_for_succ
-) {
-    // one thread per successor edge s: if it has a chosen predecessor p and is free, claim it
-    int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= n) return;
-
-    uint32_t p = best_pred_for_succ[s];
-    if (p == UINT32_MAX) return;
-
-    // only commit if successor still free
-    if (atomicCAS((unsigned int*)&prev[s], (unsigned int)UINT32_MAX, (unsigned int)p) == (unsigned int)UINT32_MAX) {
-        // set next[p] if still unset. If p somehow got set concurrently, keep first
-        atomicCAS((unsigned int*)&next[p], (unsigned int)UINT32_MAX, (unsigned int)s);
-    }
-}
-
-// extract component and position for each chain:
-// - for paths, we want pos ~ distance from head (prev == UINT32_MAX)
-// - for cycles, we just pick a representative (min index found) and pos is best-effort
-__global__
-void compute_comp_and_pos(
-    int n,
-    const uint32_t* prev,
-    uint32_t* comp,
-    uint32_t* pos
-) {
-    // TODO: tune, increase if the typical chain length could exceeds it
-    // => O(n * MAX_STEPS) total work
-    constexpr int MAX_STEPS = 256;
-
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-
-    uint32_t cur = (uint32_t)i;
-    uint32_t min_seen = cur;
-
-    for (int d = 0; d < MAX_STEPS; ++d) {
-        uint32_t p = prev[cur];
-        if (p == UINT32_MAX) {
-            comp[i] = cur; // head edge id
-            pos[i] = (uint32_t)d; // distance from head
-            return;
-        }
-        cur = p;
-        min_seen = min(min_seen, cur);
-    }
-
-    // likely cycle or very long chain; choose rep as min seen
-    comp[i] = min_seen;
-    pos[i] = 0;
-}
-
-// sorting key for edges in sequences
-struct EdgeOrderKey {
-    uint32_t comp_rank;
-    uint32_t pos;
-    uint32_t edge_id;
-};
-
-struct EdgeOrderLess {
-    __host__ __device__
-    bool operator()(const EdgeOrderKey& a, const EdgeOrderKey& b) const {
-        if (a.comp_rank != b.comp_rank) return a.comp_rank < b.comp_rank;
-        if (a.pos != b.pos) return a.pos < b.pos;
-        return a.edge_id < b.edge_id;
-    }
-};
-
-// final sequence ordering (collision-free)
-// compute component total weight and count, rank components by weight, then sort edges by (component_rank, pos, edge_id) and assign sequence_idx
-// => guarantees that sequence_idx is a permutation of [0..n-1]
-__global__
-void build_edge_order_keys(
-    int n,
-    const uint32_t* comp,
-    const uint32_t* pos,
-    const uint32_t* comp_to_rank,
-    EdgeOrderKey* keys
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        uint32_t c = comp[i];
-        keys[i].comp_rank = comp_to_rank[c];
-        keys[i].pos = pos[i];
-        keys[i].edge_id = (uint32_t)i;
-    }
-}
-
-__global__
-void scatter_sequence_idx(
-    int n,
-    const uint32_t* sorted_edge_id, // edge indices in final order (sorted space)
-    const uint32_t* orig_index_sorted, // mapping from sorted space -> original edge index
-    uint32_t* sequence_idx_out
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        uint32_t e_sorted = sorted_edge_id[i]; // edge id in sorted space
-        uint32_t e_orig = orig_index_sorted[e_sorted];
-        sequence_idx_out[e_orig] = (uint32_t)i;
-    }
-}
-
-// ================================================================
-// Entry Point
-// ================================================================
-
-// !!!!!!!!!!!!!!!!!!!!!!!!!!
-// WARNING: NOT DETERMINISTIC
-// !!!!!!!!!!!!!!!!!!!!!!!!!!
-
 // given a set of src->dst pairs, each with a size and a weight, try to construct
 // subsequences of pairs with similar size and highest total weight such that each's dst is
 // the src of the next pair, stopping upon forming a cycle. The concatenation of subsequences
 // by descending weight is then the final sequence returned.
+// => deterministic tie-breaking is always based on the pair's idx (aka node/move idx)
 void chaining(
-    const uint32_t* srcs,
-    const uint32_t* dsts,
-    const uint32_t* size, // node sizes
+    const uint32_t* d_srcs_og,
+    const uint32_t* d_dsts_og,
+    const uint32_t* d_size_og, // node sizes
     //const uint32_t* icnt, // inbound set sizes
-    const float* weight,
-    uint32_t num,
-    uint32_t* sequence_idx,
-    cudaStream_t stream
+    const float* d_weights_og,
+    const uint32_t num_edges,
+    uint32_t* sequence_idx
 ) {
-    if (num == 0) return;
+    if (num_edges == 0) return;
 
-    const int n = (int)num;
-    const int threads = 256;
-    const int blocks = (n + threads - 1) / threads;
+    const int num_threads_needed = (int)num_edges;
+    const int threads_per_block = 256;
+    const int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
 
-    auto exec = thrust::cuda::par.on(stream);
+    std::cout << "Running chaining kernels (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
 
-    // copy input device arrays into vectors so we can sort/reorder
-    thrust::device_vector<uint32_t> d_src(n), d_dst(n), d_size(n), d_orig(n);
-    //thrust::device_vector<uint32_t> d_src(n), d_dst(n), d_size(n), d_icnt(n), d_orig(n);
-    thrust::device_vector<float> d_w(n);
+    uint32_t *d_srcs = nullptr; // srcs[idx] -> source partition / source node of the idx-th pair
+    uint32_t *d_dsts = nullptr; // dsts[idx] -> destination partition / destination node of the idx-th pair
+    uint32_t *d_size = nullptr; // size[idx] -> size of the idx-th pair's moving node
+    float *d_w = nullptr; // w[idx] -> weight / gain of the idx-th pair
+    uint32_t *d_orig = nullptr; // orig[idx] -> original idx of the idx-th pair after reordering
+    src_negweight_key *d_src_keys = nullptr; // src_keys[idx] -> (src, -weight) sort key of the idx-th pair
+    int *d_out_begin = nullptr; // out_begin[idx] -> begin of the outgoing candidates range of the idx-th pair
+    int *d_out_end = nullptr; // out_end[idx] -> end of the outgoing candidates range of the idx-th pair
+    uint32_t *d_next = nullptr; // next[idx] -> chosen successor pair of the idx-th pair, later reused as comp[idx]
+    uint32_t *d_prev = nullptr; // prev[idx] -> chosen predecessor pair of the idx-th pair, later reused as comp_key[idx] and comp_to_rank[idx]
+    uint32_t *d_succ_choice = nullptr; // succ_choice[idx] -> proposed successor of the idx-th pair, later reused as pos[idx], comp_count[idx], edge_id[idx]
+    float *d_succ_score = nullptr; // succ_score[idx] -> score of the proposed successor of the idx-th pair, later reused as w_val[idx]
+    uint64_t *d_best_claim = nullptr; // best_claim[idx] -> packed best predecessor claim received by successor idx
+    uint32_t *d_counts = nullptr; // counts[idx] -> scratch uint32 buffer, reused as one[idx], unique_comp[idx], comp_id_rank[idx]
+    float *d_weights = nullptr; // weights[idx] -> scratch float buffer, reused as comp_wsum[idx]
+    edge_order_key *d_edge_keys = nullptr; // edge_keys[idx] -> final ordering key of the idx-th pair
 
-    CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(d_src.data()), srcs, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(d_dst.data()), dsts, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(d_size.data()), size, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-    //CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(d_icnt.data()), icnt, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(d_w.data()), weight, n * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMalloc(&d_srcs, num_edges * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_dsts, num_edges * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_size, num_edges * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_w, num_edges * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_orig, num_edges * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_src_keys, num_edges * sizeof(src_negweight_key)));
+    CUDA_CHECK(cudaMalloc(&d_out_begin, num_edges * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_out_end, num_edges * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_next, num_edges * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_prev, num_edges * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_succ_choice, num_edges * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_succ_score, num_edges * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_best_claim, num_edges * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_counts, num_edges * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_weights, num_edges * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_edge_keys, num_edges * sizeof(edge_order_key)));
 
-    thrust::sequence(exec, d_orig.begin(), d_orig.end());
+    thrust::device_ptr<uint32_t> t_srcs(d_srcs);
+    thrust::device_ptr<uint32_t> t_dsts(d_dsts);
+    thrust::device_ptr<uint32_t> t_size(d_size);
+    thrust::device_ptr<float> t_w(d_w);
+    thrust::device_ptr<uint32_t> t_orig(d_orig);
+    thrust::device_ptr<src_negweight_key> t_src_keys(d_src_keys);
+    thrust::device_ptr<int> t_out_begin(d_out_begin);
+    thrust::device_ptr<int> t_out_end(d_out_end);
+    thrust::device_ptr<edge_order_key> t_edge_keys(d_edge_keys);
 
-    // sort edges by (src, -weight) so OUT[v] is a contiguous range and heavier edges come first
-    thrust::device_vector<SrcNegWKey> t_keys(n);
-    build_src_keys<<<blocks, threads, 0, stream>>>(
-        n,
-        thrust::raw_pointer_cast(d_src.data()),
-        thrust::raw_pointer_cast(d_w.data()),
-        thrust::raw_pointer_cast(t_keys.data())
+    // aliases
+    uint32_t *d_comp = d_next; // comp[idx] -> representative component id of the idx-th pair
+    uint32_t *d_comp_key = d_prev; // comp_key[idx] -> component id values reordered for reductions
+    uint32_t *d_comp_to_rank = d_prev; // comp_to_rank[comp id] -> rank of that component in the final chain ordering
+    uint32_t *d_pos = d_succ_choice; // pos[idx] -> position of the idx-th pair inside its chain
+    uint32_t *d_comp_count = reinterpret_cast<uint32_t*>(d_src_keys); // comp_count[idx] -> number of pairs in the idx-th unique component
+    uint32_t *d_edge_id = d_succ_choice; // edge_id[idx] -> pair idx in sorted-space order
+    float *d_w_val = d_succ_score; // w_val[idx] -> pair weights reordered alongside comp_key for reduce_by_key
+    uint32_t *d_one = reinterpret_cast<uint32_t*>(d_out_begin); // one[idx] -> constant 1, used to count pairs per component
+    uint32_t *d_unique_comp = reinterpret_cast<uint32_t*>(d_out_end); // unique_comp[idx] -> unique component id produced by reduce_by_key
+    uint32_t *d_comp_id_rank = d_counts; // comp_id_rank[idx] -> component id that occupies the idx-th rank
+    thrust::device_ptr<uint32_t> t_comp_key(d_prev); // comp_key[idx] -> component id values reordered for reductions
+    thrust::device_ptr<uint32_t> t_comp_count(d_comp_count); // comp_count[idx] -> number of pairs in the idx-th unique component
+    thrust::device_ptr<uint32_t> t_edge_id(d_succ_choice); // edge_id[idx] -> pair idx in sorted-space order
+    thrust::device_ptr<float> t_w_val(d_succ_score); // w_val[idx] -> pair weights reordered alongside comp_key for reduce_by_key
+    thrust::device_ptr<uint32_t> t_one(d_one); // one[idx] -> constant 1, used to count pairs per component
+    thrust::device_ptr<uint32_t> t_unique_comp(d_unique_comp); // unique_comp[idx] -> unique component id produced by reduce_by_key
+    thrust::device_ptr<uint32_t> t_comp_id_rank(d_counts); // comp_id_rank[idx] -> component id that occupies the idx-th rank
+    thrust::device_ptr<float> t_comp_wsum(d_weights); // comp_wsum[idx] -> total weight of the idx-th unique component
+
+    CUDA_CHECK(cudaMemcpy(d_srcs, d_srcs_og, num_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dsts, d_dsts_og, num_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(d_size, d_size_og, num_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+    //CUDA_CHECK(cudaMemcpy(d_icnt, icnt, num_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w, d_weights_og, num_edges * sizeof(float), cudaMemcpyDeviceToDevice));
+
+    thrust::sequence(t_orig, t_orig + num_edges);
+
+    // sort edges by (src, -weight)
+    build_src_keys<<<blocks, threads_per_block>>>(
+        num_edges,
+        d_srcs,
+        d_w,
+        d_src_keys
     );
-
-    auto zipped = thrust::make_zip_iterator(thrust::make_tuple(d_src.begin(), d_dst.begin(), d_size.begin(), d_w.begin(), d_orig.begin()));
-    //auto zipped = thrust::make_zip_iterator(thrust::make_tuple(d_src.begin(), d_dst.begin(), d_size.begin(), d_icnt.begin(), d_w.begin(), d_orig.begin()));
-
-    thrust::sort_by_key(exec, t_keys.begin(), t_keys.end(), zipped, SrcNegWLess());
+    auto zipped = thrust::make_zip_iterator(thrust::make_tuple(t_srcs, t_dsts, t_size, t_w, t_orig));
+    //auto zipped = thrust::make_zip_iterator(thrust::make_tuple(t_srcs, t_dsts, t_size, t_icnt, t_w, t_orig));
+    thrust::stable_sort_by_key(t_src_keys, t_src_keys + num_edges, zipped);
 
     // for each edge i, its outgoing candidate list is OUT[dst[i]] = edges whose src == dst[i]
-    thrust::device_vector<int> d_out_begin(n), d_out_end(n);
-    thrust::lower_bound(exec, d_src.begin(), d_src.end(), d_dst.begin(), d_dst.end(), d_out_begin.begin());
-    thrust::upper_bound(exec, d_src.begin(), d_src.end(), d_dst.begin(), d_dst.end(), d_out_end.begin());
+    thrust::lower_bound(t_srcs, t_srcs + num_edges, t_dsts, t_dsts + num_edges, t_out_begin);
+    thrust::upper_bound(t_srcs, t_srcs + num_edges, t_dsts, t_dsts + num_edges, t_out_end);
 
     // chaining state
-    thrust::device_vector<uint32_t> d_next(n), d_prev(n);
-    CUDA_CHECK(cudaMemsetAsync(thrust::raw_pointer_cast(d_next.data()), 0xFF, n * sizeof(uint32_t), stream)); // init to UINT32_MAX
-    CUDA_CHECK(cudaMemsetAsync(thrust::raw_pointer_cast(d_prev.data()), 0xFF, n * sizeof(uint32_t), stream)); // init to UINT32_MAX
-
-    // temporary proposal / conflict buffers
-    thrust::device_vector<uint32_t> d_succ_choice(n);
-    thrust::device_vector<float> d_succ_score(n);
-
-    thrust::device_vector<float> d_best_score(n);
-    thrust::device_vector<uint32_t> d_best_pred(n);
+    CUDA_CHECK(cudaMemset(d_next, 0xFF, num_edges * sizeof(uint32_t))); // UINT32_MAX -> no successor chosen yet
+    CUDA_CHECK(cudaMemset(d_prev, 0xFF, num_edges * sizeof(uint32_t))); // UINT32_MAX -> no predecessor chosen yet
 
     // multi-iteration greedy build
-    for (int it = 0; it < ITERS; ++it) {
-        thrust::fill(exec, d_best_score.begin(), d_best_score.end(), -1e30f);
-        CUDA_CHECK(cudaMemsetAsync(thrust::raw_pointer_cast(d_best_pred.data()), 0xFF, n * sizeof(uint32_t), stream)); // init to UINT32_MAX
+    for (int it = 0; it < CHAIN_ITERS; ++it) {
+        CUDA_CHECK(cudaMemset(d_best_claim, 0x00, num_edges * sizeof(uint64_t))); // 0 -> no predecessor claimed this successor yet
 
-        propose_successor<<<blocks, threads, 0, stream>>>(
-            n,
-            thrust::raw_pointer_cast(d_dst.data()),
-            thrust::raw_pointer_cast(d_size.data()),
-            //thrust::raw_pointer_cast(d_icnt.data()),
-            thrust::raw_pointer_cast(d_w.data()),
-            thrust::raw_pointer_cast(d_out_begin.data()),
-            thrust::raw_pointer_cast(d_out_end.data()),
-            thrust::raw_pointer_cast(d_prev.data()),
-            thrust::raw_pointer_cast(d_next.data()),
-            WINDOW, ALPHA,
-            thrust::raw_pointer_cast(d_succ_choice.data()),
-            thrust::raw_pointer_cast(d_succ_score.data())
+        propose_successor<<<blocks, threads_per_block>>>(
+            num_edges,
+            d_dsts,
+            d_size,
+            //d_icnt,
+            d_w,
+            d_out_begin,
+            d_out_end,
+            d_prev,
+            d_next,
+            CHAIN_WINDOW,
+            CHAIN_ALPHA,
+            d_succ_choice,
+            d_succ_score
         );
 
-        resolve_successor_conflicts<<<blocks, threads, 0, stream>>>(
-            n,
-            thrust::raw_pointer_cast(d_succ_choice.data()),
-            thrust::raw_pointer_cast(d_succ_score.data()),
-            thrust::raw_pointer_cast(d_prev.data()),
-            thrust::raw_pointer_cast(d_best_score.data()),
-            thrust::raw_pointer_cast(d_best_pred.data())
+        resolve_successor_conflicts<<<blocks, threads_per_block>>>(
+            num_edges,
+            d_succ_choice,
+            d_succ_score,
+            d_prev,
+            d_best_claim
         );
 
-        commit_links<<<blocks, threads, 0, stream>>>(
-            n,
-            thrust::raw_pointer_cast(d_next.data()),
-            thrust::raw_pointer_cast(d_prev.data()),
-            thrust::raw_pointer_cast(d_best_pred.data())
+        commit_links<<<blocks, threads_per_block>>>(
+            num_edges,
+            d_next,
+            d_prev,
+            d_best_claim
         );
     }
 
     // component id and position
-    thrust::device_vector<uint32_t> d_comp(n), d_pos(n);
-    compute_comp_and_pos<<<blocks, threads, 0, stream>>>(
-        n,
-        thrust::raw_pointer_cast(d_prev.data()),
-        thrust::raw_pointer_cast(d_comp.data()),
-        thrust::raw_pointer_cast(d_pos.data())
+    compute_comp_and_pos<<<blocks, threads_per_block>>>(
+        num_edges,
+        d_prev,
+        d_comp,
+        d_pos
     );
 
-    // compute component weight sums and counts via reduce_by_key, sort edges by comp to reduce
-    thrust::device_vector<uint32_t> d_comp_key = d_comp;
-    thrust::device_vector<float> d_w_val = d_w;
-    thrust::device_vector<uint32_t> d_one(n, 1);
+    CUDA_CHECK(cudaMemcpy(d_comp_key, d_comp, num_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w_val, d_w, num_edges * sizeof(float), cudaMemcpyDeviceToDevice));
 
-    thrust::sort_by_key(exec, d_comp_key.begin(), d_comp_key.end(), thrust::make_zip_iterator(thrust::make_tuple(d_w_val.begin(), d_one.begin())));
+    thrust::fill(t_one, t_one + num_edges, 1u);
 
-    thrust::device_vector<uint32_t> d_unique_comp(n);
-    thrust::device_vector<float> d_comp_wsum(n);
-    thrust::device_vector<uint32_t> d_comp_count(n);
+    thrust::sort_by_key(t_comp_key, t_comp_key + num_edges, thrust::make_zip_iterator(thrust::make_tuple(t_w_val, t_one)));
 
     auto end1 = thrust::reduce_by_key(
-        exec,
-        d_comp_key.begin(), d_comp_key.end(),
-        d_w_val.begin(),
-        d_unique_comp.begin(),
-        d_comp_wsum.begin()
+        t_comp_key, t_comp_key + num_edges,
+        t_w_val, t_unique_comp,
+        t_comp_wsum
     );
-    int m = (int)(end1.first - d_unique_comp.begin());
+    int num_components = (int)(end1.first - t_unique_comp);
 
     auto end2 = thrust::reduce_by_key(
-        exec,
-        d_comp_key.begin(), d_comp_key.end(),
-        d_one.begin(),
-        d_unique_comp.begin(), // overwrite ok (same keys)
-        d_comp_count.begin()
+        t_comp_key, t_comp_key + num_edges,
+        t_one, t_unique_comp, // overwriting is ok (same keys)
+        t_comp_count
     );
-    int m2 = (int)(end2.first - d_unique_comp.begin());
-    if (m2 < m) m = m2;
+    int num_components_2 = (int)(end2.first - t_unique_comp);
+    if (num_components_2 < num_components) num_components = num_components_2;
+    thrust::device_ptr<uint32_t> t_comp_idx = t_comp_key; // comp_idx[idx] -> component rank candidates sorted by descending component weight
+    thrust::sequence(t_comp_idx, t_comp_idx + num_components);
 
-    // rank components by total weight descending
-    thrust::device_vector<uint32_t> d_comp_idx(m);
-    thrust::sequence(exec, d_comp_idx.begin(), d_comp_idx.end());
-
-    thrust::sort(exec, d_comp_idx.begin(), d_comp_idx.end(),
-        [wsum = thrust::raw_pointer_cast(d_comp_wsum.data())] __device__ (uint32_t a, uint32_t b) {
+    thrust::sort(t_comp_idx, t_comp_idx + num_components,
+        [wsum = d_weights] __device__ (uint32_t a, uint32_t b) {
             float wa = wsum[a];
             float wb = wsum[b];
             if (wa > wb) return true;
@@ -429,81 +199,54 @@ void chaining(
         }
     );
 
-    // map comp_id (which is an edge index in [0..n)) -> comp_rank in [0..m)
-    thrust::device_vector<uint32_t> d_comp_to_rank(n, 0);
-    thrust::device_vector<uint32_t> d_comp_id_rank(m);
-    thrust::gather(exec, d_comp_idx.begin(), d_comp_idx.end(), d_unique_comp.begin(), d_comp_id_rank.begin());
+    thrust::gather(t_comp_idx, t_comp_idx + num_components, t_unique_comp, t_comp_id_rank);
 
-    // fill comp_to_rank
+    CUDA_CHECK(cudaMemset(d_comp_to_rank, 0x00, num_edges * sizeof(uint32_t)));
+
     thrust::for_each_n(
-        exec,
-        thrust::make_counting_iterator(0),
-        m,
-        [comp_id_rank = thrust::raw_pointer_cast(d_comp_id_rank.data()), comp_to_rank = thrust::raw_pointer_cast(d_comp_to_rank.data())] __device__ (int r) {
+        thrust::make_counting_iterator(0), num_components,
+        [comp_id_rank = d_comp_id_rank, comp_to_rank = d_comp_to_rank] __device__ (int r) {
             uint32_t c = comp_id_rank[r];
             comp_to_rank[c] = (uint32_t)r;
         }
     );
 
     // build per-edge sort keys (comp_rank, pos, edge_id)
-    thrust::device_vector<EdgeOrderKey> d_edge_keys(n);
-    build_edge_order_keys<<<blocks, threads, 0, stream>>>(
-        n,
-        thrust::raw_pointer_cast(d_comp.data()),
-        thrust::raw_pointer_cast(d_pos.data()),
-        thrust::raw_pointer_cast(d_comp_to_rank.data()),
-        thrust::raw_pointer_cast(d_edge_keys.data())
+    build_edge_order_keys<<<blocks, threads_per_block>>>(
+        num_edges,
+        d_comp,
+        d_pos,
+        d_comp_to_rank,
+        d_edge_keys
     );
 
-    // sort edges by final order keys; carry edge_id along
-    thrust::device_vector<uint32_t> d_edge_id(n);
-    thrust::sequence(exec, d_edge_id.begin(), d_edge_id.end());
-
-    thrust::sort_by_key(exec, d_edge_keys.begin(), d_edge_keys.end(), d_edge_id.begin(), EdgeOrderLess());
+    thrust::sequence(t_edge_id, t_edge_id + num_edges);
+    thrust::sort_by_key(t_edge_keys, t_edge_keys + num_edges, t_edge_id);
 
     // assign final sequence_idx = global position w.r.t. that sorted order
-    scatter_sequence_idx<<<blocks, threads, 0, stream>>>(
-        n,
-        thrust::raw_pointer_cast(d_edge_id.data()),
-        thrust::raw_pointer_cast(d_orig.data()),
+    scatter_sequence_idx<<<blocks, threads_per_block>>>(
+        num_edges,
+        d_edge_id,
+        d_orig,
         sequence_idx
     );
-}
 
-// try to pair k-th smallest with k-th largest in parallel
-__global__
-void pair_kth_smallest_with_kth_largest(
-    const uint32_t* __restrict__ sorted_indices, // length = K
-    uint32_t K,
-    const uint32_t* __restrict__ d_nodes_sizes,
-    const uint32_t* __restrict__ d_inbound_count,
-    uint32_t h_max_nodes_per_part,
-    uint32_t h_max_inbound_per_part,
-    uint32_t* __restrict__ d_groups
-) {
-    uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t half = K / 2;
-    if (k >= half) return;
-
-    uint32_t idxL = sorted_indices[k];
-    uint32_t idxR = sorted_indices[K - 1 - k];
-
-    // Read sizes and inbound counts
-    uint32_t sL = d_nodes_sizes[idxL];
-    uint32_t sR = d_nodes_sizes[idxR];
-
-    // quickly check sizes constraint
-    if ((uint64_t)sL + (uint64_t)sR >= (uint64_t)h_max_nodes_per_part) return;
-
-    uint32_t inL = d_inbound_count[idxL];
-    uint32_t inR = d_inbound_count[idxR];
-
-    if ((uint64_t)inL + (uint64_t)inR >= (uint64_t)h_max_inbound_per_part) return;
-
-    // both constraints satisfied — write group id
-    uint32_t gid = (idxL < idxR) ? idxL : idxR;
-    d_groups[idxL] = gid;
-    d_groups[idxR] = gid;
+    CUDA_CHECK(cudaFree(d_edge_keys));
+    CUDA_CHECK(cudaFree(d_weights));
+    CUDA_CHECK(cudaFree(d_counts));
+    CUDA_CHECK(cudaFree(d_best_claim));
+    CUDA_CHECK(cudaFree(d_succ_score));
+    CUDA_CHECK(cudaFree(d_succ_choice));
+    CUDA_CHECK(cudaFree(d_prev));
+    CUDA_CHECK(cudaFree(d_next));
+    CUDA_CHECK(cudaFree(d_out_end));
+    CUDA_CHECK(cudaFree(d_out_begin));
+    CUDA_CHECK(cudaFree(d_src_keys));
+    CUDA_CHECK(cudaFree(d_w));
+    CUDA_CHECK(cudaFree(d_size));
+    CUDA_CHECK(cudaFree(d_dsts));
+    CUDA_CHECK(cudaFree(d_srcs));
+    CUDA_CHECK(cudaFree(d_orig));
 }
 
 // given a set of pairs proposed between nodes (d_pairs), isolate nodes without a pair,
@@ -522,52 +265,51 @@ void build_orphan_pairs(
 ) {
     thrust::device_ptr<const uint32_t> t_pairs(d_pairs);
 
-    // gather indices i where d_pairs[i] == UINT32_MAX
-    thrust::device_vector<uint32_t> t_free_indices(curr_num_nodes);
+    uint32_t *d_free_indices = nullptr; // free_indices[idx] -> idx-th orphan node, later sorted by (size, idx)
+    uint64_t *d_free_keys = nullptr; // free_keys[idx] -> deterministic sort key (size << 32) | idx of the idx-th orphan node
+
+    CUDA_CHECK(cudaMalloc(&d_free_indices, curr_num_nodes * sizeof(uint32_t)));
+    thrust::device_ptr<uint32_t> t_free_indices(d_free_indices);
 
     auto idx_begin = thrust::counting_iterator<uint32_t>(0);
     auto idx_end = thrust::counting_iterator<uint32_t>(curr_num_nodes);
 
-    // copy_if from 0..curr_num_nodes into t_free_indices
+    // copy_if from 0..curr_num_nodes into d_free_indices
     auto out_it = thrust::copy_if(
-        idx_begin, idx_end,
-        t_free_indices.begin(),
+        idx_begin, idx_end, t_free_indices,
         [t_pairs, candidates_count] __device__ (uint32_t i) {
             return t_pairs[i * candidates_count] == UINT32_MAX;
         }
     );
 
-    uint32_t num_free = (uint32_t)(out_it - t_free_indices.begin());
-    if (num_free < 2) return; // nothing to do 
+    uint32_t num_free = (uint32_t)(out_it - t_free_indices);
+    #if VERBOSE
+    std::cout << "Orphans nodes found: " << num_free << "\n";
+    #endif
+    if (num_free < 2) {
+        CUDA_CHECK(cudaFree(d_free_indices));
+        return;
+    }
 
-    // resize the vector to actual size
-    t_free_indices.resize(num_free);
+    CUDA_CHECK(cudaMalloc(&d_free_keys, num_free * sizeof(uint64_t)));
+    thrust::device_ptr<uint64_t> t_free_keys(d_free_keys);
 
-    // build 64-bit keys = (nodes_size << 32) | index for deterministic sort by size then index
-    thrust::device_vector<uint64_t> t_keys(num_free);
-
-    // transform each free index to key
     thrust::transform(
-        t_free_indices.begin(), t_free_indices.end(),
-        t_keys.begin(),
+        t_free_indices, t_free_indices + num_free, t_free_keys,
         [d_nodes_sizes] __device__ (uint32_t idx) -> uint64_t {
             uint64_t s = (uint64_t)d_nodes_sizes[idx];
-            uint64_t key = (s << 32) | (uint64_t)idx;
-            return key;
+            return (s << 32) | (uint64_t)idx;
         }
     );
 
-    // sort-by-key (ascending by size then index) while permuting index array
-    thrust::sort_by_key(t_keys.begin(), t_keys.end(), t_free_indices.begin());
+    thrust::sort_by_key(t_free_keys, t_free_keys + num_free, t_free_indices);
 
-    // at this point t_free_indices[0..num_free-1] is sorted ascending by nodes_size (tie: index)
-    // => launch pairing kernel: each thread pairs k-th smallest with k-th largest
-    const uint32_t threads = 256;
-    uint32_t pairs_to_try = num_free / 2;
-    uint32_t blocks = (pairs_to_try + threads - 1) / threads;
-
-    pair_kth_smallest_with_kth_largest<<<blocks, threads>>>(
-        thrust::raw_pointer_cast(t_free_indices.data()),
+    int threads_per_block = 256;
+    int num_threads_needed = num_free / 2; // 1 thread per one-in-two free nodes
+    int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+    std::cout << "Running pair orphans kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    pair_kth_smallest_with_kth_largest<<<blocks, threads_per_block>>>(
+        d_free_indices,
         num_free,
         d_nodes_sizes,
         d_inbound_count,
@@ -578,4 +320,7 @@ void build_orphan_pairs(
 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaFree(d_free_keys));
+    CUDA_CHECK(cudaFree(d_free_indices));
 }

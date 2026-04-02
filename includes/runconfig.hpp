@@ -35,6 +35,7 @@ namespace config {
         float oversized_multiplier; // multiplicative factor for oversized deduplication buffers
         uint32_t candidates_count; // number of candidates to propose per node during coarsening
         uint32_t refine_repeats; // number of repetitions for the refinement routine per level
+        uint32_t save_memory_up_to_level; // number of levels for which to temporarily move the initial hypergraph to the host before recursing
         bool device_touching_construction; // whether to construct touching/incidence sets on the device or the host
     };
 

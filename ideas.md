@@ -696,3 +696,54 @@ How to fix all the crap in ordering.cu:
 - sum from one array to the other directly, set to zero past the end, and a single scan is enough
 - apply moves starting from the array where the sum, scan, and max occurred, fetch the paired move from the other array by adding your distance from the offset to the other array's offset for the same p>>1
 => what currently broke me is just the concatenation of odd and even
+
+----
+
+THIS DAMN GIANT pins-per-partition!!
+
+IDEA TO TOLERATE A STUPIDLY LARGE NUMBER OF HEDGES:
+- allocate pins-per-partition once per level
+- scan hedge offsets deltas to count how many hedges have a single pin and to compute the index of each hedge among those with >1 pin
+- allocate a row of pins per partition only for those hedges with >1 pin
+=> ISSUE: by the time you reach level 0, you are gonna be back to the fully size of pins-per-partition anyway...
+KEY IDEA:
+- I need pins-per-partition, but only when it's not zero!
+- I could use
+  - a key-value representation (hash-table) -> NAH, still stupidly larger
+  - a compressed form, where zeros are stored as (zero, count of zeros)
+  => this would also be fine with the transformation in inbound-pins-per-partition, since that only subtracts, so you get a few zeros here and there, who cares
+
+HOW TO BUILT PINS-PER-PARTITION (one every ref. repeat):
+- use two arrays (CSR):
+ - array of size |hedges|, called per-per-part-offsets
+ - a contigous array of segments, of type "pin_count", a new struct containing the partition id alongside the pins count for an hedge and that partition
+ - each segmented, pointed by an offset for an hedge, contains the sparse pins-per-partition of that hedge over partitions
+- first kernel: one warp per hedge, go over pins and use a SM+GM hash-table (->TABLE<-) to count their uniques number and how mnay times each occurs, flush the SM in 
+  => if memory is really right, do not flush, rebuild
+- a scan over unique counts gives you the offsets => allocate the array of segments
+- do a pack from hash-tables to the array of segments (or rebuild, depending on available memory)
+=> ISSUE: forget the pack! You need exact immediate access, so you need to keep the hash-tables, but then memory may not be enough...rehashing?
+
+=>=> OR, I come up with another version of the sparse representation...
+TODO:
+- pay double the memory
+- build two pins-per-partition, the total-pins version and the inbound-pins version
+- keep them updated, instead of rebuilding
+=> POSSIBLE iff the sparse representation is "dynamic enough"
+
+NEW pins-per-partition sparse data structure:
+- define a struct (uint32_t, uint64_t), call it "entry"
+- say that I have R rows (~60M) and C cols (~8k)
+- allocate a matrix of R x (C / 64) entries
+- iterate other structures and write, for each row, for each entry, a 1 or a 0 in the bit of the uint64_t value corresponding to the column index % 64,
+    in the entry in column "column / 64", simultaneously increment by 1 the entry's uint32_t counter
+- then do an exclusive scan of each row's entries, over only the uint32_t counters
+- hence, the counter tell essentially how many bits were set to 1 before them in that row
+- now, with a reduce on the last entry of each row, infer the total number of non-zero bits that were set (i.e. the total of all counters)
+- moreover, the scan tells the offset where each row's data will commence
+- use the full total to allocate a compressed array of segments, one segmente per row
+- re-do the iteration over other structures to fill the new array
+- to access a cell in the array, access first the matrix, read the offset of the row, and the specific entry, add to the entry's uint32_t counter,
+    the count of bits in the uint64_t value that are 1 before your own bit; add the offset, and the final counter to get the cell exact offset
+---> maybe I could even sacrifice memory, make the counters 64bit too, and not have any need for the offsets of rows, I could just do a scan over the whole matrix at
+     once and accumulate all offsets in the then-64bit counters...

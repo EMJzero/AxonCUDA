@@ -51,6 +51,13 @@ void logPartitions(
     const uint32_t h_max_nodes_per_part
 );
 
+void logMoves(
+    const uint32_t *d_pairs,
+    const float *d_f_scores,
+    const uint32_t *d_partitions,
+    const uint32_t curr_num_nodes
+);
+
 
 // KERNELS
 
