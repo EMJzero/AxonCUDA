@@ -40,6 +40,7 @@ namespace config {
             "  -rfr <num>  Set the number of refinement repetitions per level\n"
             "  -smh <lvl>  Recover device memory by migrating to the host the pre-coarsening hypergraph up the provided level\n"
             "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
+            "  -v <lvl>    Set the verbosity level: 0 metrics only, 1 steps and phases, 2 kernel launches, 3  \n"
             "  -h          Show this help message\n";
     }
 
@@ -58,6 +59,10 @@ namespace config {
         uint32_t refine_repeats = REFINE_REPEATS;
         uint32_t save_memory_up_to_level = SAVE_MEMORY_UP_TO_LEVEL;
         bool device_touching_construction = false;
+        bool verbose_logs = VERBOSE_LOGS;
+        bool verbose_info = VERBOSE_INFO;
+        bool verbose_errs_and_warns = VERBOSE_ERRS;
+        bool verbose_kernel_launches = VERBOSE_LAUNCHES;
 
         // CLI handling
         for (int i = 1; i < argc; ++i) {
@@ -106,6 +111,15 @@ namespace config {
                 save_memory_up_to_level = std::stoul(argv[++i]);
             } else if (arg == "-dtc") {
                 device_touching_construction = true;
+            } else if (arg == "-v") {
+                if (i + 1 >= argc) { std::cerr << "Error: -v requires a positive value between 0 and 3\n"; std::exit(1); }
+                int verbosity = std::stoul(argv[++i]);
+                if (verbosity < 0 || verbosity > 3) { std::cerr << "Error: -v must be between 0 and 3 (extremes included) \n"; std::exit(1); }
+                verbose_logs = verbosity > 2;
+                verbose_info = verbosity > 0;
+                verbose_errs_and_warns = verbosity > 0;
+                verbose_kernel_launches = verbosity > 1;
+                if (verbose_logs) std::cerr << "WARNING, verbosity 3 can hinder performance, especially on the host side !!\n";
             } else { std::cerr << "Unknown option: " << arg << "\n"; std::exit(1); }
         }
         assert((mode == Mode::KWAY && constr_type == ConstrType::KWAY) || (mode != Mode::KWAY && constr_type != ConstrType::KWAY));
@@ -123,11 +137,15 @@ namespace config {
             candidates_count,
             refine_repeats,
             save_memory_up_to_level,
-            device_touching_construction
+            device_touching_construction,
+            verbose_logs,
+            verbose_info,
+            verbose_errs_and_warns,
+            verbose_kernel_launches
         };
     }
 
-    HyperGraph loadHgraph(runconfig cfg) {
+    HyperGraph loadHgraph(runconfig &cfg) {
         HyperGraph hg(0, {}, {}); // placeholder -> overwritten if "-r" is given
 
         if (!cfg.load_path.empty()) {
@@ -137,15 +155,15 @@ namespace config {
                 if (file_path.extension() == ".hgr") {
                     std::cout << "Loading hypergraph from: " << cfg.load_path << " (hMETIS format) ...\n";
                     std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(cfg.load_path)) / (1 << 20) << " MB\n";
-                    hg = HyperGraph::loadhMETIS(cfg.load_path);
+                    hg = HyperGraph::loadhMETIS(cfg.load_path, cfg.verbose_errs_and_warns);
                 } else if (file_path.extension() == ".snn") {
                     std::cout << "Loading hypergraph from: " << cfg.load_path << " (SNN format) ...\n";
                     std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(cfg.load_path)) / (1 << 20) << " MB\n";
-                    hg = HyperGraph::loadSNN(cfg.load_path);
+                    hg = HyperGraph::loadSNN(cfg.load_path, cfg.verbose_errs_and_warns);
                 } else if (file_path.extension() == ".axh") {
                     std::cout << "Loading hypergraph from: " << cfg.load_path << " (AXH format) ...\n";
                     std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(cfg.load_path)) / (1 << 20) << " MB\n";
-                    hg = HyperGraph::loadAXH(cfg.load_path);
+                    hg = HyperGraph::loadAXH(cfg.load_path, cfg.verbose_errs_and_warns);
                 } else {
                     throw std::runtime_error("Failed to load hypergraph, unsupported file format (supported: '.hgr', '.snn', '.axh').");
                 }
@@ -160,7 +178,7 @@ namespace config {
         return hg;
     }
 
-    Constraints setupConstr(runconfig cfg, HyperGraph hg) {
+    Constraints setupConstr(runconfig &cfg, HyperGraph hg) {
         if (cfg.constr_type == ConstrType::KWAY) { // k-way mode ('-k')
             std::ostringstream epsistr;
             epsistr << std::fixed << std::setprecision(3) << cfg.epsi;
@@ -193,7 +211,7 @@ namespace config {
         }
     }
 
-    void saveResult(runconfig cfg, HyperGraph partitioned_hg, std::vector<uint32_t> partitions) {
+    void saveResult(runconfig &cfg, HyperGraph partitioned_hg, std::vector<uint32_t> partitions) {
         // save hypergraph
         if (!cfg.save_path.empty()) {
             if (cfg.load_path.empty()) {

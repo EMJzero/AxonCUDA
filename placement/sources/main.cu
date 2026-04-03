@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
     std::cout << "  Wire energy, latency:    " << std::fixed << std::setprecision(3) << hw.energyPerWire() << " pJ, " << hw.latencyPerWire() << " ns\n";
 
     if (hg.nodes() > hw.coresAlongX() * hw.coresAlongY()) {
-        std::cerr << "ERROR, the hypergraph has more nodes (" << hg.nodes() << ") than the 2D lattice has points (" << hw.coresAlongX() * hw.coresAlongY() << "), placement would fail !!\n";
+        ERR(cfg) std::cerr << "ERROR, the hypergraph has more nodes (" << hg.nodes() << ") than the 2D lattice has points (" << hw.coresAlongX() * hw.coresAlongY() << "), placement would fail !!\n";
         return 1;
     }
     
@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
     std::cout << "  Max. grid size: " << props.maxGridSize[0] << " x " << props.maxGridSize[1] << " x " << props.maxGridSize[2] << "\n";
     std::cout << "  Max. block size: " << props.maxThreadsDim[0] << " x " << props.maxThreadsDim[1] << " x " << props.maxThreadsDim[2] << "\n";
     
-    std::cout << "Preparing hypergraph data...\n";
+    INFO(cfg) std::cout << "Preparing hypergraph data...\n";
 
     // build incidence sets on the host only if explicitly required
     if (!cfg.device_touching_construction)
@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
     const uint32_t h_max_width = hw.coresAlongX();
     const uint32_t h_max_height = hw.coresAlongY();
 
-    std::cout << "Starting timer...\n";
+    INFO(cfg) std::cout << "Starting timer...\n";
     auto time_start = std::chrono::high_resolution_clock::now();
     cudaEvent_t d_time_start, d_time_stop;
     CUDA_CHECK(cudaEventCreate(&d_time_start));
@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
     // ============================
     // === CUDA STUFF GOES HERE ===
 
-    std::cout << "Setting up GPU memory...\n";
+    INFO(cfg) std::cout << "Setting up GPU memory...\n";
 
     // device pointers
     // hypergraph
@@ -171,25 +171,26 @@ int main(int argc, char** argv) {
         );
     } else {
         std::tie(d_touching, d_touching_offsets) = buildTouchingHost(
+            cfg,
             hg
         );
     }
 
-    std::cout << "Starting core timer...\n";
+    INFO(cfg) std::cout << "Starting core timer...\n";
     cudaEvent_t d_time_core_start, d_time_core_stop;
     CUDA_CHECK(cudaEventCreate(&d_time_core_start));
     CUDA_CHECK(cudaEventCreate(&d_time_core_stop));
     CUDA_CHECK(cudaEventRecord(d_time_core_start));
 
     // initial placement
-    uint32_t* d_order_idx = nullptr;  // order_idx[node] -> position in the 1D ordering for node
+    uint32_t* d_order_idx = nullptr; // order_idx[node] -> position in the 1D ordering for node
     if (cfg.feedforward_order) {
         CUDA_CHECK(cudaMalloc(&d_order_idx, num_nodes * sizeof(uint32_t)));
-        std::cout << "Ordering nodes (sequential - might take a while) ...\n";
+        INFO(cfg) std::cout << "Ordering nodes (sequential - might take a while) ...\n";
         std::vector<uint32_t> nodes_order_idx = hg.feedForwardOrder();
         CUDA_CHECK(cudaMemcpy(d_order_idx, nodes_order_idx.data(), num_nodes * sizeof(uint32_t), cudaMemcpyHostToDevice));
     } else {
-        std::cout << "Ordering nodes (parallel - recursive bisection) ...\n";
+        INFO(cfg) std::cout << "Ordering nodes (parallel - recursive bisection) ...\n";
         d_order_idx = locality_ordering(
             cfg,
             num_nodes,
@@ -220,41 +221,41 @@ int main(int argc, char** argv) {
     
     // =============================
     // print some temporary results
-    #if VERBOSE
-    CUDA_CHECK(cudaMemcpy(init_placement.data(), d_placement, num_nodes * sizeof(coords), cudaMemcpyDeviceToHost));
-    std::vector<Coord2D> h_init_placement(num_nodes);
-    for (uint32_t i = 0; i < num_nodes; i++) {
-        h_init_placement[i] = Coord2D(
-            init_placement[i].x,
-            init_placement[i].y
-        );
-    }
-    
-    if (hw.checkPlacementValidity(hg, h_init_placement, true)) {
-        auto metrics = hw.getAllMetrics(hg, h_init_placement);
-        std::cout << "Initial placement metrics:\n";
-        std::cout << "  Energy:        " << std::fixed << std::setprecision(3) << metrics.energy.value() << "\n";
-        std::cout << "  Avg. latency:  " << std::fixed << std::setprecision(3) << metrics.avg_latency.value() << "\n";
-        std::cout << "  Max. Latency:  " << std::fixed << std::setprecision(3) << metrics.max_latency.value() << "\n";
-        std::cout << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << metrics.avg_congestion.value() << "\n";
-        std::cout << "  Max. congestion:  " << std::fixed << std::setprecision(3) << metrics.max_congestion.value() << "\n";
-        std::cout << "  Connections locality:\n";
-        std::cout << "    Flat:     " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean << " ar. mean, " << metrics.connections_locality.value().geo_mean << " geo. mean\n";
-        std::cout << "    Weighted: " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
-    } else {
-        std::cerr << "ERROR, invalid initial placement !!\n";
-        return 1;
-    }
-    std::vector<Coord2D>().swap(h_init_placement);
+    LOG(cfg) {
+        CUDA_CHECK(cudaMemcpy(init_placement.data(), d_placement, num_nodes * sizeof(coords), cudaMemcpyDeviceToHost));
+        std::vector<Coord2D> h_init_placement(num_nodes);
+        for (uint32_t i = 0; i < num_nodes; i++) {
+            h_init_placement[i] = Coord2D(
+                init_placement[i].x,
+                init_placement[i].y
+            );
+        }
+        
+        if (hw.checkPlacementValidity(hg, h_init_placement, true)) {
+            auto metrics = hw.getAllMetrics(hg, h_init_placement);
+            std::cout << "Initial placement metrics:\n";
+            std::cout << "  Energy:        " << std::fixed << std::setprecision(3) << metrics.energy.value() << "\n";
+            std::cout << "  Avg. latency:  " << std::fixed << std::setprecision(3) << metrics.avg_latency.value() << "\n";
+            std::cout << "  Max. Latency:  " << std::fixed << std::setprecision(3) << metrics.max_latency.value() << "\n";
+            std::cout << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << metrics.avg_congestion.value() << "\n";
+            std::cout << "  Max. congestion:  " << std::fixed << std::setprecision(3) << metrics.max_congestion.value() << "\n";
+            std::cout << "  Connections locality:\n";
+            std::cout << "    Flat:     " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean << " ar. mean, " << metrics.connections_locality.value().geo_mean << " geo. mean\n";
+            std::cout << "    Weighted: " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
+        } else {
+            std::cerr << "ERROR, invalid initial placement !!\n";
+            return 1;
+        }
+        std::vector<Coord2D>().swap(h_init_placement);
 
-    std::cout << "Initial placement:\n";
-    for (uint32_t i = 0; i < num_nodes; ++i) {
-        if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
-            const coords place = init_placement[i];
-            std::cout << "  node " << i << " -> x=" << place.x << " y=" << place.y << "\n";
+        std::cout << "Initial placement:\n";
+        for (uint32_t i = 0; i < num_nodes; ++i) {
+            if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
+                const coords place = init_placement[i];
+                std::cout << "  node " << i << " -> x=" << place.x << " y=" << place.y << "\n";
+            }
         }
     }
-    #endif
     // =============================
 
     // initialize inverse placement
@@ -265,7 +266,7 @@ int main(int argc, char** argv) {
         int num_threads_needed = num_nodes; // 1 thread per node
         int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
         // launch - inverse placement kernel
-        std::cout << "Running inverse placement kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) << "inverse placement kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         inverse_placement_kernel<<<blocks, threads_per_block>>>(
             d_placement,
             num_nodes,
@@ -277,13 +278,13 @@ int main(int argc, char** argv) {
 
     // =============================
     // print some temporary results
-    #if VERBOSE
-    std::vector<uint32_t> inv_place_tmp(h_max_width * h_max_height);
-    CUDA_CHECK(cudaMemcpy(inv_place_tmp.data(), d_inv_placement, h_max_width * h_max_height * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    std::cout << "Initial inverse placement:\n";
-    printMatrixHex16(inv_place_tmp.data(), h_max_width, h_max_height, VERBOSE_LENGTH, VERBOSE_LENGTH);
-    std::vector<uint32_t>().swap(inv_place_tmp);
-    #endif
+    LOG(cfg) {
+        std::vector<uint32_t> inv_place_tmp(h_max_width * h_max_height);
+        CUDA_CHECK(cudaMemcpy(inv_place_tmp.data(), d_inv_placement, h_max_width * h_max_height * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        std::cout << "Initial inverse placement:\n";
+        printMatrixHex16(inv_place_tmp.data(), h_max_width, h_max_height, VERBOSE_LENGTH, VERBOSE_LENGTH);
+        std::vector<uint32_t>().swap(inv_place_tmp);
+    }
     // =============================
 
     // run force-directed refinement
@@ -306,20 +307,20 @@ int main(int argc, char** argv) {
 
     // =============================
     // print some example outputs
-    #if VERBOSE
-    std::cout << "Final placement:\n";
-    for (uint32_t i = 0; i < num_nodes; ++i) {
-        if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
-            coords place = placement[i];
-            std::cout << "  node " << i << " -> x=" << place.x << " y=" << place.y << "\n";
+    LOG(cfg) {
+        std::cout << "Final placement:\n";
+        for (uint32_t i = 0; i < num_nodes; ++i) {
+            if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
+                coords place = placement[i];
+                std::cout << "  node " << i << " -> x=" << place.x << " y=" << place.y << "\n";
+            }
         }
+        std::vector<uint32_t> final_inv_place_tmp(h_max_width * h_max_height);
+        CUDA_CHECK(cudaMemcpy(final_inv_place_tmp.data(), d_inv_placement, h_max_width * h_max_height * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        std::cout << "Final inverse placement:\n";
+        printMatrixHex16(final_inv_place_tmp.data(), h_max_width, h_max_height, VERBOSE_LENGTH, VERBOSE_LENGTH);
+        std::vector<uint32_t>().swap(final_inv_place_tmp);
     }
-    std::vector<uint32_t> final_inv_place_tmp(h_max_width * h_max_height);
-    CUDA_CHECK(cudaMemcpy(final_inv_place_tmp.data(), d_inv_placement, h_max_width * h_max_height * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    std::cout << "Final inverse placement:\n";
-    printMatrixHex16(final_inv_place_tmp.data(), h_max_width, h_max_height, VERBOSE_LENGTH, VERBOSE_LENGTH);
-    std::vector<uint32_t>().swap(final_inv_place_tmp);
-    #endif
     // =============================
     
     // cleanup device memory
@@ -352,12 +353,12 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventDestroy(d_time_core_stop));
 
     auto time_end = std::chrono::high_resolution_clock::now();
-    std::cout << "Stopping timer...\n";
+    INFO(cfg) std::cout << "Stopping timer...\n";
 
     // === CUDA STUFF ENDS HERE ===
     // ============================
 
-    std::cerr << "CUDA section: complete; proceeding with placement results validation and evalution...\n";
+    INFO(cfg) std::cout << "CUDA section: complete; proceeding with placement results validation and evalution...\n";
 
     double total_ms = std::chrono::duration<double, std::milli>(time_end - time_start).count();
     // core: excluding the initialization of hedges and incidence sets in device memory
@@ -373,7 +374,7 @@ int main(int argc, char** argv) {
         );
     }
 
-    if (hw.checkPlacementValidity(hg, h_placement, true)) {
+    if (hw.checkPlacementValidity(hg, h_placement, cfg.verbose_errs_and_warns)) {
         auto metrics = hw.getAllMetrics(hg, h_placement);
         std::cout << "Placement metrics:\n";
         std::cout << "  Energy:        " << std::fixed << std::setprecision(3) << metrics.energy.value() << "\n";
@@ -388,7 +389,7 @@ int main(int argc, char** argv) {
         // save hypergraph
         saveResult(cfg, h_placement);
     } else {
-        std::cerr << "WARNING, invalid placement !!\n";
+        ERR(cfg) std::cerr << "WARNING, invalid placement !!\n";
     }
 
     return 0;

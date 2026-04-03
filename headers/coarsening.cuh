@@ -33,7 +33,7 @@ namespace cg = cooperative_groups;
 // STEPS
 
 void candidatesProposal(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t *d_srcs_count,
@@ -50,14 +50,14 @@ void candidatesProposal(
 );
 
 void logCandidates(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_pairs,
     const uint32_t *d_u_scores,
     const uint32_t curr_num_nodes
 );
 
 std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
-    const runconfig cfg,
+    const runconfig &cfg,
     const cudaDeviceProp props,
     const uint32_t *d_inbound_count,
     const uint32_t *d_pairs,
@@ -71,7 +71,7 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
 );
 
 void logGroups(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_pairs,
     const uint32_t *d_groups,
     const uint32_t *d_groups_sizes,

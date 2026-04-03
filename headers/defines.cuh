@@ -10,8 +10,11 @@
 
 #define DEVICE_ID 0
 
-#define VERBOSE false
 #define VERBOSE_LENGTH 20
+#define VERBOSE_LAUNCHES true
+#define VERBOSE_INFO true
+#define VERBOSE_LOGS false
+#define VERBOSE_ERRS true
 
 
 // USED BY: everyone

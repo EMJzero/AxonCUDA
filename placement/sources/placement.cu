@@ -15,7 +15,7 @@
 #include "placement.cuh"
 
 void force_directed_refinement(
-    const runconfig cfg,
+    const runconfig &cfg,
     const cudaDeviceProp props,
     const uint32_t* d_hedges,
     const dim_t* d_hedges_offsets,
@@ -53,8 +53,8 @@ void force_directed_refinement(
     thrust::device_ptr<swap> t_ev_swaps(d_ev_swaps);
     thrust::device_ptr<float> t_ev_scores(d_ev_scores);
 
-    for (int iter = 0; iter < cfg.fd_iterations; iter++) {
-        std::cout << "Force-directed refinement, iteration " << iter << "\n";
+    for (uint32_t iter = 0; iter < cfg.fd_iterations; iter++) {
+        INFO(cfg) std::cout << "Force-directed refinement, iteration " << iter << "\n";
 
         /*
         * Flow:
@@ -76,7 +76,7 @@ void force_directed_refinement(
             int num_warps_needed = num_nodes ; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - forces kernel
-            std::cout << "Running forces kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "forces kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             forces_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
                 d_hedges_offsets,
@@ -93,12 +93,10 @@ void force_directed_refinement(
 
         // =============================
         // print some temporary results
-        #if VERBOSE
-        logForces(
-            *d_forces,
+        LOG(cfg) logForces(
+            d_forces,
             num_nodes
         );
-        #endif
         // =============================
 
         {
@@ -108,7 +106,7 @@ void force_directed_refinement(
             int num_warps_needed = num_nodes ; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - tensions kernel
-            std::cout << "Running tensions kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "tensions kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             tensions_kernel<<<blocks, threads_per_block>>>(
                 d_placement,
                 d_inv_placement,
@@ -124,14 +122,12 @@ void force_directed_refinement(
 
         // =============================
         // print some temporary results
-        #if VERBOSE
-        logTensions(
+        LOG(cfg) logTensions(
             cfg,
             d_pairs,
             d_scores,
             num_nodes
         );
-        #endif
         // =============================
 
         // zero-out swap slots and flags
@@ -153,15 +149,15 @@ void force_directed_refinement(
             uint32_t num_repeats = 1;
             if (blocks > max_blocks) {
                 num_repeats = (blocks + max_blocks - 1) / max_blocks;
-                std::cout << "NOTE: exclusive swaps kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
+                INFO(cfg) std::cout << "NOTE: exclusive swaps kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
                 blocks = (blocks + num_repeats - 1) / num_repeats;
                 if (num_repeats > MAX_SWAPS_MATCHING_REPEATS) {
-                    std::cout << "ABORTING: exclusive swaps kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_SWAPS_MATCHING_REPEATS << " !!\n";
+                    ERR(cfg) std::cerr << "ABORTING: exclusive swaps kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_SWAPS_MATCHING_REPEATS << " !!\n";
                     abort();
                 }
             }
             // launch - exclusive swaps kernel
-            std::cout << "Running exclusive swaps kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "exclusive swaps kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             void *kernel_args[] = {
                 (void*)&d_pairs,
                 (void*)&d_scores,
@@ -178,24 +174,22 @@ void force_directed_refinement(
 
         // =============================
         // print some temporary results
-        #if VERBOSE
-        void logSwapPairs(
+        LOG(cfg) logSwapPairs(
             d_swap_slots,
             d_swap_flags,
             num_nodes
         );
-        #endif
         // =============================
 
         // scan flags to give each event its offset
         thrust::exclusive_scan(t_swap_flags, t_swap_flags + (num_nodes + 1), t_swap_flags);
         uint32_t num_events;
         CUDA_CHECK(cudaMemcpy(&num_events, d_swap_flags + num_nodes, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        std::cout << "Number of events produced: " << num_events << " ...\n";
+        INFO(cfg) std::cout << "Number of events produced: " << num_events << " ...\n";
         if (num_events > (num_nodes + 1) / 2)
-            std::cout << "WARNING, there are more events (" << num_events << ") than half the node (" << (num_nodes + 1) / 2 << "), this >may< an undesirable situation ...\n";
+            ERR(cfg) std::cerr << "WARNING, there are more events (" << num_events << ") than half the node (" << (num_nodes + 1) / 2 << "), this >may< an undesirable situation ...\n";
         else if (num_events == 0) {
-            std::cout << "Stopping with no events (viable swaps), on iteration " << iter << "\n";
+            INFO(cfg) std::cout << "Stopping with no events (viable swaps), on iteration " << iter << "\n";
             break;
         }
 
@@ -216,7 +210,7 @@ void force_directed_refinement(
             int num_threads_needed = num_nodes; // 1 thread per node
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - events kernel
-            std::cout << "Running events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             swap_events_kernel<<<blocks, threads_per_block>>>(
                 d_swap_slots,
                 d_swap_flags,
@@ -234,14 +228,12 @@ void force_directed_refinement(
 
         // =============================
         // print some temporary results
-        #if VERBOSE
-        void logEvents(
+        LOG(cfg) logEvents(
             d_ev_swaps,
             d_ev_scores,
             num_nodes,
             "sorted - in isolation"
         );
-        #endif
         // =============================
 
         {
@@ -250,7 +242,7 @@ void force_directed_refinement(
             int num_threads_needed = num_events; // 1 thread per event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - scatter ranks kernel
-            std::cout << "Running scatter ranks kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "scatter ranks kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             scatter_ranks_kernel<<<blocks, threads_per_block>>>(
                 d_ev_swaps,
                 num_events,
@@ -267,7 +259,7 @@ void force_directed_refinement(
             int num_warps_needed = num_events ; // 1 warp per event
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - cascade kernel
-            std::cout << "Running cascade kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "cascade kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             cascade_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
                 d_hedges_offsets,
@@ -286,14 +278,12 @@ void force_directed_refinement(
 
         // =============================
         // print some temporary results
-        #if VERBOSE
-        void logEvents(
+        LOG(cfg) logEvents(
             d_ev_swaps,
             d_ev_scores,
             num_nodes,
             "cascade - in sequence"
         );
-        #endif
         // =============================
 
         // scan the new scores, find the maximum gain subsequence
@@ -306,11 +296,13 @@ void force_directed_refinement(
 
         // stop if the sequence has length 0 or the gain is too low
         if (num_good_swaps == 0 || gain < 0.001f) {
-            if (num_good_swaps == 0) std::cout << "Stopping with no further improving swaps, on iteration " << iter << "\n";
-            else std::cout << "Stopping with gain" << std::fixed << std::setprecision(3) << gain << " ( < 10^-3) on iteration " << iter << "\n";
+            INFO(cfg) {
+                if (num_good_swaps == 0) std::cout << "Stopping with no further improving swaps, on iteration " << iter << "\n";
+                else std::cout << "Stopping with gain" << std::fixed << std::setprecision(3) << gain << " ( < 10^-3) on iteration " << iter << "\n";
+            }
             break;
         } else {
-            std::cout << "Number of good swaps performed: " << num_good_swaps << " ...\n";
+            INFO(cfg) std::cout << "Number of good swaps performed: " << num_good_swaps << " ...\n";
         }
 
         // update placement and inv_placement
@@ -320,7 +312,7 @@ void force_directed_refinement(
             int num_threads_needed = num_good_swaps; // 1 thread per swap
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - apply swaps kernel
-            std::cout << "Running apply swaps kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "apply swaps kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             apply_swaps_kernel<<<blocks, threads_per_block>>>(
                 d_ev_swaps,
                 num_good_swaps,
@@ -343,7 +335,7 @@ void force_directed_refinement(
 }
 
 void logForces(
-    const uint32_t *d_forces,
+    const float *d_forces,
     const uint32_t num_nodes
 ) {
     std::vector<float> forces_tmp(num_nodes * 4);
@@ -361,7 +353,7 @@ void logForces(
 }
 
 void logTensions(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_pairs,
     const uint32_t *d_scores,
     const uint32_t num_nodes

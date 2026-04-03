@@ -31,7 +31,7 @@ extern __constant__ uint32_t max_height;
 // STEPS
 
 void force_directed_refinement(
-    const runconfig cfg,
+    const runconfig &cfg,
     const cudaDeviceProp props,
     const uint32_t* d_hedges,
     const dim_t* d_hedges_offsets,
@@ -44,11 +44,12 @@ void force_directed_refinement(
 );
 
 void logForces(
-    const uint32_t *d_forces,
+    const float *d_forces,
     const uint32_t num_nodes
 );
 
 void logTensions(
+    const runconfig &cfg,
     const uint32_t *d_pairs,
     const uint32_t *d_scores,
     const uint32_t num_nodes

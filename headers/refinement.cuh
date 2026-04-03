@@ -21,7 +21,7 @@ using namespace config;
 // STEPS
 
 void refinementRepeats(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t *d_srcs_count,

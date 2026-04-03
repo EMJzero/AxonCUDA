@@ -40,7 +40,18 @@ namespace hgraph {
         const uint32_t* hedges_flat_; // pointer to the owning hypergraph's hedges_flat_ array
 
         public:
-        HyperEdge(uint32_t offset, uint32_t length, uint32_t src_count, float weight, const uint32_t* hedges_flat) : offset_(offset), length_(length), src_count_(src_count), weight_(weight), hedges_flat_(hedges_flat) {}
+        HyperEdge(
+            uint32_t offset,
+            uint32_t length,
+            uint32_t src_count,
+            float weight,
+            const uint32_t* hedges_flat
+        ) : offset_(offset),
+            length_(length),
+            src_count_(src_count),
+            weight_(weight),
+            hedges_flat_(hedges_flat)
+        {}
 
         uint32_t offset() const { return offset_; }
         uint32_t length() const { return length_; }
@@ -109,12 +120,21 @@ namespace hgraph {
         std::vector<uint32_t> neighborhood_offsets_;
         bool neighborhoods_built_ = false;
 
+        bool verbose_;
+
         public:
         // constructor:
         // - nodes: number of nodes
         // - hedges: vector of pairs of two vectors, srcs and dsts, like: [([src1, src2, ...], [dst1, dst2, ...]), (...), ...]
         // - weights: same length as hedges, one weight per hyperedge.
-        HyperGraph(uint32_t nodes, const std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>>& hedges, const std::vector<float>& weights) : node_count_(nodes) {
+        HyperGraph(
+            uint32_t nodes,
+            const std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>>& hedges,
+            const std::vector<float>& weights,
+            bool verbose = true
+        ) : node_count_(nodes),
+            verbose_(verbose)
+        {
             if (hedges.size() != weights.size())
                 throw std::runtime_error("Number of hyperedges != number of weights");
 
@@ -126,7 +146,7 @@ namespace hgraph {
                 if (he.first.size() < 1) no_src_warning++;
                 total_pins += he.first.size() + he.second.size();
             }
-            if (no_src_warning) std::cerr << "WARNING: found " << no_src_warning << " hyperedges with zero sources (make sure this is intended - e.g. you loaded an hypergraph in hMETIS format) !!\n";
+            if (no_src_warning && verbose_) std::cerr << "WARNING: found " << no_src_warning << " hyperedges with zero sources (make sure this is intended - e.g. you loaded an hypergraph in hMETIS format) !!\n";
 
             hedges_flat_.reserve(total_pins);
             hedges_.reserve(hedges.size());
@@ -352,12 +372,12 @@ namespace hgraph {
                 }
             }
 
-            return HyperGraph(new_nodes, new_hedges, new_weights);
+            return HyperGraph(new_nodes, new_hedges, new_weights, verbose_);
         }
 
         // build inbound and outbound sets
         void buildIncidenceSets() {
-            std::cerr << "WARNING: building inbound and outbound sets will take a while...\n";
+            if (verbose_) std::cerr << "WARNING: building inbound and outbound sets will take a while...\n";
 
             outbound_.clear();
             inbound_.clear();
@@ -486,7 +506,7 @@ namespace hgraph {
                 new_weights.push_back(he.weight());
             }
 
-            return HyperGraph(node_count_, new_hedges, new_weights);
+            return HyperGraph(node_count_, new_hedges, new_weights, verbose_);
         }
 
         // remove duplicate nodes (and self-cycles) inside each hyperedge
@@ -563,7 +583,7 @@ namespace hgraph {
         // builds all neighborhoods (in- and outbound to each node)
         void buildNeighborhoods() {
             if (!incidences_built_) throw std::runtime_error("Call to buildNeighborhoods(). Incidence sets not built. Call buildIncidenceSets() first.");
-            std::cerr << "WARNING: building neighborhoods will take a long while...\n";
+            if (verbose_) std::cerr << "WARNING: building neighborhoods will take a long while...\n";
 
             neighborhoods_.clear();
             neighborhood_offsets_.clear();
@@ -684,7 +704,7 @@ namespace hgraph {
         *   a warning is emitted during saving.
         * - No vertex weights or metadata are stored.
         */
-        static HyperGraph loadSNN(const std::string& path) {
+        static HyperGraph loadSNN(const std::string& path, bool verbose = true) {
             std::ifstream f(path, std::ios::binary);
             if (!f) throw std::runtime_error("Cannot open file");
 
@@ -719,7 +739,7 @@ namespace hgraph {
                 weights[i] = w;
             }
 
-            return HyperGraph(nodes, hedges, weights);
+            return HyperGraph(nodes, hedges, weights, verbose);
         }
 
         // HP: one src per hyperedge
@@ -750,7 +770,7 @@ namespace hgraph {
                 WF(he.weight());
             }
 
-            if (multiple_srcs_warning) std::cerr << "WARNING: the partitioned hypergraph had hedge with multiple sources, a feature unsupported in '.snn' format, every source after the first was converted to a destination !!\n";
+            if (multiple_srcs_warning && verbose_) std::cerr << "WARNING: the partitioned hypergraph had hedge with multiple sources, a feature unsupported in '.snn' format, every source after the first was converted to a destination !!\n";
         }
 
         /*
@@ -782,7 +802,7 @@ namespace hgraph {
          * - This format is lossless with respect to the internal HyperGraph model.
          * - All integers and floats are stored in native little-endian format.
          */
-        static HyperGraph loadAXH(const std::string& path) {
+        static HyperGraph loadAXH(const std::string& path, bool verbose = true) {
             std::ifstream f(path, std::ios::binary);
             if (!f) throw std::runtime_error("Cannot open .axh file");
 
@@ -830,7 +850,7 @@ namespace hgraph {
                 weights.push_back(w);
             }
 
-            return HyperGraph(nodes, hedges, weights);
+            return HyperGraph(nodes, hedges, weights, verbose);
         }
 
         void saveAXH(const std::string& path) const {
@@ -913,7 +933,7 @@ namespace hgraph {
         * - Directionality and source/destination distinctions are not represented in
         *   hMETIS and are ignored on load; all pins are treated uniformly.
         */
-        static HyperGraph loadhMETIS(const std::string& path) {
+        static HyperGraph loadhMETIS(const std::string& path, bool verbose = true) {
             std::ifstream f(path);
             if (!f) throw std::runtime_error("Cannot open .hgr file");
 
@@ -972,7 +992,7 @@ namespace hgraph {
             }
 
             //std::vector<uint32_t> vertex_weights;
-            if (node_weights) {
+            if (node_weights && verbose) {
                 std::cerr << "WARNING: .hgr files with vertex weights are not supported !!\n";
                 //vertex_weights.resize(V);
                 //for (uint32_t i = 0; i < V; ++i) {
@@ -982,11 +1002,11 @@ namespace hgraph {
                 //    vertex_weights[i] = static_cast<uint32_t>(std::stoul(line));
                 //}
             }
-            if (singleton_hyperedges > 0) {
+            if (singleton_hyperedges > 0 && verbose) {
                 std::cerr << "WARNING: skipped " << singleton_hyperedges << " singleton hyperedges (cardinality = 1) !!\n";
             }
 
-            return HyperGraph(V, hedges, weights);
+            return HyperGraph(V, hedges, weights, verbose);
         }
 
         // HP: export undirected hyperedge, no vertex weights, only on hypredges

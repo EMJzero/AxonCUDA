@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cassert>
 #include <cstdlib>
+#include <iostream>
 
 #include <cuda_runtime.h>
 
@@ -37,6 +38,27 @@ inline cudaError_t cudaFreeLogged(T* ptr, const char* varname, const char* file,
 #define cudaMalloc(ptr, size) cudaMallocLogged(ptr, size, #ptr, __FILE__, __LINE__)
 #define cudaFree(ptr) cudaFreeLogged(ptr, #ptr, __FILE__, __LINE__)
 #endif
+
+// insight in algorithms' logic and decisions
+#define LOG(cfg) \
+    if (!cfg.verbose_logs) {} else
+
+// what the program is up to now, the algorithm's step and phase
+#define INFO(cfg) \
+    if (!cfg.verbose_info) {} else
+
+// error and warnings (on stderr)
+#define ERR(cfg) \
+    if (!cfg.verbose_errs_and_warns) {} else
+
+// kernel launches
+#define LAUNCH(cfg) \
+    if (!cfg.verbose_kernel_launches) {} else std::cout << "Running "
+
+// CUB calls
+#define CUB(cfg) \
+    if (!cfg.verbose_kernel_launches) {} else std::cout << "CUB "
+
 
 // NOTE: everything tagged as "wrp" or "warp" assumes that all lanes are active, unless otherwise specified!
 

@@ -37,15 +37,19 @@ namespace config {
         uint32_t refine_repeats; // number of repetitions for the refinement routine per level
         uint32_t save_memory_up_to_level; // number of levels for which to temporarily move the initial hypergraph to the host before recursing
         bool device_touching_construction; // whether to construct touching/incidence sets on the device or the host
+        bool verbose_logs; // whether to log what is happening inside the algorithms
+        bool verbose_info; // whether to log the step/phase where the program is at
+        bool verbose_errs_and_warns; // whether to log errs and warnings
+        bool verbose_kernel_launches; // whether to log every kernel launch or not
     };
 
     void printHelp();
 
     runconfig parseArgs(int argc, char** argv);
 
-    hgraph::HyperGraph loadHgraph(runconfig cfg);
+    hgraph::HyperGraph loadHgraph(runconfig &cfg);
 
-    constraints::Constraints setupConstr(runconfig cfg, hgraph::HyperGraph hg);
+    constraints::Constraints setupConstr(runconfig &cfg, hgraph::HyperGraph hg);
 
-    void saveResult(runconfig cfg, hgraph::HyperGraph partitioned_hg, std::vector<uint32_t> partitions);
+    void saveResult(runconfig &cfg, hgraph::HyperGraph partitioned_hg, std::vector<uint32_t> partitions);
 }

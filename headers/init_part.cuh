@@ -5,12 +5,15 @@
 #include "defines.cuh"
 #include "data_types.cuh"
 
+namespace config {
+    struct runconfig;
+}
+
+using namespace config;
+
 
 // USED BY: initial part
 
-#define VERBOSE_INIT false
-#define VERBOSE_INIT_LOG false
-#define VERBOSE_INIT_CONN false
 #define VERBOSE_INIT_LENGTH 20
 
 // controls
@@ -26,6 +29,7 @@
 // STEPS
 
 std::tuple<uint32_t*, uint32_t*> initial_partitioning(
+    const runconfig &cfg,
     const uint32_t num_nodes,
     const uint32_t num_hedges,
     const uint32_t* d_hedges,
@@ -40,6 +44,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
 );
 
 std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
+    const runconfig &cfg,
     const uint32_t num_nodes,
     const uint32_t num_hedges,
     const uint32_t* d_hedges,

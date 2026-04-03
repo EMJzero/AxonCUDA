@@ -11,6 +11,7 @@
 
 // for each partition, randomly bisect it, mapping every partition id "p" to either "p*2" or "p*2+1"
 void split_partitions_rand(
+    const runconfig &cfg,
     uint32_t* d_partitions,
     uint32_t num_nodes,
     uint32_t num_parts,
@@ -55,7 +56,7 @@ void split_partitions_rand(
         int num_threads_needed = num_nodes; // 1 thread per node
         int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
         // launch - split partitions kernel
-        std::cout << "Running split partitions kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) << "split partitions kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         split_partitions_kernel<<<blocks, threads_per_block>>>(
             thrust::raw_pointer_cast(t_part_offsets.data()),
             num_nodes,
@@ -78,7 +79,7 @@ void split_partitions_rand(
 
 // return a high-locality, seeded 1D ordering of nodes
 uint32_t* locality_ordering(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t num_nodes,
     const uint32_t num_hedges,
     const uint32_t* d_hedges,
@@ -151,11 +152,12 @@ uint32_t* locality_ordering(
 
     uint32_t level_idx = 0u;
     while (num_parts < (num_nodes + 1) / 2) { // as long as partitions do not strictly contain 1 or 2 nodes...
-        std::cout << "Bisection level " << level_idx << " number of partitions=" << num_parts << "\n";
+        INFO(cfg) std::cout << "Bisection level " << level_idx << " number of partitions=" << num_parts << "\n";
         level_idx++;
 
         // random bisection of every partition
         split_partitions_rand(
+            cfg,
             d_partitions,
             num_nodes,
             num_parts,
@@ -174,7 +176,7 @@ uint32_t* locality_ordering(
                 int num_warps_needed = num_nodes; // 1 warp per node
                 int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
                 // launch - label propagation kernel
-                std::cout << "Running label propagation kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+                LAUNCH(cfg) << "label propagation kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
                 label_propagation_kernel<<<blocks, threads_per_block>>>(
                     d_hedges,
                     d_hedges_offsets,
@@ -202,10 +204,10 @@ uint32_t* locality_ordering(
             CUDA_CHECK(cudaMemcpy(&even_events_count, d_even_event_idx + num_nodes, sizeof(uint32_t), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(&odd_events_count, d_odd_event_idx + num_nodes, sizeof(uint32_t), cudaMemcpyDeviceToHost));
             if (even_events_count == 0 || odd_events_count == 0) {
-                std::cout << "No valid label propagation move found on level " << level_idx << " repeat " << lp_repeat << " (even events count=" << even_events_count << " odd events count=" << odd_events_count << ") !!\n";
+                INFO(cfg) std::cout << "No valid label propagation move found on level " << level_idx << " repeat " << lp_repeat << " (even events count=" << even_events_count << " odd events count=" << odd_events_count << ") !!\n";
                 break;
             }
-            std::cout << "Label propagation on level " << level_idx << " repeat " << lp_repeat << " (even events count=" << even_events_count << " odd events count=" << odd_events_count << ")\n";
+            INFO(cfg) std::cout << "Label propagation on level " << level_idx << " repeat " << lp_repeat << " (even events count=" << even_events_count << " odd events count=" << odd_events_count << ")\n";
 
             // NOTE: partitions inside events are stored as p/2 and (p-1)/2 !!
             uint32_t* d_even_event_part = nullptr; // part[idx] -> src partition / 2 for the idx-th move (partition being even)
@@ -232,7 +234,7 @@ uint32_t* locality_ordering(
                 int num_threads_needed = num_nodes; // 1 thread per node
                 int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - label move events kernel
-                std::cout << "Running label move events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+                LAUNCH(cfg) << "label move events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
                 label_move_events_kernel<<<blocks, threads_per_block>>>(
                     d_moves,
                     d_scores,
@@ -301,7 +303,7 @@ uint32_t* locality_ordering(
                 int num_warps_needed = even_events_count + odd_events_count; // 1 warp per event
                 int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
                 // launch - label cascade kernel
-                std::cout << "Running label cascade kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+                LAUNCH(cfg) << "label cascade kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
                 label_cascade_kernel<<<blocks, threads_per_block>>>(
                     d_hedges,
                     d_hedges_offsets,
@@ -348,7 +350,7 @@ uint32_t* locality_ordering(
                 int num_threads_needed = even_events_count; // 1 thread per event
                 int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - apply move events kernels
-                std::cout << "Running apply move events kernels (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+                LAUNCH(cfg) << "apply move events kernels (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
                 apply_move_events_kernel<<<blocks, threads_per_block>>>(
                     d_even_event_idx,
                     d_even_event_part,
@@ -381,6 +383,7 @@ uint32_t* locality_ordering(
 
     // one final bisection to go down to 1-element partitions
     split_partitions_rand(
+        cfg,
         d_partitions,
         num_nodes,
         num_parts,
@@ -402,7 +405,7 @@ uint32_t* locality_ordering(
 
     // fuse back partitions while internally reversing them as needed to "trap" strong connections locally inside partition pairs
     while (num_parts > 1) { // go back up the bisection tree
-        std::cout << "Tree reorientation level " << level_idx << " number of partitions=" << num_parts << "\n";
+        INFO(cfg) std::cout << "Tree reorientation level " << level_idx << " number of partitions=" << num_parts << "\n";
         level_idx--;
         
         float* d_sibling_score = nullptr; // sibling_score[p] -> total connection strength between partition p and the sibling subtree of floor(p/2)
@@ -417,7 +420,7 @@ uint32_t* locality_ordering(
             int num_warps_needed = num_nodes; // 1 warp per event
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - sibling tree connection strength kernel
-            std::cout << "Running sibling tree connection strength kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "sibling tree connection strength kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             sibling_tree_connection_strength_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
                 d_hedges_offsets,
@@ -453,7 +456,7 @@ uint32_t* locality_ordering(
             int num_threads_needed = num_parts; // 1 thread per (half) partition
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - flag reversals kernel
-            std::cout << "Running flag reversals kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "flag reversals kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             flag_reversals_kernel<<<blocks, threads_per_block>>>(
                 d_sibling_score,
                 num_parts,
@@ -483,7 +486,7 @@ uint32_t* locality_ordering(
             int num_threads_needed = num_nodes; // 1 thread per (half) partition
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - apply reversals kernel
-            std::cout << "Running apply reversals kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "apply reversals kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             apply_reversals_kernel<<<blocks, threads_per_block>>>(
                 d_ord_part,
                 d_ord_part_offsets,

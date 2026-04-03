@@ -5,15 +5,16 @@
 
 #include "runconfig.hpp"
 
+#include "coarsening.cuh"
+
 #include "utils.cuh"
 #include "defines.cuh"
 #include "chaining.cuh"
-#include "coarsening.cuh"
 
 using namespace config;
 
 void candidatesProposal(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t *d_srcs_count,
@@ -43,7 +44,7 @@ void candidatesProposal(
         size_t bytes_per_warp = 3 * HIST_SIZE * sizeof(uint32_t);
         size_t shared_bytes = warps_per_block * bytes_per_warp;
         // launch - candidates kernel
-        std::cout << "Running candidates kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) << "candidates kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         candidates_kernel<<<blocks, threads_per_block, shared_bytes>>>(
             d_hedges,
             d_hedges_offsets,
@@ -65,52 +66,8 @@ void candidatesProposal(
     }
 }
 
-void logCandidates(
-    const runconfig cfg,
-    const uint32_t *d_pairs,
-    const uint32_t *d_u_scores,
-    const uint32_t curr_num_nodes
-) {
-    std::vector<uint32_t> pairs_tmp(curr_num_nodes * cfg.candidates_count);
-    std::vector<uint32_t> scores_tmp(curr_num_nodes * cfg.candidates_count);
-    std::vector<std::set<uint32_t>> candidates_count(cfg.candidates_count);
-    CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_u_scores, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
-    std::cout << "Pairing results:";
-    for (uint32_t i = 0; i < curr_num_nodes; ++i) {
-        if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH))
-            std::cout << "\n  node " << i << " ->";
-        for (uint32_t j = 0; j < cfg.candidates_count; ++j) {
-            float score = ((float)scores_tmp[i * cfg.candidates_count + j])/FIXED_POINT_SCALE;
-            uint32_t target = pairs_tmp[i * cfg.candidates_count + j];
-            candidates_count[j].insert(target);
-            if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
-                if (target == UINT32_MAX) std::cout << " (" << j << " target=none score=none)";
-                else if (target == i) std::cout << " !!SELF TARGETED!! ";
-                else std::cout << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ")";
-            }
-            if (target == UINT32_MAX) continue;
-            // check the symmetry invariant: mutual pairs or the other has found a higher score pair (or one with lower id - tiebreaker) [easy for j = 0, for j > 0 check first that the target wasn't already used at a lower j]
-            if (
-                pairs_tmp[target * cfg.candidates_count + j] != i && pairs_tmp[target * cfg.candidates_count + j] != UINT32_MAX
-                && std::find(pairs_tmp.begin() + target * cfg.candidates_count, pairs_tmp.begin() + target * cfg.candidates_count + j, i) == pairs_tmp.begin() + target * cfg.candidates_count + j
-                && !(scores_tmp[target * cfg.candidates_count + j] > score || scores_tmp[target * cfg.candidates_count + j] == score && pairs_tmp[target * cfg.candidates_count + j] < i)
-            ) {
-                std::cerr
-                    << "\n  WARNING, symmetry violated: node " << i
-                    << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score
-                    << ") AND node " << target << " (" << j << " target=" << pairs_tmp[target * cfg.candidates_count + j]
-                    << " score=" << std::fixed << std::setprecision(3) << scores_tmp[target * cfg.candidates_count + j] << ") !!";
-            }
-        }
-    }
-    std::cout << "\n";
-    for (uint32_t j = 0; j < cfg.candidates_count; ++j)
-        std::cout << "Candidates count (" << j << "): " << candidates_count[j].size() << "\n";
-}
-
 std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
-    const runconfig cfg,
+    const runconfig &cfg,
     const cudaDeviceProp props,
     const uint32_t *d_inbound_count,
     const uint32_t *d_pairs,
@@ -146,15 +103,15 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
         uint32_t num_repeats = 1;
         if (blocks > max_blocks) {
             num_repeats = (blocks + max_blocks - 1) / max_blocks;
-            std::cout << "NOTE: grouping kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
+            INFO(cfg) std::cout << "NOTE: grouping kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
             blocks = (blocks + num_repeats - 1) / num_repeats;
             if (num_repeats > MAX_MATCHING_REPEATS) {
-                std::cout << "ABORTING: grouping kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_MATCHING_REPEATS << " !!\n";
+                ERR(cfg) std::cerr << "ABORTING: grouping kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_MATCHING_REPEATS << " !!\n";
                 abort();
             }
         }
         // launch - grouping kernel
-        std::cout << "Running grouping kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) << "grouping kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         void *kernel_args[] = {
             (void*)&d_pairs,
             (void*)&d_u_scores,
@@ -175,6 +132,7 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
     // => impose the sum of sizes and the sum of inbound set sizes < constraints
     // => the idea is to try pairs among non-neighbors, therefore the inbound set size intersection can already be taken as empty (hence, sum set sizes)
     build_orphan_pairs(
+        cfg,
         d_nodes_sizes,
         d_inbound_count,
         d_pairs,
@@ -245,8 +203,52 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
     return std::make_tuple(new_num_nodes, d_groups, d_groups_sizes, d_ungroups, d_ungroups_offsets);
 }
 
+void logCandidates(
+    const runconfig &cfg,
+    const uint32_t *d_pairs,
+    const uint32_t *d_u_scores,
+    const uint32_t curr_num_nodes
+) {
+    std::vector<uint32_t> pairs_tmp(curr_num_nodes * cfg.candidates_count);
+    std::vector<uint32_t> scores_tmp(curr_num_nodes * cfg.candidates_count);
+    std::vector<std::set<uint32_t>> candidates_count(cfg.candidates_count);
+    CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(scores_tmp.data(), d_u_scores, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
+    std::cout << "Pairing results:";
+    for (uint32_t i = 0; i < curr_num_nodes; ++i) {
+        if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH))
+            std::cout << "\n  node " << i << " ->";
+        for (uint32_t j = 0; j < cfg.candidates_count; ++j) {
+            float score = ((float)scores_tmp[i * cfg.candidates_count + j])/FIXED_POINT_SCALE;
+            uint32_t target = pairs_tmp[i * cfg.candidates_count + j];
+            candidates_count[j].insert(target);
+            if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
+                if (target == UINT32_MAX) std::cout << " (" << j << " target=none score=none)";
+                else if (target == i) std::cout << " !!SELF TARGETED!! ";
+                else std::cout << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score << ")";
+            }
+            if (target == UINT32_MAX) continue;
+            // check the symmetry invariant: mutual pairs or the other has found a higher score pair (or one with lower id - tiebreaker) [easy for j = 0, for j > 0 check first that the target wasn't already used at a lower j]
+            if (
+                pairs_tmp[target * cfg.candidates_count + j] != i && pairs_tmp[target * cfg.candidates_count + j] != UINT32_MAX
+                && std::find(pairs_tmp.begin() + target * cfg.candidates_count, pairs_tmp.begin() + target * cfg.candidates_count + j, i) == pairs_tmp.begin() + target * cfg.candidates_count + j
+                && !(scores_tmp[target * cfg.candidates_count + j] > score || scores_tmp[target * cfg.candidates_count + j] == score && pairs_tmp[target * cfg.candidates_count + j] < i)
+            ) {
+                std::cerr
+                    << "\n  WARNING, symmetry violated: node " << i
+                    << " (" << j << " target=" << target << " score=" << std::fixed << std::setprecision(3) << score
+                    << ") AND node " << target << " (" << j << " target=" << pairs_tmp[target * cfg.candidates_count + j]
+                    << " score=" << std::fixed << std::setprecision(3) << scores_tmp[target * cfg.candidates_count + j] << ") !!";
+            }
+        }
+    }
+    std::cout << "\n";
+    for (uint32_t j = 0; j < cfg.candidates_count; ++j)
+        std::cout << "Candidates count (" << j << "): " << candidates_count[j].size() << "\n";
+}
+
 void logGroups(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_pairs,
     const uint32_t *d_groups,
     const uint32_t *d_groups_sizes,

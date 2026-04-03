@@ -22,6 +22,8 @@
 
 #include <omp.h>
 
+#include "runconfig.hpp"
+
 #include "init_part.cuh"
 
 #include "utils.cuh"
@@ -378,6 +380,7 @@ void log_partitions(
 }
 
 float compute_connectivity(
+    const runconfig &cfg,
     const uint32_t max_parts,
     const uint32_t num_hedges,
     const uint32_t* d_pins_per_partitions,
@@ -391,9 +394,7 @@ float compute_connectivity(
     int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
     CUDA_CHECK(cudaMallocAsync(&d_connectivity, blocks * sizeof(float), stream)); // first reduce inside each block, then across blocks with thrust
     // launch - fm-ref gains kernel
-    #if VERBOSE_INIT
-    std::cout << "Running compute connectivity kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-    #endif
+    LAUNCH(cfg) << "compute connectivity kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
     compute_connectivity_kernel<<<blocks, threads_per_block, 0, stream>>>(
         d_pins_per_partitions,
         d_hedge_weights,
@@ -557,6 +558,7 @@ bool pack_bins_bfd(
 
 // initial partitioning for the k-way balanced version (no inbound constraint)
 std::tuple<uint32_t*, uint32_t*> initial_partitioning(
+    const runconfig &cfg,
     const uint32_t num_nodes,
     const uint32_t num_hedges,
     const uint32_t* d_hedges,
@@ -572,7 +574,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
     const uint32_t max_parts,
     const uint32_t h_max_nodes_per_part
 ) {
-    std::cout << "Building initial partitioning, remaining nodes=" << num_nodes << ", remaining pins=" << hedges_size << "\n";
+    INFO(cfg) std::cout << "Building initial partitioning, remaining nodes=" << num_nodes << ", remaining pins=" << hedges_size << "\n";
 
     // best results
     float best_conn = FLT_MAX;
@@ -588,7 +590,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
     // setup streams for OpenMP parallel random initializations
     const int max_threads = std::min(omp_get_max_threads(), MAX_OMP_THREADS);
     omp_set_num_threads(max_threads);
-    std::cout << "Spawning " << max_threads << " OpenMP threads ...\n";
+    INFO(cfg) std::cout << "Spawning " << max_threads << " OpenMP threads ...\n";
     std::vector<cudaStream_t> streams(max_threads);
     std::vector<uint32_t*> h_partitions_omp(max_threads);
     std::vector<uint32_t*> h_partitions_sizes_omp(max_threads);
@@ -683,9 +685,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_threads_needed = num_nodes; // 1 thread per node
                 blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - random init kernel
-                #if VERBOSE_INIT
-                std::cout << "Running random init kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
-                #endif
+                LAUNCH(cfg) << "random init kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
                 init_partitions_random<<<blocks, threads_per_block, 0, stream>>>(
                     num_nodes,
                     INIT_SEED + repeats * MAX_CONSECUTIVE_INIT_FAILURES + consecutive_failures,
@@ -720,9 +720,15 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
 
             // =============================
             // print some temporary results
-            #if VERBOSE_INIT_LOG
-            log_partitions(num_nodes, max_parts, h_max_nodes_per_part, d_partitions, d_partitions_sizes, "Random initial partitioning", stream);
-            #endif
+            LOG(cfg) log_partitions(
+                num_nodes,
+                max_parts,
+                h_max_nodes_per_part,
+                d_partitions,
+                d_partitions_sizes,
+                "Random initial partitioning",
+                stream
+            );
             // =============================
 
             // compute pins per partition
@@ -732,9 +738,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
             num_threads_needed = num_hedges; // 1 thread per hedge
             blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - pins per partition kernel
-            #if VERBOSE_INIT
-            std::cout << "Running pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
-            #endif
+            LAUNCH(cfg) << "pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
             // NOTE: having this available during FM refinement makes its complexity linear in the connectivity, instead of quadratic!
             pins_per_partition_only_kernel<<<blocks, threads_per_block, 0, stream>>>(
                 d_hedges,
@@ -758,9 +762,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_warps_needed = num_nodes ; // 1 warp per node
                 blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
                 // launch - jacobi gains kernel
-                #if VERBOSE_INIT
-                std::cout << "Running jacobi gains kernel (iter=" << jacobi << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
-                #endif
+                LAUNCH(cfg) << "jacobi gains kernel (iter=" << jacobi << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
                 fm_refinement_gains_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_touching,
                     d_touching_offsets,
@@ -808,9 +810,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_threads_needed = num_nodes; // 1 thread per move to apply
                 blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - jacobi apply kernel
-                #if VERBOSE_INIT
-                std::cout << "Running jacobi apply kernel (iter=" << jacobi << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
-                #endif
+                LAUNCH(cfg) << "jacobi apply kernel (iter=" << jacobi << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
                 jacobi_apply_moves_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_touching,
                     d_touching_offsets,
@@ -832,29 +832,28 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 CUDA_CHECK(cudaMemcpyAsync(&h_partitions_hash, d_partitions_hash, sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
 
-                if (!h_continue_flag && jacobi < 4) std::cerr << "WARNING: no valid jacobi moves just after " << jacobi << " iterations (thread=" << tid << ") !!\n";
+                if (!h_continue_flag && jacobi < 4) ERR(cfg) std::cerr << "WARNING: no valid jacobi moves just after " << jacobi << " iterations (thread=" << tid << ") !!\n";
                 if (seen_partitionings.contains(h_partitions_hash)) {
-                    #if VERBOSE_INIT
-                    std::cout << "Stopping jacobi in iteration " << jacobi << " for reaching a repeated state (thread=" << tid << ") !\n";
-                    #endif
+                    INFO(cfg) std::cout << "Stopping jacobi in iteration " << jacobi << " for reaching a repeated state (thread=" << tid << ") !\n";
                     break;
                 } else seen_partitionings.insert(h_partitions_hash);
                 // =============================
                 // print some temporary results
-                #if VERBOSE_INIT_CONN
-                float log_conn = compute_connectivity(max_parts, num_hedges, d_pins_per_partitions, d_hedge_weights, stream);
-                std::cout << "Jacobi iteration " << jacobi << " connectivity: " << std::fixed << std::setprecision(3) << log_conn << " (thread=" << tid << ")\n";
-                #endif
+                // NOTE: this isn't cheap to compute!
+                LOG(cfg) {
+                    float log_conn = compute_connectivity(cfg, max_parts, num_hedges, d_pins_per_partitions, d_hedge_weights, stream);
+                    std::cout << "Jacobi iteration " << jacobi << " connectivity: " << std::fixed << std::setprecision(3) << log_conn << " (thread=" << tid << ")\n";
+                }
                 // =============================
             }
 
             // =============================
             // print some temporary results
-            #if VERBOSE_INIT_LOG
-            log_partitions(num_nodes, max_parts, h_max_nodes_per_part, d_partitions, d_partitions_sizes, "Post-jacobi partitioning", stream);
-            float log_conn = compute_connectivity(max_parts, num_hedges, d_pins_per_partitions, d_hedge_weights, stream);
-            std::cout << "Post-jacobi connectivity: " << std::fixed << std::setprecision(3) << log_conn << " (thread=" << tid << ")\n";
-            #endif
+            LOG(cfg) {
+                log_partitions(num_nodes, max_parts, h_max_nodes_per_part, d_partitions, d_partitions_sizes, "Post-jacobi partitioning", stream);
+                float log_conn = compute_connectivity(cfg, max_parts, num_hedges, d_pins_per_partitions, d_hedge_weights, stream);
+                std::cout << "Post-jacobi connectivity: " << std::fixed << std::setprecision(3) << log_conn << " (thread=" << tid << ")\n";
+            }
             // =============================
 
             // repeated application of the longest valid improving moves subsequence
@@ -872,9 +871,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_warps_needed = num_nodes ; // 1 warp per node
                 blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
                 // launch - fm-ref gains kernel
-                #if VERBOSE_INIT
-                std::cout << "Running fm-ref gains kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
-                #endif
+                LAUNCH(cfg) << "fm-ref gains kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
                 fm_refinement_gains_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_touching,
                     d_touching_offsets,
@@ -918,9 +915,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
 
                 // launch configuration - fm-ref cascade kernel - same as fm-ref gains kernel
                 // launch - fm-ref cascade kernel
-                #if VERBOSE_INIT
-                std::cout << "Running fm-ref cascade kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
-                #endif
+                LAUNCH(cfg) << "fm-ref cascade kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
                 fm_refinement_cascade_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_hedges,
                     d_hedges_offsets,
@@ -947,9 +942,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_threads_needed = num_nodes; // 1 thread per move
                 blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - build size events kernel
-                #if VERBOSE_INIT
-                std::cout << "Running build size events kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
-                #endif
+                LAUNCH(cfg) << "build size events kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
                 build_size_events_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_moves,
                     d_ranks,
@@ -974,9 +967,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_threads_needed = num_size_events; // 1 thread per event
                 blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - flag size events kernel
-                #if VERBOSE_INIT
-                std::cout << "Running flag size events kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
-                #endif
+                LAUNCH(cfg) << "flag size events kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
                 flag_size_events_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_size_events_partition,
                     d_size_events_index,
@@ -1011,9 +1002,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     num_threads_needed = num_nodes; // 1 thread per move to apply
                     blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                     // launch - fm-ref apply kernel
-                    #if VERBOSE_INIT
-                    std::cout << "Running fm-ref apply (iter=" << fm << ") (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
-                    #endif
+                    LAUNCH(cfg) << "fm-ref apply (iter=" << fm << ") (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
                     fm_refinement_apply_update_kernel<<<blocks, threads_per_block, 0, stream>>>(
                         d_touching,
                         d_touching_offsets,
@@ -1033,32 +1022,36 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     CUDA_CHECK(cudaMemcpyAsync(&h_partitions_hash, d_partitions_hash, sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
                     CUDA_CHECK(cudaStreamSynchronize(stream));
                     if (seen_partitionings.contains(h_partitions_hash)) {
-                        #if VERBOSE_INIT
-                        std::cout << "Stopping FM in iteration " << fm << " for reaching a repeated state (thread=" << tid << ") !\n";
-                        #endif
+                        INFO(cfg) std::cout << "Stopping FM in iteration " << fm << " for reaching a repeated state (thread=" << tid << ") !\n";
                         break;
                     } else seen_partitionings.insert(h_partitions_hash);
                 } else {
                     h_continue_flag = false;
-                    if (fm < 2) std::cerr << "WARNING: no valid FM moves just after " << fm << " iterations (thread=" << tid << ") !!\n";
+                    if (fm < 2) ERR(cfg) std::cerr << "WARNING: no valid FM moves just after " << fm << " iterations (thread=" << tid << ") !!\n";
                 }
                 // =============================
                 // print some temporary results
-                #if VERBOSE_INIT_CONN
-                float log_conn = compute_connectivity(max_parts, num_hedges, d_pins_per_partitions, d_hedge_weights, stream);
-                std::cout << "FM iteration " << fm << " connectivity: " << std::fixed << std::setprecision(3) << log_conn << " (thread=" << tid << ")\n";
-                #endif
+                LOG(cfg) {
+                    float log_conn = compute_connectivity(cfg, max_parts, num_hedges, d_pins_per_partitions, d_hedge_weights, stream);
+                    std::cout << "FM iteration " << fm << " connectivity: " << std::fixed << std::setprecision(3) << log_conn << " (thread=" << tid << ")\n";
+                }
                 // =============================
             }
 
             // =============================
             // print some temporary results
-            #if VERBOSE_INIT_LOG
-            log_partitions(num_nodes, max_parts, h_max_nodes_per_part, d_partitions, d_partitions_sizes, "Post-fm-refinement partitioning", stream);
-            #endif
+            LOG(cfg) log_partitions(
+                num_nodes,
+                max_parts,
+                h_max_nodes_per_part,
+                d_partitions,
+                d_partitions_sizes,
+                "Post-fm-refinement partitioning",
+                stream
+            );
             // =============================
 
-            float conn = compute_connectivity(max_parts, num_hedges, d_pins_per_partitions, d_hedge_weights, stream);
+            float conn = compute_connectivity(cfg, max_parts, num_hedges, d_pins_per_partitions, d_hedge_weights, stream);
 
             // update best initial partitioning
             #pragma omp critical
@@ -1068,13 +1061,9 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     CUDA_CHECK(cudaMemcpyAsync(d_best_partitions, d_partitions, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
                     CUDA_CHECK(cudaMemcpyAsync(d_best_partitions_sizes, d_partitions_sizes, max_parts * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
                     CUDA_CHECK(cudaStreamSynchronize(stream));
-                    #if VERBOSE_INIT
-                    std::cout << "Updated initial partitioning, connectivity=" << std::fixed << std::setprecision(3) << best_conn << " (thread=" << tid << ")\n";
-                    #endif
+                    INFO(cfg) std::cout << "Updated initial partitioning, connectivity=" << std::fixed << std::setprecision(3) << best_conn << " (thread=" << tid << ")\n";
                 } else {
-                    #if VERBOSE_INIT
-                    std::cout << "Post-fm connectivity (worse than best): " << std::fixed << std::setprecision(3) << conn << " (thread=" << tid << ")\n";
-                    #endif
+                    INFO(cfg) std::cout << "Post-fm connectivity (worse than best): " << std::fixed << std::setprecision(3) << conn << " (thread=" << tid << ")\n";
                 }
             }
         }
@@ -1107,12 +1096,13 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
     if (d_best_partitions == nullptr)
         throw std::runtime_error("Could not randomly construct a valid initial partitioning.");
 
-    std::cout << "Completed initial partitioning, connectivity=" << std::fixed << std::setprecision(3) << best_conn << "\n";
+    INFO(cfg) std::cout << "Completed initial partitioning, connectivity=" << std::fixed << std::setprecision(3) << best_conn << "\n";
     return std::make_tuple(d_best_partitions, d_best_partitions_sizes);
 }
 
 // initial partitioning for the k-way balanced version via Mt-KaHyPar
 std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
+    const runconfig &cfg,
     const uint32_t num_nodes,
     const uint32_t num_hedges,
     const uint32_t* d_hedges,
@@ -1125,7 +1115,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     const float epsilon,
     const uint32_t h_max_nodes_per_part
 ) {
-    std::cout << "Building initial partitioning via Mt-KaHyPar, remaining nodes=" << num_nodes << ", remaining pins=" << hedges_size << "\n";
+    INFO(cfg) std::cout << "Building initial partitioning via Mt-KaHyPar, remaining nodes=" << num_nodes << ", remaining pins=" << hedges_size << "\n";
     
     // target: keep n*d hyperedges
     const uint32_t target_keep_hedges = num_nodes * (hedges_size / num_hedges);
@@ -1139,7 +1129,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     int num_warps_needed = num_hedges; // 1 warp per hedge
     int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
     // launch - armonic score kernel
-    std::cout << "Running armonic score kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    LAUNCH(cfg) << "armonic score kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
     armonic_degree_score_kernel<<<blocks, threads_per_block>>>(
         d_hedges,
         d_hedges_offsets,
@@ -1167,7 +1157,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     int num_threads_needed = num_hedges; // 1 thread per hedge
     blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
     // launch - prune hedges kernel
-    std::cout << "Running prune hedges kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    LAUNCH(cfg) << "prune hedges kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
     prune_hedges_kernel<<<blocks, threads_per_block>>>(
         d_hedge_weights,
         d_hedge_ratio,
@@ -1201,7 +1191,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
 
     // write input file for Mt-KaHyPar
     std::ofstream f_coarse_hg("coarse_tmp.hgr");
-    std::cout << "Writing temporary file 'coarse_tmp.hgr' ...\n";
+    INFO(cfg) std::cout << "Writing temporary file 'coarse_tmp.hgr' ...\n";
     constexpr int HEADER_WIDTH = 64;
     f_coarse_hg << std::setw(HEADER_WIDTH) << std::left << " " << "\n";
   
@@ -1266,7 +1256,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     
     f_coarse_hg.close();
 
-    std::cout << "Preserved unique non-degenerate hedges count: " << true_num_hedges << "\n";
+    INFO(cfg) std::cout << "Preserved unique non-degenerate hedges count: " << true_num_hedges << "\n";
 
     // invoke Mt-KaHyPar
     std::ostringstream command;
@@ -1275,14 +1265,14 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
         << " -e " << std::format("{}", epsilon)
         << " -t " << MAX_OMP_THREADS
         << " -o km1 -v 0 -m direct --write-partition-file 1 --partition-output-folder . --preset-type default --seed " << INIT_SEED;
-    std::cout << "Running Mt-KaHyPar: " << command.str().c_str() << "\n";
+    INFO(cfg) std::cout << "Running Mt-KaHyPar: " << command.str().c_str() << "\n";
     int command_result = std::system(command.str().c_str());
     std::ostringstream out_filename;
     out_filename << "coarse_tmp.hgr.part" << k << ".epsilon" << std::format("{}", epsilon) << ".seed" << INIT_SEED << ".KaHyPar";
     if (command_result == 0)
-        std::cout << "Mt-KaHyPar finished successfully ...\n";
+        INFO(cfg) std::cout << "Mt-KaHyPar finished successfully ...\n";
     else {
-        std::cout << "ERROR, Mt-KaHyPar failed with code: " << command_result << ", inspect 'coarse_tmp.hgr' for possible bugs !!\n";
+        ERR(cfg) std::cerr << "ERROR, Mt-KaHyPar failed with code: " << command_result << ", inspect 'coarse_tmp.hgr' for possible bugs !!\n";
         abort();
     }
     std::filesystem::remove("coarse_tmp.hgr");
@@ -1292,15 +1282,15 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     std::vector<uint32_t> h_partitions_sizes(k, 0u);
 
     std::ifstream f_parts(out_filename.str().c_str());
-    std::cout << "Reading temporary file '" << out_filename.str().c_str() << "' ...\n";
+    INFO(cfg) std::cout << "Reading temporary file '" << out_filename.str().c_str() << "' ...\n";
 
     for (uint32_t i = 0; i < num_nodes; i++) {
         if (!(f_parts >> h_partitions[i])) {// already with 0-based idxs
-            std::cout << "ERROR, invalid partitioning returned with " << i << " nodes instead of " << num_nodes << ", inspect '" << out_filename.str().c_str() << "' for possible bugs !!\n";
+            ERR(cfg) std::cerr << "ERROR, invalid partitioning returned with " << i << " nodes instead of " << num_nodes << ", inspect '" << out_filename.str().c_str() << "' for possible bugs !!\n";
             throw std::runtime_error("Unexpected partitions file format or too few lines");
         }
         if (h_partitions[i] >= k) {
-            std::cout << "ERROR, partitioning out of range: " << h_partitions[i] << ", inspect '" << out_filename.str().c_str() << "' for possible bugs !!\n";
+            ERR(cfg) std::cerr << "ERROR, partitioning out of range: " << h_partitions[i] << ", inspect '" << out_filename.str().c_str() << "' for possible bugs !!\n";
             throw std::runtime_error("Partition id out of range");
         }
         h_partitions_sizes[h_partitions[i]] += h_nodes_sizes[i];
@@ -1310,7 +1300,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
 
     for (uint32_t i = 0; i < k; i++) {
         if (h_partitions_sizes[i] > h_max_nodes_per_part) { // already with 0-based idxs
-            std::cout << "ERROR, invalid size for partition " << i << " : " << h_partitions_sizes[i] << " > " << h_max_nodes_per_part << ", inspect '" << out_filename.str().c_str() << "' for possible bugs !!\n";
+            ERR(cfg) std::cerr << "ERROR, invalid size for partition " << i << " : " << h_partitions_sizes[i] << " > " << h_max_nodes_per_part << ", inspect '" << out_filename.str().c_str() << "' for possible bugs !!\n";
             throw std::runtime_error("Invalid partition size");
             // TODO: try rerunning KaHyPar a few times...
         }
@@ -1320,7 +1310,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
 
     auto time_end = std::chrono::high_resolution_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(time_end - time_start).count();
-    std::cout << "Host initial partitioning time: " << std::fixed << std::setprecision(3) << total_ms << " ms\n";
+    INFO(cfg) std::cout << "Host initial partitioning time: " << std::fixed << std::setprecision(3) << total_ms << " ms\n";
 
     uint32_t *d_partitions = nullptr;
     uint32_t *d_partitions_sizes = nullptr;
@@ -1329,6 +1319,6 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     CUDA_CHECK(cudaMemcpy(d_partitions, h_partitions.data(), num_nodes * sizeof(uint32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_partitions_sizes, h_partitions_sizes.data(), k * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-    std::cout << "Completed initial partitioning via Mt-KaHyPar !\n";
+    INFO(cfg) std::cout << "Completed initial partitioning via Mt-KaHyPar !\n";
     return std::make_tuple(d_partitions, d_partitions_sizes);
 }

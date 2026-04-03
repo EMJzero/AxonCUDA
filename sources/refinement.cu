@@ -13,7 +13,7 @@
 using namespace config;
 
 void refinementRepeats(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t *d_srcs_count,
@@ -39,11 +39,7 @@ void refinementRepeats(
     bool encourage = cfg.mode == Mode::INCC; // true -> give a gain to moves that don't fully disconnect an hedge, doing so proportionally to how few pins the leave behind
 
     for (uint32_t fm_repeat = 0u; fm_repeat < cfg.refine_repeats; fm_repeat++) {
-        std::cout << "Refining level " << level_idx << " repeat " << fm_repeat << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << num_partitions << "\n";
-
-        // initially relax partition size, then rely on later refinement to bring it back [TERRIBLE MISTAKE!]
-        //const uint32_t h_varying_max_nodes_per_part = (int32_t)((float)h_max_nodes_per_part * (1.4f - 0.4f * (float)std::min(2*fm_repeat, cfg.refine_repeats) / cfg.refine_repeats));
-        //CUDA_CHECK(cudaMemcpyToSymbol(max_nodes_per_part, &h_varying_max_nodes_per_part, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
+        INFO(cfg) std::cout << "Refining level " << level_idx << " repeat " << fm_repeat << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << num_partitions << "\n";
 
         // by how much of a node's size to allow an invalid move to be proposed (but filtered later by events - if still invalid)
         uint32_t discount = fm_repeat < cfg.refine_repeats / 3 ? 1u : (fm_repeat < 2 * cfg.refine_repeats / 3 ? 2u : UINT32_MAX);
@@ -70,7 +66,7 @@ void refinementRepeats(
             int num_threads_needed = num_hedges; // 1 thread per hedge
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - pins per partition kernel
-            std::cout << "Running pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // NOTE: having this available during FM refinement makes its complexity linear in the connectivity, instead of quadratic!
             pins_per_partition_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
@@ -97,7 +93,7 @@ void refinementRepeats(
             int num_warps_needed = curr_num_nodes; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - fm-ref gains kernel
-            std::cout << "Running fm-ref gains kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "fm-ref gains kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             fm_refinement_gains_kernel<<<blocks, threads_per_block>>>(
                 d_touching,
                 d_touching_offsets,
@@ -122,14 +118,14 @@ void refinementRepeats(
 
         // =============================
         // print some temporary results
-        #if VERBOSE
-        logMoves(
-            d_pairs,
-            d_f_scores,
-            d_partitions,
-            curr_num_nodes
-        );
-        #endif
+        LOG(cfg) {
+            logMoves(
+                d_pairs,
+                d_f_scores,
+                d_partitions,
+                curr_num_nodes
+            );
+        }
         // =============================
         
         uint32_t *d_ranks = nullptr;
@@ -158,6 +154,7 @@ void refinementRepeats(
         } else {
             // build move-chains to approximate high-gain swaps, then sort by chain total gain
             chaining(
+                cfg,
                 d_partitions,
                 d_pairs,
                 d_nodes_sizes,
@@ -175,7 +172,7 @@ void refinementRepeats(
             int num_warps_needed = curr_num_nodes ; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - fm-ref cascade kernel
-            std::cout << "Running fm-ref cascade kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "fm-ref cascade kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             fm_refinement_cascade_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
                 d_hedges_offsets,
@@ -219,7 +216,7 @@ void refinementRepeats(
             int num_threads_needed = curr_num_nodes; // 1 thread per move
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - build size events kernel
-            std::cout << "Running build size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "build size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // TODO: could filter out null moves (target = -1)?
             build_size_events_kernel<<<blocks, threads_per_block>>>(
                 d_pairs,
@@ -253,7 +250,7 @@ void refinementRepeats(
             int num_threads_needed = num_size_events; // 1 thread per event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - flag size events kernel
-            std::cout << "Running flag size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "flag size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             flag_size_events_kernel<<<blocks, threads_per_block>>>(
                 d_size_events_partition,
                 d_size_events_index,
@@ -280,7 +277,7 @@ void refinementRepeats(
             int num_threads_needed = num_hedges; // 1 thread per hedge
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - inbound pins per partition kernel
-            std::cout << "Running inbound pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "inbound pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // NOTE: inbound-only version of the above used for constraints checks...
             inbound_pins_per_partition_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
@@ -321,7 +318,7 @@ void refinementRepeats(
             int num_warps_needed = curr_num_nodes ; // 1 warp per move
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - build hedge events kernel
-            std::cout << "Running build hedge events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "build hedge events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // TODO: could filter out null moves (target = -1)?
             build_hedge_events_kernel<<<blocks, threads_per_block>>>(
                 d_pairs,
@@ -361,7 +358,7 @@ void refinementRepeats(
             int num_threads_needed = num_inbound_count_events; // 1 thread per hedge event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - count inbound events kernel
-            std::cout << "Running count inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "count inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             count_inbound_size_events_kernel<<<blocks, threads_per_block>>>(
                 d_pins_per_partitions,
                 d_inbound_count_events_partition,
@@ -396,7 +393,7 @@ void refinementRepeats(
             int num_threads_needed = num_inbound_count_events; // 1 thread per hedge event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - build inbound events kernel
-            std::cout << "Running build inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "build inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             build_inbound_size_events_kernel<<<blocks, threads_per_block>>>(
                 d_pins_per_partitions,
                 d_inbound_count_events_partition,
@@ -437,7 +434,7 @@ void refinementRepeats(
             int num_threads_needed = num_inbound_size_events; // 1 thread per event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - flag inbound events kernel
-            std::cout << "Running flag inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "flag inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             flag_inbound_events_kernel<<<blocks, threads_per_block>>>(
                 d_inbound_size_events_partition,
                 d_inbound_size_events_index,
@@ -471,14 +468,14 @@ void refinementRepeats(
         CUDA_CHECK(cudaMemcpy(&size_validity, d_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(&inbounds_validity, d_inbound_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(&acquired_gain, d_f_scores + best_rank, sizeof(float), cudaMemcpyDeviceToHost));
-        std::cout << "Best fm-ref move:\n  Move rank: " << best_rank << ", Acquired gain: " << acquired_gain << "\n";
+        INFO(cfg) std::cout << "Best fm-ref move:\n  Move rank: " << best_rank << ", Acquired gain: " << acquired_gain << "\n";
         if (size_validity <= 0 && inbounds_validity <= 0 && acquired_gain >= 0) {
             // launch configuration - fm-ref apply kernel
             int threads_per_block = 128;
             int num_threads_needed = curr_num_nodes; // 1 thread per move to apply
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - fm-ref apply kernel
-            std::cout << "Running fm-ref apply (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) << "fm-ref apply (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             fm_refinement_apply_kernel<<<blocks, threads_per_block>>>(
                 d_touching,
                 d_touching_offsets,
@@ -495,12 +492,13 @@ void refinementRepeats(
             );
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
-            //if (acquired_gain < 0) std::cerr << "WARNING: applied a refinement move with negative gain on level " << level_idx << " !!\n";
         } else {
-            std::cout << "No valid refinement move found on level " << level_idx << "- reason: "
-                << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : "negative gain")) << "\n";
-            if (size_validity > 0) std::cout << "  Size constraint violations variation amount (in nodes above the limit): " << size_validity << "\n";
-            if (inbounds_validity > 0) std::cout << "  Inbound constraint violations variation (in invalid partitions): " << inbounds_validity << "\n";
+            INFO(cfg) {
+                std::cout << "No valid refinement move found on level " << level_idx << "- reason: "
+                    << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : "negative gain")) << "\n";
+                if (size_validity > 0) std::cout << "  Size constraint violations variation amount (in nodes above the limit): " << size_validity << "\n";
+                if (inbounds_validity > 0) std::cout << "  Inbound constraint violations variation (in invalid partitions): " << inbounds_validity << "\n";
+            }
             if (size_validity > 0 && !chainup) chainup = true; // enable chaining when no moves are available via greedy sorting because of size constraints
             else if (fm_repeat < cfg.refine_repeats / 3) fm_repeat = cfg.refine_repeats / 2;
             else if (fm_repeat < 2 * cfg.refine_repeats / 3) fm_repeat = 2 * cfg.refine_repeats / 3;

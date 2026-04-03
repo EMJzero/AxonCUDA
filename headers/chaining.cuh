@@ -4,6 +4,12 @@
 #include "defines.cuh"
 #include "data_types.cuh"
 
+namespace config {
+    struct runconfig;
+}
+
+using namespace config;
+
 
 // USED BY: chaining
 
@@ -42,6 +48,7 @@ struct edge_order_key {
 // STEPS
 
 void chaining(
+    const runconfig &cfg,
     const uint32_t *srcs,
     const uint32_t *dsts,
     const uint32_t *size,
@@ -51,6 +58,7 @@ void chaining(
 );
 
 void build_orphan_pairs(
+    const runconfig &cfg,
     const uint32_t* d_nodes_sizes,
     const uint32_t* d_inbound_count,
     const uint32_t* d_pairs,

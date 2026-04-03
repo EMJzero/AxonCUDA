@@ -32,11 +32,12 @@ using namespace hgraph;
 // STEPS
 
 std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouchingHost(
+    const runconfig &cfg,
     const HyperGraph& hg
 );
 
 std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouching(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t *d_srcs_count,
@@ -45,7 +46,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouching(
 );
 
 dim_t sampleMaxNeighborhoodSize(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t *d_touching,
@@ -55,7 +56,7 @@ dim_t sampleMaxNeighborhoodSize(
 );
 
 std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t *d_touching,
@@ -67,7 +68,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
 );
 
 std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t *d_touching,
@@ -83,7 +84,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
 );
 
 std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t *d_srcs_count,
@@ -93,7 +94,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
 );
 
 std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_coarse_hedges,
     const dim_t *d_coarse_hedges_offsets,
     const uint32_t *d_touching,

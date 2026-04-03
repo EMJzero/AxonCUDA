@@ -23,11 +23,12 @@ using namespace hgraph;
 // STEPS
 
 std::tuple<uint32_t*, dim_t*> buildTouchingHost(
+    const runconfig &cfg,
     const HyperGraph& hg
 );
 
 std::tuple<uint32_t*, dim_t*> buildTouching(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t num_nodes,

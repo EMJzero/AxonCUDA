@@ -13,9 +13,10 @@
 using namespace config_plc;
 
 std::tuple<uint32_t*, dim_t*> buildTouchingHost(
+    const runconfig &cfg,
     const HyperGraph& hg
 ) {
-    std::cerr << "WARNING: moving incidence sets host -> device will take a while...\n";
+    ERR(cfg) std::cerr << "WARNING: moving incidence sets host -> device will take a while...\n";
 
     // HP: hedges already internally deduplicated (acyclic), keeping the dst whenever a duplicate is between srcs and dsts
     uint32_t *d_touching = nullptr;
@@ -50,7 +51,7 @@ std::tuple<uint32_t*, dim_t*> buildTouchingHost(
 }
 
 std::tuple<uint32_t*, dim_t*> buildTouching(
-    const runconfig cfg,
+    const runconfig &cfg,
     const uint32_t *d_hedges,
     const dim_t *d_hedges_offsets,
     const uint32_t num_nodes,
@@ -71,7 +72,7 @@ std::tuple<uint32_t*, dim_t*> buildTouching(
         int num_warps_needed = num_hedges; // 1 warp per hedge
         int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
         // launch - touching count
-        std::cout << "Running touching count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) << "touching count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         touching_count_kernel<<<blocks, threads_per_block>>>(
             d_hedges,
             d_hedges_offsets,
@@ -98,7 +99,7 @@ std::tuple<uint32_t*, dim_t*> buildTouching(
         int num_warps_needed = num_hedges; // 1 warp per hedge
         int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
         // launch - touching build kernel
-        std::cout << "Running touching build kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) << "touching build kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         touching_build_kernel<<<blocks, threads_per_block>>>(
             d_hedges,
             d_hedges_offsets,

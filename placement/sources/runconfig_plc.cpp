@@ -35,9 +35,11 @@ namespace config_plc {
             "  -lpr <num>  Set the number of label propagation repeats during recursive bisection initial partitioning\n"
             "  -fdi <num>  Set the number of force-directed refinement iterations\n"
             "  -cnc <num>  Set the count of candidate swaps proposed per node during force-directed refinement\n"
+            "  -mso <num>  Overrides the number of multi-start attempts (default is chosen to maximally occupy the GPU)\n"
             "  -ff         Replaces the 1D ordering heuristic with host-side sequential feedforward ordering\n"
             "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
             "  -seed <num> Set the algorithm's seed to <num> (default: " << SEED << ") (ignored when '-ff' is passed)\n"
+            "  -v <lvl>    Set the verbosity level: 0 metrics only, 1 steps and phases, 2 kernel launches, 3  \n"
             "  -h          Show this help\n";
     }
 
@@ -49,9 +51,14 @@ namespace config_plc {
         uint32_t labelprop_repeats = LABELPROP_REPEATS;
         uint32_t fd_iterations = FD_ITERATIONS;
         uint32_t candidates_count = MAX_CANDIDATE_MOVES;
+        uint32_t multi_start_override = UINT32_MAX;
         bool feedforward_order = false; // NB: runs sequentially on the HOST!
         bool device_touching_construction = false;
         uint64_t seed = SEED;
+        bool verbose_logs = VERBOSE_LOGS;
+        bool verbose_info = VERBOSE_INFO;
+        bool verbose_errs_and_warns = VERBOSE_ERRS;
+        bool verbose_kernel_launches = VERBOSE_LAUNCHES;
 
         // CLI handling
         for (int i = 1; i < argc; ++i) {
@@ -72,6 +79,9 @@ namespace config_plc {
             } else if (arg == "-fdi") {
                 if (i + 1 >= argc) { std::cerr << "Error: -fdi requires a positive integer value\n"; std::exit(1); }
                 fd_iterations = std::stoul(argv[++i]);
+            } else if (arg == "-mso") {
+                if (i + 1 >= argc) { std::cerr << "Error: -mso requires a positive integer value\n"; std::exit(1); }
+                multi_start_override = std::stoul(argv[++i]);
             } else if (arg == "-cnc") {
                 if (i + 1 >= argc) { std::cerr << "Error: -cnc requires a positive integer value\n"; std::exit(1); }
                 candidates_count = std::stoul(argv[++i]);
@@ -83,6 +93,15 @@ namespace config_plc {
             } else if (arg == "-seed") {
                 if (i + 1 >= argc) { std::cerr << "Error: -seed requires a positive integer value\n"; std::exit(1); }
                 seed = std::stoull(argv[++i]);
+            } else if (arg == "-v") {
+                if (i + 1 >= argc) { std::cerr << "Error: -v requires a positive value between 0 and 3\n"; std::exit(1); }
+                int verbosity = std::stoul(argv[++i]);
+                if (verbosity < 0 || verbosity > 3) { std::cerr << "Error: -v must be between 0 and 3 (extremes included) \n"; std::exit(1); }
+                verbose_logs = verbosity > 2;
+                verbose_info = verbosity > 0;
+                verbose_errs_and_warns = verbosity > 0;
+                verbose_kernel_launches = verbosity > 1;
+                if (verbose_logs) std::cerr << "WARNING, verbosity 3 can hinder performance, especially on the host side !!\n";
             } else { std::cerr << "Unknown option: " << arg << "\n"; std::exit(1); }
         }
 
@@ -93,13 +112,18 @@ namespace config_plc {
             labelprop_repeats,
             fd_iterations,
             candidates_count,
+            multi_start_override,
             feedforward_order,
             device_touching_construction,
-            seed
+            seed,
+            verbose_logs,
+            verbose_info,
+            verbose_errs_and_warns,
+            verbose_kernel_launches
         };
     }
 
-    HyperGraph loadHgraph(runconfig cfg) {
+    HyperGraph loadHgraph(runconfig &cfg) {
         HyperGraph hg(0, {}, {}); // placeholder -> overwritten if "-r" is given
 
         if (!cfg.load_path.empty()) {
@@ -109,15 +133,15 @@ namespace config_plc {
                 if (file_path.extension() == ".hgr") {
                     std::cout << "Loading hypergraph from: " << cfg.load_path << " (hMETIS format) ...\n";
                     std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(cfg.load_path)) / (1 << 20) << " MB\n";
-                    hg = HyperGraph::loadhMETIS(cfg.load_path);
+                    hg = HyperGraph::loadhMETIS(cfg.load_path, cfg.verbose_errs_and_warns);
                 } else if (file_path.extension() == ".snn") {
                     std::cout << "Loading hypergraph from: " << cfg.load_path << " (SNN format) ...\n";
                     std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(cfg.load_path)) / (1 << 20) << " MB\n";
-                    hg = HyperGraph::loadSNN(cfg.load_path);
+                    hg = HyperGraph::loadSNN(cfg.load_path, cfg.verbose_errs_and_warns);
                 } else if (file_path.extension() == ".axh") {
                     std::cout << "Loading hypergraph from: " << cfg.load_path << " (AXH format) ...\n";
                     std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(cfg.load_path)) / (1 << 20) << " MB\n";
-                    hg = HyperGraph::loadAXH(cfg.load_path);
+                    hg = HyperGraph::loadAXH(cfg.load_path, cfg.verbose_errs_and_warns);
                 } else {
                     throw std::runtime_error("Failed to load hypergraph, unsupported file format (supported: '.hgr', '.snn', '.axh').");
                 }
@@ -132,7 +156,7 @@ namespace config_plc {
         return hg;
     }
 
-    HardwareModel setupNMH(runconfig cfg) {
+    HardwareModel setupNMH(runconfig &cfg) {
         std::unordered_map<std::string, HardwareModel (*)()> configurations {
             { "loihi64", HardwareModel::createLoihiLarge },
             { "loihi84", HardwareModel::createLoihiJin84 },
@@ -147,7 +171,7 @@ namespace config_plc {
         return hw_it->second();
     }
 
-    void saveResult(runconfig cfg, std::vector<Coord2D> h_placement) {
+    void saveResult(runconfig &cfg, std::vector<Coord2D> h_placement) {
         // save hypergraph
         if (!cfg.save_path.empty()) {
             if (cfg.load_path.empty()) {

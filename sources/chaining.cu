@@ -2,6 +2,8 @@
 
 #include "thruster.cuh"
 
+#include "runconfig.hpp"
+
 #include "chaining.cuh"
 
 #include "utils.cuh"
@@ -14,6 +16,7 @@
 // by descending weight is then the final sequence returned.
 // => deterministic tie-breaking is always based on the pair's idx (aka node/move idx)
 void chaining(
+    const runconfig &cfg,
     const uint32_t* d_srcs_og,
     const uint32_t* d_dsts_og,
     const uint32_t* d_size_og, // node sizes
@@ -28,7 +31,7 @@ void chaining(
     const int threads_per_block = 256;
     const int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
 
-    std::cout << "Running chaining kernels (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    if (cfg.verbose_kernel_launches) std::cout << "Running chaining kernels (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
 
     uint32_t *d_srcs = nullptr; // srcs[idx] -> source partition / source node of the idx-th pair
     uint32_t *d_dsts = nullptr; // dsts[idx] -> destination partition / destination node of the idx-th pair
@@ -254,6 +257,7 @@ void chaining(
 // combined size and inbound set cardinality are within constraints. The objective is an
 // almost-maximal number of formed pairs.
 void build_orphan_pairs(
+    const runconfig &cfg,
     const uint32_t* d_nodes_sizes,
     const uint32_t* d_inbound_count,
     const uint32_t* d_pairs,
@@ -283,9 +287,7 @@ void build_orphan_pairs(
     );
 
     uint32_t num_free = (uint32_t)(out_it - t_free_indices);
-    #if VERBOSE
-    std::cout << "Orphans nodes found: " << num_free << "\n";
-    #endif
+    LOG(cfg) std::cout << "Orphans nodes found: " << num_free << "\n";
     if (num_free < 2) {
         CUDA_CHECK(cudaFree(d_free_indices));
         return;
@@ -307,7 +309,7 @@ void build_orphan_pairs(
     int threads_per_block = 256;
     int num_threads_needed = num_free / 2; // 1 thread per one-in-two free nodes
     int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-    std::cout << "Running pair orphans kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    LAUNCH(cfg) << "pair orphans kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
     pair_kth_smallest_with_kth_largest<<<blocks, threads_per_block>>>(
         d_free_indices,
         num_free,

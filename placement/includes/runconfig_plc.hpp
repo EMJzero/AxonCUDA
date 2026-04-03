@@ -26,18 +26,24 @@ namespace config_plc {
         uint32_t labelprop_repeats; // number of labelprop rounds performed at each level of recursive bisection in the parallel initial placement
         uint32_t fd_iterations; // number of force-directed refinement iterations to perform
         uint32_t candidates_count; // number of candidate swaps proposed per node during force-directed refinement
+        uint32_t multi_start_override; // imposes the number of multi-start attempts at placement
         bool feedforward_order; // if true, use the greedy sequential feedforward initial partitioning (runs on the host !!)
         bool device_touching_construction; // whether to construct touching/incidence sets on the device or the host
         uint64_t seed; // seed for the multi-start and recursive bisection methods
+        bool verbose_logs; // whether to log what is happening inside the algorithms
+        bool verbose_info; // whether to log the step/phase where the program is at
+        bool verbose_errs_and_warns; // whether to log errs and warnings
+        bool verbose_kernel_launches; // whether to log every kernel launch or not
+
     };
 
     void printHelp();
 
     runconfig parseArgs(int argc, char** argv);
 
-    hgraph::HyperGraph loadHgraph(runconfig cfg);
+    hgraph::HyperGraph loadHgraph(runconfig &cfg);
 
-    hwmodel::HardwareModel setupNMH(runconfig cfg);
+    hwmodel::HardwareModel setupNMH(runconfig &cfg);
 
-    void saveResult(runconfig cfg, std::vector<hwgeom::Coord2D> h_placement);
+    void saveResult(runconfig &cfg, std::vector<hwgeom::Coord2D> h_placement);
 }
