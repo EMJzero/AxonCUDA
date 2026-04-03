@@ -103,7 +103,7 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
         uint32_t num_repeats = 1;
         if (blocks > max_blocks) {
             num_repeats = (blocks + max_blocks - 1) / max_blocks;
-            INFO(cfg) std::cout << "NOTE: grouping kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
+            LOG(cfg) std::cout << "NOTE: grouping kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
             blocks = (blocks + num_repeats - 1) / num_repeats;
             if (num_repeats > MAX_MATCHING_REPEATS) {
                 ERR(cfg) std::cerr << "ABORTING: grouping kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_MATCHING_REPEATS << " !!\n";
@@ -202,6 +202,9 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
 
     return std::make_tuple(new_num_nodes, d_groups, d_groups_sizes, d_ungroups, d_ungroups_offsets);
 }
+
+
+// LOGGING
 
 void logCandidates(
     const runconfig &cfg,

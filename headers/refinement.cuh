@@ -39,7 +39,28 @@ void refinementRepeats(
     float *d_f_scores,
     uint32_t *d_partitions,
     uint32_t *d_partitions_sizes,
-    uint32_t *d_pins_per_partitions,
+    uint32_t *d_partitions_inbound_sizes
+);
+
+void refinementSparseRepeats(
+    const runconfig &cfg,
+    const uint32_t *d_hedges,
+    const dim_t *d_hedges_offsets,
+    const uint32_t *d_srcs_count,
+    const uint32_t *d_touching,
+    const dim_t *d_touching_offsets,
+    const uint32_t *d_inbound_count,
+    const float *d_hedge_weights,
+    const uint32_t *d_nodes_sizes,
+    const uint32_t level_idx,
+    const uint32_t curr_num_nodes,
+    const uint32_t num_hedges,
+    const uint32_t num_partitions,
+    const dim_t touching_size,
+    uint32_t *d_pairs,
+    float *d_f_scores,
+    uint32_t *d_partitions,
+    uint32_t *d_partitions_sizes,
     uint32_t *d_partitions_inbound_sizes
 );
 
@@ -181,8 +202,8 @@ void count_inbound_size_events_kernel(
     const uint32_t* __restrict__ ev_index,
     const uint32_t* __restrict__ ev_hedge,
     const int32_t* __restrict__ ev_delta,
-    uint32_t num_events,
-    uint32_t num_partitions,
+    const uint32_t num_events,
+    const uint32_t num_partitions,
     uint32_t* __restrict__ inbound_size_events_offsets
 );
 
@@ -194,8 +215,8 @@ void build_inbound_size_events_kernel(
     const uint32_t* __restrict__ ev_hedge,
     const int32_t* __restrict__ ev_delta,
     const uint32_t* __restrict__ inbound_size_events_offsets,
-    uint32_t num_events,
-    uint32_t num_partitions,
+    const uint32_t num_events,
+    const uint32_t num_partitions,
     uint32_t* __restrict__ new_ev_partition,
     uint32_t* __restrict__ new_ev_index,
     int32_t* __restrict__ new_ev_delta
@@ -209,4 +230,114 @@ void flag_inbound_events_kernel(
     const uint32_t* __restrict__ partitions_inbound_sizes,
     const uint32_t num_events,
     int32_t* __restrict__ valid_moves
+);
+
+
+// SPARSE PINS-PER-PARTITION VARIANT
+
+__global__
+void sparse_pins_per_partition_count_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ partitions,
+    const uint32_t num_hedges,
+    const uint32_t ppp_per_hedge,
+    bitmap* __restrict__ ppp_offsets
+);
+
+__global__
+void sparse_pins_per_partition_write_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ partitions,
+    const bitmap* __restrict__ ppp_offsets,
+    const uint32_t num_hedges,
+    const uint32_t ppp_per_hedge,
+    uint32_t* __restrict__ ppp,
+    uint32_t* __restrict__ partitions_incident_sizes
+);
+
+__global__
+void sparse_inbound_pins_per_partition_update_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const uint32_t* __restrict__ partitions,
+    const bitmap* __restrict__ ppp_offsets,
+    const uint32_t num_hedges,
+    const uint32_t ppp_per_hedge,
+    uint32_t* __restrict__ in_ppp,
+    uint32_t* __restrict__ partitions_inbound_sizes
+);
+
+__global__
+void fm_refinement_gains_sparse_ppp_kernel(
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const float* __restrict__ hedge_weights,
+    const uint32_t* __restrict__ partitions,
+    const bitmap* __restrict__ ppp_offsets,
+    const uint32_t* __restrict__ ppp,
+    const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ partitions_sizes,
+    const uint32_t num_hedges,
+    const uint32_t num_nodes,
+    const uint32_t num_partitions,
+    const uint32_t ppp_per_hedge,
+    const uint32_t randomizer,
+    const uint32_t discount,
+    const bool encourage_all_moves,
+    uint32_t* __restrict__ moves,
+    float* __restrict__ scores
+);
+
+__global__
+void fm_refinement_cascade_sparse_ppp_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const float* hedge_weights,
+    const uint32_t* __restrict__ move_ranks,
+    const uint32_t* __restrict__ moves,
+    const uint32_t* __restrict__ partitions,
+    const bitmap* __restrict__ ppp_offsets,
+    const uint32_t* __restrict__ ppp,
+    const uint32_t num_hedges,
+    const uint32_t num_nodes,
+    const uint32_t num_partitions,
+    const uint32_t ppp_per_hedge,
+    const bool encourage_all_moves,
+    float* __restrict__ scores
+);
+
+__global__
+void count_inbound_size_events_sparse_ppp_kernel(
+    const bitmap* __restrict__ ppp_offsets,
+    const uint32_t* __restrict__ in_ppp,
+    const uint32_t* __restrict__ ev_partition,
+    const uint32_t* __restrict__ ev_index,
+    const uint32_t* __restrict__ ev_hedge,
+    const int32_t* __restrict__ ev_delta,
+    const uint32_t num_events,
+    const uint32_t num_partitions,
+    const uint32_t ppp_per_hedge,
+    uint32_t* inbound_size_events_offsets
+);
+
+__global__
+void build_inbound_size_events_sparse_ppp_kernel(
+    const bitmap* __restrict__ ppp_offsets,
+    const uint32_t* __restrict__ in_ppp,
+    const uint32_t* __restrict__ ev_partition,
+    const uint32_t* __restrict__ ev_index,
+    const uint32_t* __restrict__ ev_hedge,
+    const int32_t* __restrict__ ev_delta,
+    const uint32_t* inbound_size_events_offsets,
+    const uint32_t num_events,
+    const uint32_t num_partitions,
+    const uint32_t ppp_per_hedge,
+    uint32_t* __restrict__ new_ev_partition,
+    uint32_t* __restrict__ new_ev_index,
+    int32_t* __restrict__ new_ev_delta
 );

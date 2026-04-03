@@ -178,7 +178,6 @@ int main(int argc, char** argv) {
     dp_score *d_dp_scores = nullptr; // dynamic programming score for each node in the tree assuming it connected (with) or not (w/out) to its target
     uint32_t *d_nodes_sizes = nullptr; // nodes_size[node idx] -> how many pins the node counts as towards the partition size limit
     uint32_t *d_partitions_sizes = nullptr; // partitions_sizes[idx] -> how many nodes (by total size) are in the partition
-    uint32_t *d_pins_per_partitions = nullptr; // matrix<num_hedges x num_partitions>, pins_per_partitions[hedge idx * num_partitions + partition idx] -> count of pins of "hedge" in that "partition"
     uint32_t *d_partitions_inbound_sizes = nullptr; // partitions_inbound_sizes[partition] -> distinct inbound hedges count for "partition"
 
     // allocate device memory
@@ -374,8 +373,6 @@ int main(int argc, char** argv) {
                 h_max_nodes_per_part
             );
             d_partitions_sizes = d_init_partitions_sizes;
-            const size_t pins_per_partitions_bytes = static_cast<size_t>(num_hedges) * max_parts * sizeof(uint32_t);
-            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, pins_per_partitions_bytes));
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, max_parts * sizeof(uint32_t))); // TODO: remove, not needed in KWAY mode
 
             return std::make_tuple(max_parts, d_init_partitions);
@@ -466,8 +463,6 @@ int main(int argc, char** argv) {
                 h_max_nodes_per_part
             );
             d_partitions_sizes = d_init_partitions_sizes;
-            const size_t pins_per_partitions_bytes = static_cast<size_t>(num_hedges) * max_parts * sizeof(uint32_t);
-            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, pins_per_partitions_bytes));
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, max_parts * sizeof(uint32_t))); // TODO: remove, not needed in KWAY mode
             CUDA_CHECK(cudaFree(d_groups));
             CUDA_CHECK(cudaFree(d_ungroups));
@@ -489,7 +484,7 @@ int main(int argc, char** argv) {
         if (
             new_num_nodes <= target_parts
             || new_num_nodes == curr_num_nodes
-            || (level_idx >= NUMBER_OF_LEVELS_WITH_NO_SHRINK_LIMIT && coarsening_ratio > SHRINK_RATIO_LIMIT && new_num_nodes <= max_parts)
+            || (level_idx >= NUMBER_OF_LEVELS_WITH_NO_SHRINK_LIMIT && coarsening_ratio > SHRINK_RATIO_LIMIT)
         ) {
             // HERE we repurpose the coarsening routine as the routine for initial partitions:
             // - num_partitions = new_num_nodes
@@ -507,13 +502,18 @@ int main(int argc, char** argv) {
             } else if (new_num_nodes <= max_parts) { // still valid but not minimal partitions count
                 INFO(cfg) std::cout << "Initial partitioning built at level " << level_idx << ", remaining nodes=" << curr_num_nodes << ", number of partitions=" << new_num_nodes << "\n";
                 if (new_num_nodes == curr_num_nodes) { // impossible to coarsen further
-                    ERR(cfg) std::cerr << "WARNING: could not coarsen any further, the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ") ...\n";
+                    ERR(cfg) std::cerr << "WARNING: could not coarsen any further, the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ") !!\n";
                 } else if (coarsening_ratio > SHRINK_RATIO_LIMIT) { // too little pairs created, too expensive to coarsen further
-                    ERR(cfg) std::cerr << "WARNING: coarsening rate too low (" << std::fixed << std::setprecision(2) << 1/coarsening_ratio << " < " << 1/SHRINK_RATIO_LIMIT << ") the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ") ...\n";
+                    ERR(cfg) std::cerr << "WARNING: coarsening rate too low (" << std::fixed << std::setprecision(2) << 1/coarsening_ratio << " < " << 1/SHRINK_RATIO_LIMIT << ") the partitioning is valid, but didn't reach the minimal number of partitions (" << target_parts << ") !!\n";
                 }
             } else { // base case, failure to coarsen further
                 ERR(cfg) std::cerr << "FAILED TO COARSEN FURTHER at level " << level_idx << ", remaining nodes=" << curr_num_nodes << " number of partitions=" << new_num_nodes << " max allowed partitions=" << max_parts << "\n";
-                ERR(cfg) std::cerr << "WARNING: falling back to returning current groups as individual partitions...\n";
+                if (new_num_nodes == curr_num_nodes) { // impossible to coarsen further
+                    ERR(cfg) std::cerr << "  Reason: no coarsening pairs were formed\n";
+                } else if (coarsening_ratio > SHRINK_RATIO_LIMIT) { // too little pairs created, too expensive to coarsen further
+                    ERR(cfg) std::cerr << "  Reason: coarsening rate too low (" << std::fixed << std::setprecision(2) << 1/coarsening_ratio << " < " << 1/SHRINK_RATIO_LIMIT << ")\n";
+                }
+                ERR(cfg) std::cerr << "WARNING: falling back to returning current groups as individual partitions !!\n";
             }
 
             // neighbors are no longer needed after coarsening is done
@@ -524,9 +524,7 @@ int main(int argc, char** argv) {
             // NOTE: current groups become the partitions, and so group sizes become partition sizes
             d_partitions_sizes = d_groups_sizes;
 
-            // NOTE: the inbound counters per partition are just the transposed of pins per partition! No need to compute them separately!
-            const size_t pins_per_partitions_bytes = static_cast<size_t>(num_hedges) * new_num_nodes * sizeof(uint32_t);
-            CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, pins_per_partitions_bytes));
+            // perpare inbound set size counts per partition (written by "refinementRepeats")
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, new_num_nodes * sizeof(uint32_t)));
 
             CUDA_CHECK(cudaFree(d_ungroups));
@@ -746,7 +744,6 @@ int main(int argc, char** argv) {
             d_f_scores,
             d_partitions,
             d_partitions_sizes,
-            d_pins_per_partitions,
             d_partitions_inbound_sizes
         );
 
@@ -901,7 +898,6 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_nodes_sizes));
     CUDA_CHECK(cudaFree(d_partitions));
     CUDA_CHECK(cudaFree(d_partitions_sizes));
-    CUDA_CHECK(cudaFree(d_pins_per_partitions));
     CUDA_CHECK(cudaFree(d_partitions_inbound_sizes));
 
     // final sync

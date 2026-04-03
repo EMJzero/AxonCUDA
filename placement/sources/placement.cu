@@ -334,6 +334,9 @@ void force_directed_refinement(
     CUDA_CHECK(cudaFree(d_nodes_rank));
 }
 
+
+// LOGGING
+
 void logForces(
     const float *d_forces,
     const uint32_t num_nodes

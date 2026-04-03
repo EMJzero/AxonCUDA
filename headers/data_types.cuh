@@ -77,11 +77,22 @@ struct best_move_functor {
 };
 
 
+// USED BY: pins per partition (sparse bitmap matrix)
+
+#define BITMAP_CAPACITY 64u // number of bits/elements flagged by a bitmap instance
+#define BITMAP_CAPLOG 6u // log_2(BITMASK_CAPACITY) -> how many bits are needed to index inside "flg"
+
+struct bitmap {
+    uint64_t cnt; // counter of how many entries exist before mines
+    uint64_t flg; // i-th bit set to 1 if the cnt+i element is present
+};
+
+
 // USED BY: final small partitions merging
 
 struct constraints_state {
-    dim_t s, i;
-    uint32_t g;
+    dim_t s, i; // size and inbound count
+    uint32_t g; // group id
 };
 
 

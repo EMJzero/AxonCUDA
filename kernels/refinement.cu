@@ -64,7 +64,7 @@ void inbound_pins_per_partition_kernel(
     const dim_t hedge_start_idx = hedges_offsets[tid];
     const uint32_t *hedge_start = hedges + hedge_start_idx;
     const uint32_t hedge_srcs_count = srcs_count[tid];
-    const uint32_t *hedge_srcs_end = hedges + hedge_srcs_count;
+    const uint32_t *hedge_srcs_end = hedge_start + hedge_srcs_count;
     uint32_t *my_inbound_pins_per_partitions = inbound_pins_per_partitions + static_cast<dim_t>(tid) * num_partitions;
 
     for (const uint32_t* curr = hedge_start; curr < hedge_srcs_end; curr++) {
@@ -492,14 +492,15 @@ void build_hedge_events_kernel(
     *   move's, but we can easily filter those out later by identifying them from the UINT32_MAX ev_partition...
     */
 
+    const uint32_t dst_part = moves[warp_id];
+    if (dst_part == UINT32_MAX) return;
+    const uint32_t src_part = partitions[warp_id];
+    const uint32_t my_rank = ranks[warp_id];
+
     uint32_t *my_ev_partition = ev_partition + 2 * touching_offsets[warp_id] + 2 * lane_id;
     uint32_t *my_ev_index = ev_index + 2 * touching_offsets[warp_id] + 2 * lane_id;
     uint32_t *my_ev_hedge = ev_hedge + 2 * touching_offsets[warp_id] + 2 * lane_id;
     int32_t *my_ev_delta = ev_delta + 2 * touching_offsets[warp_id] + 2 * lane_id;
-
-    const uint32_t src_part = partitions[warp_id];
-    const uint32_t dst_part = moves[warp_id];
-    const uint32_t my_rank = ranks[warp_id];
 
     const uint32_t* inbound = touching + touching_offsets[warp_id];
     const uint32_t my_inbound_count = inbound_count[warp_id];
@@ -531,8 +532,8 @@ void count_inbound_size_events_kernel(
     const uint32_t* __restrict__ ev_index,
     const uint32_t* __restrict__ ev_hedge,
     const int32_t* __restrict__ ev_delta,
-    uint32_t num_events,
-    uint32_t num_partitions,
+    const uint32_t num_events,
+    const uint32_t num_partitions,
     uint32_t* inbound_size_events_offsets // init. to zero
 ) {
     // STYLE: one event per thread!
@@ -565,8 +566,8 @@ void build_inbound_size_events_kernel(
     const uint32_t* __restrict__ ev_hedge,
     const int32_t* __restrict__ ev_delta,
     const uint32_t* inbound_size_events_offsets,
-    uint32_t num_events,
-    uint32_t num_partitions,
+    const uint32_t num_events,
+    const uint32_t num_partitions,
     uint32_t* __restrict__ new_ev_partition,
     uint32_t* __restrict__ new_ev_index,
     int32_t* __restrict__ new_ev_delta
@@ -648,4 +649,438 @@ void flag_inbound_events_kernel(
         atomicAdd(&valid_moves[rank], 1);
     if (!was_valid && is_valid) // this event made the partition invalid -> track a -1 in invalid partitions as of this event
         atomicSub(&valid_moves[rank], 1);
+}
+
+
+// SPARSE PINS-PER-PARTITION VARIANT
+
+// retrieval:
+// - if your flag bit (the one part-idx from the least-significant one) is zero, return zero
+// - otherwise, count how many ones are in less-significant positions than part-idx, add that to the base count, and that's your offset to go fetch
+// TODO: could <maybe> cache a few entries of ppp_offsets per warp/block?
+__device__ __forceinline__ uint32_t get_ppp(const bitmap* ppp_offsets, const uint32_t* ppp, const uint32_t ppp_per_hedge, const uint32_t hedge_idx, const uint32_t part_idx) {
+    const bitmap *my_ppp_offsets = ppp_offsets + static_cast<dim_t>(hedge_idx) * ppp_per_hedge;
+    const dim_t ppp_bitmap_idx = part_idx >> BITMAP_CAPLOG; // aka: part / BITMAP_CAPACITY
+    bitmap ppp_bitmap = my_ppp_offsets[ppp_bitmap_idx];
+    const uint64_t bitmap_part_idx = part_idx & (BITMAP_CAPACITY - 1u); // aka: part % BITMAP_CAPACITY
+    const uint64_t ppp_bitmask = 1ull << bitmap_part_idx; // put a 1 in position part % BITMAP_CAPACITY, all other bits are zero
+    if ((ppp_bitmap.flg & ppp_bitmask) == 0ull) return 0u; // no pins
+    //const uint64_t ppp_left_side_bitmask = ~(UINT64_MAX >> (part_idx & (BITMAP_CAPACITY - 1u))); // put all 1s left of position part % BITMAP_CAPACITY, followed by zeros
+    //return ppp[ppp_bitmap.cnt + __popcll(ppp_bitmap.flg & ppp_left_side_bitmask)];
+    //return ppp[ppp_bitmap.cnt + __popcll(ppp_bitmap.flg >> (BITMAP_CAPACITY - bitmap_part_idx))];
+    return ppp[ppp_bitmap.cnt + (bitmap_part_idx == 0 ? 0u : __popcll(ppp_bitmap.flg << (BITMAP_CAPACITY - bitmap_part_idx)))];
+}
+
+// for each hyperedge, count how many of its pins are in each partition
+// SEQUENTIAL COMPLEXITY: e*d
+// PARALLEL OVER: e
+// SHUFFLES OVER: d
+__global__
+void sparse_pins_per_partition_count_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
+    const uint32_t num_hedges,
+    const uint32_t ppp_per_hedge, // ppp_per_hedge = ceil(num_partitions / 64) [note: 64 = BITMAP_CAPACITY]
+    bitmap* __restrict__ ppp_offsets // ppp_offsets[hedge-idx * ppp_per_hedge + part-idx / 64] -> bitmap to access the pin count for all (hedge, part / 64), ... (hedge, part / 64 + 63) pairs
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the sample to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    const dim_t hedge_start_idx = hedges_offsets[warp_id], hedge_end_idx = hedges_offsets[warp_id + 1];
+    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
+    bitmap *my_ppp_offsets = ppp_offsets + static_cast<dim_t>(warp_id) * ppp_per_hedge;
+
+    for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_end; curr += WARP_SIZE) {
+        const uint32_t part = partitions[*curr];
+        // now all thread in the warp set their "bitmap.flg" of my_ppp_offsets to 1 in parallel
+        // => since multiple threads might want to write the same 64bit word, make them agree on a single update per word
+        const dim_t ppp_bitmap_idx = part >> BITMAP_CAPLOG; // aka: part / BITMAP_CAPACITY
+        const uint64_t ppp_bitmask = 1ull << (part & (BITMAP_CAPACITY - 1u)); // put a 1 in position part % BITMAP_CAPACITY, all other bits are zero
+        const unsigned active = __activemask();
+        // lanes targeting the same 64+64-bit word cooperate
+        const unsigned peers = __match_any_sync(active, ppp_bitmap_idx);
+        // OR-reduce all bit requests for the same word across peers
+        const uint64_t combined_mask = __reduce_or_sync(peers, ppp_bitmask);
+        const int leader = __ffs(peers) - 1;
+        if (static_cast<int>(lane_id) == leader) {
+            // exactly one writer per bitmap per iteration
+            bitmap* ppp_offset_ptr = my_ppp_offsets + ppp_bitmap_idx;
+            const bitmap old_bitmap = *ppp_offset_ptr;
+            bitmap updated_bitmap;
+            uint64_t new_bits = combined_mask & ~old_bitmap.flg;
+            updated_bitmap.cnt = old_bitmap.cnt + __popcll(new_bits);
+            updated_bitmap.flg = old_bitmap.flg | combined_mask;
+            *ppp_offset_ptr = updated_bitmap;
+            // add the number of added 1s to the incident hedges count
+        }
+    }
+}
+
+// for each hedge-partition sparse offset pair, assuming bitmap flg-s to have been update, re-infer the cnt-s
+// SEQUENTIAL COMPLEXITY: e*d
+// PARALLEL OVER: e*d
+/*__global__
+void sparse_pins_per_partition_update_kernel(
+    const uint32_t num_hedges,
+    const uint32_t ppp_per_hedge,
+    bitmap* __restrict__ ppp_offsets
+) {
+    // STYLE: one (hedge, part(s)) bitmap per warp!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_hedges * ppp_per_hedge) return;
+    ppp_offsets[tid].cnt = __popcll(ppp_offsets[tid].flg);
+}*/
+
+// given the sparse pins-per-partiton bitmaps, write the actual ppp counters in the segmented array
+// SEQUENTIAL COMPLEXITY: e*d
+// PARALLEL OVER: e
+// SHUFFLES OVER: d
+__global__
+void sparse_pins_per_partition_write_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
+    const bitmap* __restrict__ ppp_offsets, // ppp_offsets[hedge-idx * ppp_per_hedge + part-idx / 64] -> bitmap to access the pin count for all (hedge, part / 64), ... (hedge, part / 64 + 63) pairs
+    const uint32_t num_hedges,
+    const uint32_t ppp_per_hedge, // ppp_per_hedge = ceil(num_partitions / 64) [note: 64 = BITMAP_CAPACITY]
+    uint32_t* __restrict__ ppp, // ppp[ppp_offsets[e*num_partitions+p/64].cnt + bits-at-one-before-the(p%64)th-in(ppp_offsets[e*num_partitions+p/64].flg)] -> pins count held by hedge e in partition p
+    uint32_t* __restrict__ partitions_incident_sizes // partitions_incident_sizes[part] -> number of pins-per-partitions for 'part' that are not zero
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the sample to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    const dim_t hedge_start_idx = hedges_offsets[warp_id], hedge_end_idx = hedges_offsets[warp_id + 1];
+    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
+    const bitmap *my_ppp_offsets = ppp_offsets + static_cast<dim_t>(warp_id) * ppp_per_hedge;
+
+    for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_end; curr += WARP_SIZE) {
+        const uint32_t part = partitions[*curr];
+        const dim_t ppp_bitmap_idx = part >> BITMAP_CAPLOG; // aka: part / BITMAP_CAPACITY
+        const uint64_t bitmap_part_idx = part & (BITMAP_CAPACITY - 1u); // aka: part % BITMAP_CAPACITY
+        bitmap ppp_bitmap = my_ppp_offsets[ppp_bitmap_idx];
+        const uint32_t prev = atomicAdd(&ppp[ppp_bitmap.cnt + (bitmap_part_idx == 0 ? 0u : __popcll(ppp_bitmap.flg << (BITMAP_CAPACITY - bitmap_part_idx)))], 1u);
+        if (prev == 0) atomicAdd(&partitions_incident_sizes[part], 1);
+    }
+}
+
+// subtract outbound pins from ppp's counters
+// SEQUENTIAL COMPLEXITY: e*d
+// PARALLEL OVER: e
+// SHUFFLES OVER: d
+__global__
+void sparse_inbound_pins_per_partition_update_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const uint32_t* __restrict__ partitions,
+    const bitmap* __restrict__ ppp_offsets,
+    const uint32_t num_hedges,
+    const uint32_t ppp_per_hedge,
+    uint32_t* __restrict__ in_ppp, // in_ppp[ppp_offsets[... same as ppp] -> inbound pins count held by hedge e in partition p
+    uint32_t* __restrict__ partitions_inbound_sizes // partitions_inbound_sizes[part] -> number of inbound-pins-per-partitions for 'part' that are not zero
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the sample to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    const dim_t hedge_src_start_idx = hedges_offsets[warp_id];
+    const dim_t hedge_src_end_idx = hedge_src_start_idx + srcs_count[warp_id];
+    const uint32_t *hedge_src_start = hedges + hedge_src_start_idx, *hedge_src_end = hedges + hedge_src_end_idx;
+    const bitmap *my_ppp_offsets = ppp_offsets + static_cast<dim_t>(warp_id) * ppp_per_hedge;
+
+    for (const uint32_t* curr = hedge_src_start + lane_id; curr < hedge_src_end; curr += WARP_SIZE) {
+        const uint32_t part = partitions[*curr];
+        const dim_t ppp_bitmap_idx = part >> BITMAP_CAPLOG; // aka: part / BITMAP_CAPACITY
+        const uint64_t bitmap_part_idx = part & (BITMAP_CAPACITY - 1u); // aka: part % BITMAP_CAPACITY
+        bitmap ppp_bitmap = my_ppp_offsets[ppp_bitmap_idx];
+        const uint32_t prev = atomicSub(&in_ppp[ppp_bitmap.cnt + (bitmap_part_idx == 0 ? 0u : __popcll(ppp_bitmap.flg << (BITMAP_CAPACITY - bitmap_part_idx)))], 1u);
+        if (prev == 1) atomicSub(&partitions_inbound_sizes[part], 1);
+    }
+}
+
+// see "fm_refinement_gains_kernel"
+__global__
+void fm_refinement_gains_sparse_ppp_kernel(
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const float* __restrict__ hedge_weights,
+    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
+    const bitmap* __restrict__ ppp_offsets, // ppp_offsets[hedge-idx * ppp_per_hedge + part-idx / 64] -> bitmap to access the pin count for all (hedge, part / 64), ... (hedge, part / 64 + 63) pairs
+    const uint32_t* __restrict__ ppp, // ppp[ppp_offsets[e*num_partitions+p/64].cnt + bits-at-one-before-the(p%64)th-in(ppp_offsets[e*num_partitions+p/64].flg)] -> pins count held by hedge e in partition p
+    const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ partitions_sizes,
+    const uint32_t num_hedges,
+    const uint32_t num_nodes,
+    const uint32_t num_partitions,
+    const uint32_t ppp_per_hedge,
+    const uint32_t randomizer,
+    const uint32_t discount, // by how much to overshoot the size constraint when proposing moves
+    const bool encourage_all_moves, // if true, even moves that don't fully disconnect an hyperedge receive a gain inversely proportional to how many pins remain
+    // NOTE: we repurpose the arrays allocated for the "candidates kernel" for those!
+    uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx
+    float* __restrict__ scores // scores[idx] -> gain for move in position idx
+) { 
+    // STYLE: one node per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the node to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_nodes) return;
+    
+    const uint32_t my_partition = partitions[warp_id];
+    const uint32_t my_size = nodes_sizes[warp_id];
+    
+    const uint32_t* my_touching = touching + touching_offsets[warp_id];
+    const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
+    //uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
+    float loss[PART_HIST_SIZE]; // make sure this fits in registers (no spill) !! Store here only the score, the partition id can be inferred!
+    float saving = 0.0f;
+    
+    // all threads in the warp should agree on those...
+    float best_gain = -FLT_MAX;
+    uint32_t best_move = UINT32_MAX;
+
+    // handle the current partition first with its own scan of touching hyperedges
+    for (const uint32_t* hedge_idx = my_touching + lane_id; hedge_idx < not_my_touching; hedge_idx += WARP_SIZE) {
+        const uint32_t actual_hedge_idx = *hedge_idx;
+        const uint32_t my_pin_per_partition = get_ppp(ppp_offsets, ppp, ppp_per_hedge, actual_hedge_idx, my_partition);
+        const float my_hedge_weight = hedge_weights[actual_hedge_idx];
+        // hedge connected to my partition: gain the hedge's weight iff moving would disconnect it from my partition (I am its last pin left there)
+        if (!encourage_all_moves && my_pin_per_partition == 1)
+            saving += my_hedge_weight;
+        // VARIANT: give a little push to nodes leaving a partition with not just one, but few pins left for an hedge
+        if (encourage_all_moves && my_pin_per_partition >= 1)
+            saving += my_hedge_weight / (my_pin_per_partition * my_pin_per_partition);
+    }
+
+    saving = warpReduceSum<float>(saving);
+    
+    // handle PART_HIST_SIZE*WARP_SIZE partitions at a time, that is partitions_per_thread per thread in the warp
+    for (uint32_t curr_base_part = 0; curr_base_part < num_partitions; curr_base_part += PART_HIST_SIZE*WARP_SIZE) {
+        // each thread handles, at once, min(PART_HIST_SIZE, partitions_per_thread) partitions, each partition is handled by exactly one thread per warp
+        const uint32_t partitions_to_handle = min(num_partitions - curr_base_part, PART_HIST_SIZE*WARP_SIZE); // ... to handle over the whole warp
+        const uint32_t partitions_per_thread = (partitions_to_handle + WARP_SIZE - 1) / WARP_SIZE; // ceiled
+        const uint32_t threads_with_one_less_partition = partitions_per_thread*WARP_SIZE - partitions_to_handle;
+        const uint32_t my_part_count = partitions_per_thread - (lane_id >= WARP_SIZE - threads_with_one_less_partition ? 1 : 0);
+
+        // clear per-thread local histograms
+        for (uint32_t p = 0; p < my_part_count; p++)
+            loss[p] = 0.0f;
+
+        // scan touching hyperedges
+        // NOTE: interpret this as "for each hedge, see if you moving to a certain partition is something that they like or not"
+        for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
+            const uint32_t actual_hedge_idx = *hedge_idx;
+            const float my_hedge_weight = hedge_weights[actual_hedge_idx];
+            const bitmap *my_ppp_offsets = ppp_offsets + static_cast<dim_t>(actual_hedge_idx) * ppp_per_hedge;
+            // each thread in the warp reads partitions_per_thread counters
+            for (uint32_t p = 0; p < my_part_count; p++) {
+                const uint32_t part = curr_base_part + lane_id + p * WARP_SIZE;
+                const dim_t ppp_bitmap_idx = part >> BITMAP_CAPLOG; // aka: part / BITMAP_CAPACITY
+                bitmap ppp_bitmap = my_ppp_offsets[ppp_bitmap_idx];
+                uint32_t my_pin_per_partition = 0u;
+                const uint64_t ppp_bitmask = 1ull << (part & (BITMAP_CAPACITY - 1u)); // put a 1 in position part % BITMAP_CAPACITY, all other bits are zero
+                if ((ppp_bitmap.flg & ppp_bitmask) != 0ull) { // >0 pins
+                    const uint64_t bitmap_part_idx = part & (BITMAP_CAPACITY - 1u); // aka: part % BITMAP_CAPACITY
+                    my_pin_per_partition = ppp[ppp_bitmap.cnt + (bitmap_part_idx == 0 ? 0u : __popcll(ppp_bitmap.flg << (BITMAP_CAPACITY - bitmap_part_idx)))];
+                }
+                // hedge not yet connected to the partition: pay the hedge's weight iff moving there connects it to the new partition (I would become its first pin there)
+                if (my_pin_per_partition == 0) loss[p] += my_hedge_weight;
+            }
+        }
+
+        // reduce max inside each threads
+        for (uint32_t p = 0; p < my_part_count; p++) {
+            const float gain = saving - loss[p];
+            const uint32_t part = curr_base_part + lane_id + p * WARP_SIZE;
+            // => pseudo-random tie-break via hashes
+            if (part != my_partition && partitions_sizes[part] + my_size - (my_size / discount) <= max_nodes_per_part && (gain > best_gain || gain == best_gain && hash_uint32(part + randomizer) > hash_uint32(best_move + randomizer))) {
+                best_gain = gain;
+                best_move = part;
+            }
+        }
+
+        // reduce max between threads
+        bin<float> max = warpReduceMax<float>(best_gain, best_move);
+        best_gain = max.val;
+        best_move = max.payload; // yeah, "node" should be called "partition" here, but this way we repurpose the struct...
+    }
+
+    if (lane_id == 0) {
+        moves[warp_id] = best_move;
+        scores[warp_id] = best_gain;
+    }
+}
+
+// see "fm_refinement_cascade_kernel"
+__global__
+void fm_refinement_cascade_sparse_ppp_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const float* hedge_weights,
+    const uint32_t* __restrict__ move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
+    const uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
+    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
+    const bitmap* __restrict__ ppp_offsets, // ppp_offsets[hedge-idx * ppp_per_hedge + part-idx / 64] -> bitmap to access the pin count for all (hedge, part / 64), ... (hedge, part / 64 + 63) pairs
+    const uint32_t* __restrict__ ppp, // ppp[ppp_offsets[e*num_partitions+p/64].cnt + bits-at-one-before-the(p%64)th-in(ppp_offsets[e*num_partitions+p/64].flg)] -> pins count held by hedge e in partition p
+    const uint32_t num_hedges,
+    const uint32_t num_nodes,
+    const uint32_t num_partitions,
+    const uint32_t ppp_per_hedge,
+    const bool encourage_all_moves,
+    float* __restrict__ scores // scores[move_ranks[node_idx]] -> gain for node idx's move
+) {
+    // STYLE: one node (move) per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the node to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_nodes) return;
+    
+    float score = 0.0f;
+    
+    const uint32_t my_move_part = moves[warp_id];
+    // no need to update invalid moves
+    if (my_move_part == UINT32_MAX) return;
+    
+    const uint32_t my_partition = partitions[warp_id];
+    const uint32_t my_move_rank = move_ranks[warp_id];
+    
+    const uint32_t* my_touching = touching + touching_offsets[warp_id];
+    const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
+    
+    // scan touching hyperedges
+    // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
+    for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
+        const uint32_t actual_hedge_idx = *hedge_idx;
+        // NOTE: this is not a warp-sync kernel, so using shuffles here to share data looses time, it's better to exploit caches with redundant reads!
+        const uint32_t* my_hedge = hedges + hedges_offsets[actual_hedge_idx];
+        my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
+        const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
+        const float my_hedge_weight = hedge_weights[actual_hedge_idx];
+        const uint32_t my_curr_part_counter = get_ppp(ppp_offsets, ppp, ppp_per_hedge, actual_hedge_idx, my_partition);
+        const uint32_t my_move_part_counter = get_ppp(ppp_offsets, ppp, ppp_per_hedge, actual_hedge_idx, my_move_part);
+        int32_t my_curr_part_counter_delta = 0;
+        int32_t my_move_part_counter_delta = 0;
+        for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
+            uint32_t pin = *my_hedge;
+            if (move_ranks[pin] < my_move_rank) { // speculation: better-ranked move -> applied
+                // NOTE: invalid moves should all have a lower score and thus a higher rank than all others, never being see here
+                uint32_t new_pin_partition = moves[pin];
+                uint32_t prev_pin_partition = partitions[pin];
+                if (new_pin_partition == my_partition)
+                    my_curr_part_counter_delta++;
+                else if (new_pin_partition == my_move_part)
+                    my_move_part_counter_delta++;
+                if (prev_pin_partition == my_partition)
+                    my_curr_part_counter_delta--;
+                else if (prev_pin_partition == my_move_part)
+                    my_move_part_counter_delta--;
+            }
+        }
+        // gain the hedge's weight iff moving would disconnect the hedge from my partition (I am its last pin left there)
+        const uint32_t true_curr_part_counter = my_curr_part_counter + warpReduceSumLN0<int32_t>(my_curr_part_counter_delta);
+        if (!encourage_all_moves && true_curr_part_counter == 1)
+            score += my_hedge_weight;
+        // pay the hedge's weight iff moving there connects the hedge to the new partition (I would become its first pin there)
+        if (my_move_part_counter + warpReduceSumLN0<int32_t>(my_move_part_counter_delta) == 0)
+            score -= my_hedge_weight;
+        // VARIANT: give a little push to nodes leaving a partition with not just one, but few pins left for an hedge
+        if (encourage_all_moves && true_curr_part_counter >= 1)
+            score += my_hedge_weight / (true_curr_part_counter * true_curr_part_counter);
+    }
+
+    if (lane_id == 0)
+        scores[my_move_rank] = score;
+}
+
+// see "count_inbound_size_events_kernel"
+__global__
+void count_inbound_size_events_sparse_ppp_kernel(
+    const bitmap* __restrict__ ppp_offsets,
+    const uint32_t* __restrict__ in_ppp,
+    const uint32_t* __restrict__ ev_partition,
+    const uint32_t* __restrict__ ev_index,
+    const uint32_t* __restrict__ ev_hedge,
+    const int32_t* __restrict__ ev_delta,
+    const uint32_t num_events,
+    const uint32_t num_partitions,
+    const uint32_t ppp_per_hedge,
+    uint32_t* inbound_size_events_offsets // init. to zero
+) {
+    // STYLE: one event per thread!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_events) return;
+
+    const uint32_t part = ev_partition[tid];
+
+    // dispose of invalid events
+    if (part == UINT32_MAX) return;
+
+    const uint32_t hedge = ev_hedge[tid];
+    const uint32_t init_hedge_inbound_count = get_ppp(ppp_offsets, in_ppp, ppp_per_hedge, hedge, part);
+
+    uint32_t prev_hedge_inbound_count = init_hedge_inbound_count;
+    if (tid > 0 && ev_partition[tid - 1] == part && ev_hedge[tid - 1] == hedge) // if the previous sum was about the same hedge as mine, consider its updated count in the sequence
+        prev_hedge_inbound_count += ev_delta[tid - 1];
+    uint32_t curr_hedge_inbound_count = init_hedge_inbound_count + ev_delta[tid];
+
+    if (prev_hedge_inbound_count == 0 && curr_hedge_inbound_count > 0 || prev_hedge_inbound_count > 0 && curr_hedge_inbound_count == 0)
+        inbound_size_events_offsets[tid + 1] = 1; // +1 to do an inclusive scan and keep the final count
+}
+
+// see "build_inbound_size_events_kernel"
+__global__
+void build_inbound_size_events_sparse_ppp_kernel(
+    const bitmap* __restrict__ ppp_offsets,
+    const uint32_t* __restrict__ in_ppp,
+    const uint32_t* __restrict__ ev_partition,
+    const uint32_t* __restrict__ ev_index,
+    const uint32_t* __restrict__ ev_hedge,
+    const int32_t* __restrict__ ev_delta,
+    const uint32_t* inbound_size_events_offsets,
+    const uint32_t num_events,
+    const uint32_t num_partitions,
+    const uint32_t ppp_per_hedge,
+    uint32_t* __restrict__ new_ev_partition,
+    uint32_t* __restrict__ new_ev_index,
+    int32_t* __restrict__ new_ev_delta
+) {
+    // STYLE: one event per thread!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_events) return;
+
+    const uint32_t part = ev_partition[tid];
+
+    // dispose of invalid events
+    if (part == UINT32_MAX) return;
+
+    const uint32_t hedge = ev_hedge[tid];
+    const uint32_t init_hedge_inbound_count = get_ppp(ppp_offsets, in_ppp, ppp_per_hedge, hedge, part);
+
+    uint32_t prev_hedge_inbound_count = init_hedge_inbound_count;
+    if (tid > 0 && ev_partition[tid - 1] == part && ev_hedge[tid - 1] == hedge) // if the previous sum was about the same hedge as mine, consider its updated count in the sequence
+        prev_hedge_inbound_count += ev_delta[tid - 1];
+    uint32_t curr_hedge_inbound_count = init_hedge_inbound_count + ev_delta[tid];
+
+    if (prev_hedge_inbound_count == 0 && curr_hedge_inbound_count > 0) {
+        const uint32_t new_ev_offset = inbound_size_events_offsets[tid];
+        new_ev_partition[new_ev_offset] = part;
+        new_ev_index[new_ev_offset] = ev_index[tid];
+        new_ev_delta[new_ev_offset] = 1;
+    } else if (prev_hedge_inbound_count > 0 && curr_hedge_inbound_count == 0) {
+        const uint32_t new_ev_offset = inbound_size_events_offsets[tid];
+        new_ev_partition[new_ev_offset] = part;
+        new_ev_index[new_ev_offset] = ev_index[tid];
+        new_ev_delta[new_ev_offset] = -1;
+    }
 }
