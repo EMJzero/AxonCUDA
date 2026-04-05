@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Assume 'procure_hgraphs.sh' was used to create the "snns" folder
+# Assume 'procure_hgraphs.sh' was used to create the "ispd98_16x" folder
 
 # -------------------------
 # Configuration
@@ -15,9 +15,9 @@ while [[ -L "$SOURCE" ]]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-DATA_DIR="$(cd -P "$SCRIPT_DIR/snns" && pwd)"
+DATA_DIR="$(cd -P "$SCRIPT_DIR/ispd98_16x" && pwd)"
 TARGET_BIN="$(cd -P "$SCRIPT_DIR/.." && pwd)/hgraph_gpu.exe"
-TARGET_ARGS=(-rfr 16 -cnc 4 -dtc -v 0)
+TARGET_ARGS=(-rfr 16 -cnc 4 -dtc -v 0 -smh 0)
 RESULTS_DIR="$DATA_DIR/results_rfr4_cnc16"
 
 PROFILING=0
@@ -147,28 +147,47 @@ run_case() {
 mkdir -p "$RESULTS_DIR"
 
 # -------------------------
-# Custom ANNs
+# ISPD 98 - 16x - k = 2
 # -------------------------
-run_case "8k"          "8k_model"          -r 8k_model_ordered_processed.snn -smh 0
-run_case "64k"         "64k_model"         -r 64k_model_ordered_processed.snn -smh 0
-run_case "256k"        "256k_model"        -r 256k_model_ordered_processed.snn -c loihi84
-run_case "1M"          "1M_model"          -r 1M_model_ordered_processed.snn -c loihi84
-run_case "16M"         "16M_model"         -r 16M_model_ordered_processed.snn -c loihi1024 -smh 12
+run_case "01-k2"        "ispd98_01_k2"        -r ISPD98_ibm01.16xNW.hgr -k 2 0.03 -om 5
+run_case "02-k2"        "ispd98_02_k2"        -r ISPD98_ibm02.16xNW.hgr -k 2 0.03 -om 5
+run_case "03-k2"        "ispd98_03_k2"        -r ISPD98_ibm03.16xNW.hgr -k 2 0.03 -om 5
+run_case "04-k2"        "ispd98_04_k2"        -r ISPD98_ibm04.16xNW.hgr -k 2 0.03 -om 8
+run_case "05-k2"        "ispd98_05_k2"        -r ISPD98_ibm05.16xNW.hgr -k 2 0.03 -om 5
+run_case "06-k2"        "ispd98_06_k2"        -r ISPD98_ibm06.16xNW.hgr -k 2 0.03 -om 5
+run_case "07-k2"        "ispd98_07_k2"        -r ISPD98_ibm07.16xNW.hgr -k 2 0.03 -om 5
+run_case "08-k2"        "ispd98_08_k2"        -r ISPD98_ibm08.16xNW.hgr -k 2 0.03 -om 5
+run_case "09-k2"        "ispd98_09_k2"        -r ISPD98_ibm09.16xNW.hgr -k 2 0.03 -om 5
+run_case "10-k2"        "ispd98_10_k2"        -r ISPD98_ibm10.16xNW.hgr -k 2 0.03 -om 8
+run_case "11-k2"        "ispd98_11_k2"        -r ISPD98_ibm11.16xNW.hgr -k 2 0.03 -om 5
+run_case "12-k2"        "ispd98_12_k2"        -r ISPD98_ibm12.16xNW.hgr -k 2 0.03 -om 5
+run_case "13-k2"        "ispd98_13_k2"        -r ISPD98_ibm13.16xNW.hgr -k 2 0.03 -om 5
+run_case "14-k2"        "ispd98_14_k2"        -r ISPD98_ibm14.16xNW.hgr -k 2 0.03 -om 5
+run_case "15-k2"        "ispd98_15_k2"        -r ISPD98_ibm15.16xNW.hgr -k 2 0.03 -om 5
+run_case "16-k2"        "ispd98_16_k2"        -r ISPD98_ibm16.16xNW.hgr -k 2 0.03 -om 5
+run_case "17-k2"        "ispd98_17_k2"        -r ISPD98_ibm17.16xNW.hgr -k 2 0.03 -om 8
+run_case "18-k2"        "ispd98_18_k2"        -r ISPD98_ibm18.16xNW.hgr -k 2 0.03 -om 8
 
 # -------------------------
-# Classic ANNs
+# ISPD 98 - 16x - k = 4
 # -------------------------
-run_case "LeNet"       "lenet"             -r lenet_cifar_ordered_processed.snn -smh 0
-run_case "VGG11"       "vgg11"             -r vgg11_cifar_model_ordered_processed.snn -c loihi84
-run_case "AlexNet"     "alexnet"           -r alexnet_cifar_ordered_processed.snn -c loihi84
-run_case "MobileNet"   "mobilenet"         -r mobilenet_imagenet_ordered_processed.snn -c loihi1024 -smh 8
-
-# -------------------------
-# SNNs
-# -------------------------
-run_case "16k rand"    "16k_rand"          -r 16384L_rand_reservoir.snn -smh 0
-run_case "64k rand"    "64k_rand"          -r 65536L_rand_reservoir.snn -smh 0
-run_case "256k rand"   "256k_rand"         -r 262144L_rand_reservoir.snn -smh 0
-run_case "Allen V1"    "allen_v1"          -r allen_v1_ordered_processed.snn -c loihi84
+run_case "01-k4"        "ispd98_01_k4"        -r ISPD98_ibm01.16xNW.hgr -k 4 0.03 -om 5
+run_case "02-k4"        "ispd98_02_k4"        -r ISPD98_ibm02.16xNW.hgr -k 4 0.03 -om 5
+run_case "03-k4"        "ispd98_03_k4"        -r ISPD98_ibm03.16xNW.hgr -k 4 0.03 -om 5
+run_case "04-k4"        "ispd98_04_k4"        -r ISPD98_ibm04.16xNW.hgr -k 4 0.03 -om 8
+run_case "05-k4"        "ispd98_05_k4"        -r ISPD98_ibm05.16xNW.hgr -k 4 0.03 -om 5
+run_case "06-k4"        "ispd98_06_k4"        -r ISPD98_ibm06.16xNW.hgr -k 4 0.03 -om 5
+run_case "07-k4"        "ispd98_07_k4"        -r ISPD98_ibm07.16xNW.hgr -k 4 0.03 -om 5
+run_case "08-k4"        "ispd98_08_k4"        -r ISPD98_ibm08.16xNW.hgr -k 4 0.03 -om 5
+run_case "09-k4"        "ispd98_09_k4"        -r ISPD98_ibm09.16xNW.hgr -k 4 0.03 -om 5
+run_case "10-k4"        "ispd98_10_k4"        -r ISPD98_ibm10.16xNW.hgr -k 4 0.03 -om 8
+run_case "11-k4"        "ispd98_11_k4"        -r ISPD98_ibm11.16xNW.hgr -k 4 0.03 -om 5
+run_case "12-k4"        "ispd98_12_k4"        -r ISPD98_ibm12.16xNW.hgr -k 4 0.03 -om 5
+run_case "13-k4"        "ispd98_13_k4"        -r ISPD98_ibm13.16xNW.hgr -k 4 0.03 -om 5
+run_case "14-k4"        "ispd98_14_k4"        -r ISPD98_ibm14.16xNW.hgr -k 4 0.03 -om 5
+run_case "15-k4"        "ispd98_15_k4"        -r ISPD98_ibm15.16xNW.hgr -k 4 0.03 -om 5
+run_case "16-k4"        "ispd98_16_k4"        -r ISPD98_ibm16.16xNW.hgr -k 4 0.03 -om 5
+run_case "17-k4"        "ispd98_17_k4"        -r ISPD98_ibm17.16xNW.hgr -k 4 0.03 -om 8
+run_case "18-k4"        "ispd98_18_k4"        -r ISPD98_ibm18.16xNW.hgr -k 4 0.03 -om 8
 
 echo "All runs completed."

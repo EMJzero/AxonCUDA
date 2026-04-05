@@ -30,7 +30,7 @@
 
 #define SAVE_MEMORY_UP_TO_LEVEL 2 // number of coarsening levels for which to spill non-coarse data structures to the host, set to 0 to disable the feature
 
-#define SMALL_PART_MERGE_SIZE_THRESHOLD 15 // number of nodes below which partitions are considered "small" and an attempt is done at merging them with one-another
+#define SMALL_PART_MERGE_SIZE_THRESHOLD 16 // number of nodes below which partitions are considered "small" and an attempt is done at merging them with one-another
 
 #define KWAY_INIT_UPPER_THREASHOLD 8192 // number of coarse nodes below which to run the initial partitioning algorithm (KWAY model only)
 #define KWAY_INIT_LOWER_THREASHOLD 1024 // number of coarse nodes below which to undo the last coarsening round and run the initial partitioning algorithm (KWAY model only)

@@ -70,6 +70,20 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
     dp_score *d_dp_scores
 );
 
+uint32_t greedyMergeGroups(
+    const runconfig &cfg,
+    const uint32_t *d_nodes_sizes,
+    const uint32_t *d_inbound_count,
+    const uint32_t *d_ungroups,
+    const dim_t *d_ungroups_offsets,
+    const uint32_t curr_num_nodes,
+    const uint32_t new_num_nodes,
+    const uint32_t h_max_nodes_per_part,
+    const uint32_t h_max_inbound_per_part,
+    uint32_t *d_groups,
+    uint32_t *d_groups_sizes
+);
+
 void logGroups(
     const runconfig &cfg,
     const uint32_t *d_pairs,

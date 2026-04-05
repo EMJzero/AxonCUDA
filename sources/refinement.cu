@@ -38,7 +38,7 @@ void refinementRepeats(
     // NOTE: the inbound counters per partition are just the transposed of pins per partition! No need to compute them separately!
     uint32_t *d_pins_per_partitions = nullptr; // matrix<num_hedges x num_partitions>, pins_per_partitions[hedge idx * num_partitions + partition idx] -> count of pins of "hedge" in that "partition"
     const size_t pins_per_partitions_bytes = static_cast<size_t>(num_hedges) * num_partitions * sizeof(uint32_t);
-    //|
+    // |
     // if we are short on memory, go for the sparse pins-per-partition representation
     size_t free_bytes, total_bytes;
     cudaMemGetInfo(&free_bytes, &total_bytes);
@@ -67,7 +67,7 @@ void refinementRepeats(
             d_partitions_inbound_sizes
         );
     }
-    //|
+    // |
     // allocate pins per partition
     CUDA_CHECK(cudaMalloc(&d_pins_per_partitions, pins_per_partitions_bytes));
 
@@ -459,7 +459,7 @@ void refinementRepeats(
         CUDA_CHECK(cudaMalloc(&d_inbound_valid_moves, curr_num_nodes * sizeof(int32_t))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
         CUDA_CHECK(cudaMemset(d_inbound_valid_moves, 0u, curr_num_nodes * sizeof(int32_t)));
         thrust::device_ptr<int32_t> t_inbound_valid_moves(d_inbound_valid_moves);
-        {
+        if(num_inbound_size_events > 0) {
             // launch configuration - flag inbound events kernel
             int threads_per_block = 128;
             int num_threads_needed = num_inbound_size_events; // 1 thread per event
@@ -1052,7 +1052,7 @@ void refinementSparseRepeats(
         CUDA_CHECK(cudaMalloc(&d_inbound_valid_moves, curr_num_nodes * sizeof(int32_t))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
         CUDA_CHECK(cudaMemset(d_inbound_valid_moves, 0u, curr_num_nodes * sizeof(int32_t)));
         thrust::device_ptr<int32_t> t_inbound_valid_moves(d_inbound_valid_moves);
-        {
+        if (num_inbound_size_events > 0) {
             // launch configuration - flag inbound events kernel
             int threads_per_block = 128;
             int num_threads_needed = num_inbound_size_events; // 1 thread per event
@@ -1131,26 +1131,6 @@ void refinementSparseRepeats(
         CUDA_CHECK(cudaFree(d_ranks));
         CUDA_CHECK(cudaFree(d_valid_moves));
         CUDA_CHECK(cudaFree(d_inbound_valid_moves));
-
-        // update offsets bitmaps
-        // GOOD IDEA -> BUT: when updating bitmap bits, some may go to 0, some may go to 1, but you may be setting the same to 0 and 1
-        // => then how can you solve the race condition? There's no way to go check if it was 1 somehow...
-        /*{
-            // launch configuration - pins per partition update kernel
-            int threads_per_block = 128;
-            int num_threads_needed = num_hedges * ppp_per_hedge; // 1 thread per (hedge, part(s)) bitmap
-            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-            // launch - pins per partition update kernel
-            LAUNCH(cfg) << "pins per partition update kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            // NOTE: having this available during FM refinement makes its complexity linear in the connectivity, instead of quadratic!
-            pins_per_partition_update_kernel<<<blocks, threads_per_block>>>(
-                num_hedges,
-                ppp_per_hedge,
-                ppp_offsets
-            );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
-        }*/
     }
 
     CUDA_CHECK(cudaFree(d_ppp_offsets));

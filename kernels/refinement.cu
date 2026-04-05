@@ -720,21 +720,6 @@ void sparse_pins_per_partition_count_kernel(
     }
 }
 
-// for each hedge-partition sparse offset pair, assuming bitmap flg-s to have been update, re-infer the cnt-s
-// SEQUENTIAL COMPLEXITY: e*d
-// PARALLEL OVER: e*d
-/*__global__
-void sparse_pins_per_partition_update_kernel(
-    const uint32_t num_hedges,
-    const uint32_t ppp_per_hedge,
-    bitmap* __restrict__ ppp_offsets
-) {
-    // STYLE: one (hedge, part(s)) bitmap per warp!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_hedges * ppp_per_hedge) return;
-    ppp_offsets[tid].cnt = __popcll(ppp_offsets[tid].flg);
-}*/
-
 // given the sparse pins-per-partiton bitmaps, write the actual ppp counters in the segmented array
 // SEQUENTIAL COMPLEXITY: e*d
 // PARALLEL OVER: e

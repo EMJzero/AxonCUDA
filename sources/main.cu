@@ -24,6 +24,7 @@
 #include "constants.cuh"
 #include "data_types.cuh"
 #include "coarsening.cuh"
+#include "chaining.cuh"
 #include "construction.cuh"
 #include "refinement.cuh"
 #include "init_part.cuh"
@@ -486,6 +487,24 @@ int main(int argc, char** argv) {
             || new_num_nodes == curr_num_nodes
             || (level_idx >= NUMBER_OF_LEVELS_WITH_NO_SHRINK_LIMIT && coarsening_ratio > SHRINK_RATIO_LIMIT)
         ) {
+            // try to further merge partitions (groups) so long as it is allowed by constraints
+            // => here the goal is just to reduce partitions count, no concern about mergees connection strenght
+            if (cfg.initial_partitions_merge) {
+                new_num_nodes = greedyMergeGroups(
+                    cfg,
+                    d_nodes_sizes,
+                    d_inbound_count,
+                    d_ungroups,
+                    d_ungroups_offsets,
+                    curr_num_nodes,
+                    new_num_nodes,
+                    h_max_nodes_per_part,
+                    h_max_inbound_per_part,
+                    d_groups,
+                    d_groups_sizes
+                );
+            }
+
             // HERE we repurpose the coarsening routine as the routine for initial partitions:
             // - num_partitions = new_num_nodes
             // - partitions = groups
@@ -766,82 +785,23 @@ int main(int argc, char** argv) {
         d_nodes_sizes
     );
 
-    // final partitions rework: merge small ones and make partition ids zero-based
-    thrust::device_ptr<uint32_t> t_partitions(d_partitions);
-    thrust::device_ptr<uint32_t> t_partitions_sizes(d_partitions_sizes);
-    thrust::device_ptr<uint32_t> t_partitions_inbound_sizes(d_partitions_inbound_sizes);
 
     if (cfg.mode == Mode::INCC) {
-        // greedily merge small partitions
-        // => checking inbound constraints w/out deduping, with a straight sum, to make it fast
-        thrust::device_vector<uint32_t> t_part_index(num_partitions);
-        thrust::sequence(t_part_index.begin(), t_part_index.end());
-        // extract small partitions (size < K)
-        thrust::device_vector<uint32_t> t_small_parts(num_partitions);
-        auto small_end = thrust::copy_if(t_part_index.begin(), t_part_index.end(), t_small_parts.begin(), [=] __host__ __device__ (uint32_t p) { return t_partitions_sizes[p] < SMALL_PART_MERGE_SIZE_THRESHOLD; });
-        t_small_parts.resize(small_end - t_small_parts.begin());
-        uint32_t smallest_part_size = thrust::reduce(t_partitions_sizes, t_partitions_sizes + num_partitions, UINT32_MAX, thrust::minimum<uint32_t>());
-        INFO(cfg) std::cout << "Smallest partition size: " << smallest_part_size << "\n";
-        if (!t_small_parts.empty()) {
-            INFO(cfg) std::cout << "Partitions compression over " << t_small_parts.size() << " partitions ...\n";
-            // stable sort small partitions with key (size, inbound, id)
-            thrust::stable_sort(
-                t_small_parts.begin(), t_small_parts.end(),
-                [=] __host__ __device__ (uint32_t a, uint32_t b) {
-                    uint32_t sa = t_partitions_sizes[a];
-                    uint32_t sb = t_partitions_sizes[b];
-                    if (sa != sb) return sa < sb;
-                    uint32_t ia = t_partitions_inbound_sizes[a];
-                    uint32_t ib = t_partitions_inbound_sizes[b];
-                    if (ia != ib) return ia < ib; return a < b;
-                }
-            );
-            // greedy grouping scan for constraints
-            thrust::device_vector<constraints_state> t_constraints_states(t_small_parts.size());
-            thrust::transform(
-                t_small_parts.begin(), t_small_parts.end(), t_constraints_states.begin(),
-                [=] __host__ __device__ (uint32_t p) {
-                    return constraints_state{ t_partitions_sizes[p], t_partitions_inbound_sizes[p], 0u };
-                }
-            );
-            thrust::inclusive_scan(
-                t_constraints_states.begin(), t_constraints_states.end(), t_constraints_states.begin(),
-                [=] __host__ __device__ (const constraints_state& a, const constraints_state& b) {
-                    if (a.s + b.s <= h_max_nodes_per_part && a.i + b.i <= h_max_inbound_per_part) return constraints_state{ a.s + b.s, a.i + b.i, a.g };
-                    return constraints_state{ b.s, b.i, a.g + 1 };
-                }
-            );
-            // get the id of each node of a group
-            thrust::device_vector<uint32_t> t_groups(t_constraints_states.size());
-            thrust::transform(
-                t_constraints_states.begin(), t_constraints_states.end(), t_groups.begin(),
-                [] __host__ __device__ (const constraints_state& s) { return s.g; }
-            );
-            // map groups to a representative partition id (lowest id in the group); groups are already contiguous, a single reduce-by-key is enough
-            thrust::device_vector<uint32_t> t_rep_ids(t_groups.size());
-            auto rep_end = thrust::reduce_by_key(
-                t_groups.begin(), t_groups.end(), t_small_parts.begin(),
-                thrust::make_discard_iterator(), t_rep_ids.begin(),
-                thrust::equal_to<uint32_t>(), thrust::minimum<uint32_t>()
-            );
-            t_rep_ids.resize(rep_end.second - t_rep_ids.begin());
-            // build the map from partition id to the representative node
-            thrust::device_vector<uint32_t> pid_map(num_partitions);
-            thrust::sequence(pid_map.begin(), pid_map.end());
-            thrust::device_vector<uint32_t> new_pids(t_small_parts.size());
-            thrust::gather(t_groups.begin(), t_groups.end(), t_rep_ids.begin(), new_pids.begin());
-            thrust::scatter(new_pids.begin(), new_pids.end(), t_small_parts.begin(), pid_map.begin());
-            // update partitions
-            uint32_t* pid_map_ptr = thrust::raw_pointer_cast(pid_map.data());
-            thrust::transform(
-                t_partitions, t_partitions + num_nodes, t_partitions,
-                [pid_map_ptr] __host__ __device__ (uint32_t p) { return pid_map_ptr[p]; }
-            );
-        } else
-            INFO(cfg) std::cout << "Partitions compression not performed ...\n";
+        // final partitions rework: merge small ones and make partition ids zero-based
+        merge_small_partitions(
+            cfg,
+            d_partitions_sizes,
+            d_partitions_inbound_sizes,
+            num_nodes,
+            num_partitions,
+            h_max_nodes_per_part,
+            h_max_inbound_per_part,
+            d_partitions
+        );
     }
 
     // make d_partitions zero-based again, if we emptied some partitions... (same logic as that used for d_groups)
+    thrust::device_ptr<uint32_t> t_partitions(d_partitions);
     thrust::device_vector<uint32_t> t_indices(num_nodes);
     thrust::sequence(t_indices.begin(), t_indices.end());
     thrust::sort_by_key(t_partitions, t_partitions + num_nodes, t_indices.begin());

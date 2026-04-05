@@ -32,383 +32,6 @@
 #include "chaining.cuh"
 
 
-// for each node, randomly assign it to the first partition that still has space
-// SEQUENTIAL COMPLEXITY: n*p (worst case linear scan)
-// PARALLEL OVER: n
-__global__
-void init_partitions_random(
-    const uint32_t num_nodes,
-    const uint32_t seed,
-    const uint32_t num_partitions,
-    const uint32_t* __restrict__ nodes_sizes, // node_sizes[idx] is how many original nodes the idx coarse node contains
-    uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
-    uint32_t* __restrict__ partitions_sizes, // partitions_remaining_space[idx] is how many nodes (by size) are in partition idx
-    bool* __restrict__ fail // set when one node cannot be assigned
-) {
-    // STYLE: one node per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
-
-    uint32_t x = seed ^ tid;
-    auto rng = [&]() {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        return x;
-    };
-    
-    const uint32_t my_size = nodes_sizes[tid];
-    
-    // try random partitions
-    for (int t = 0; t < 8; t++) {
-        const uint32_t part = rng() % num_partitions;
-        const uint32_t old = atomicAdd(&partitions_sizes[part], my_size);
-        if (old + my_size <= max_nodes_per_part) {
-            partitions[tid] = part;
-            return;
-        }
-        atomicSub(&partitions_sizes[part], my_size);
-    }
-
-    // fallback: linear scan
-    rng();
-    for (uint32_t p = 0; p < num_partitions; p++) {
-        const uint32_t part = (p + x) % num_partitions;
-        const uint32_t old = atomicAdd(&partitions_sizes[part], my_size);
-        if (old + my_size <= max_nodes_per_part) {
-            partitions[tid] = part;
-            return;
-        }
-        atomicSub(&partitions_sizes[part], my_size);
-    }
-
-    //assert(false && "Could not fit every node in the available partitions!");
-    *fail = true;
-}
-
-// for each hyperedge, count how many of its pins are in each partition
-// SEQUENTIAL COMPLEXITY: e*d
-// PARALLEL OVER: e
-__global__
-void pins_per_partition_only_kernel(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
-    const uint32_t num_hedges,
-    const uint32_t num_partitions,
-    uint32_t* __restrict__ pins_per_partitions // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
-) {
-    // STYLE: one hedge per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_hedges) return;
-
-    const dim_t hedge_start_idx = hedges_offsets[tid], hedge_end_idx = hedges_offsets[tid + 1];
-    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
-    uint32_t *my_pins_per_partitions = pins_per_partitions + tid * num_partitions;
-
-    for (const uint32_t* curr = hedge_start; curr < hedge_end; curr++) {
-        const uint32_t part = partitions[*curr];
-        atomicAdd(&my_pins_per_partitions[part], 1);
-    }
-}
-
-// apply moves within the size constraint
-// SEQUENTIAL COMPLEXITY: n*h
-// PARALLEL OVER: n
-__global__
-void jacobi_apply_moves_kernel(
-    const uint32_t* __restrict__ touching,
-    const dim_t* __restrict__ touching_offsets,
-    const uint32_t* __restrict__ nodes_sizes,
-    const uint32_t* __restrict__ moves,
-    const uint32_t* __restrict__ partitions_sizes_aux, // -> this is now the node sizes scan + initial partition size = final partition size if a move is applied
-    const uint32_t* __restrict__ move_srcs,
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
-    uint32_t* __restrict__ partitions_sizes,
-    uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
-    bool* __restrict__ continue_flag,
-    uint64_t* __restrict__ partitions_hash
-) {
-    // STYLE: one node (move) per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
-
-    // block-level hash
-    __shared__ uint64_t blk_partitions_hash;
-    if (threadIdx.x == 0) blk_partitions_hash = 0;
-    __syncthreads();
-
-    const uint32_t dst_part = moves[tid];
-    const uint32_t final_part_size = partitions_sizes_aux[tid];
-    const uint32_t node = move_srcs[tid];
-
-    // filter out null moves AND stop at the first move that would push partition size beyond constraints
-    if (dst_part == UINT32_MAX || final_part_size > max_nodes_per_part) {
-        uint64_t hash = hash_uint64((uint64_t)partitions[node] ^ (uint64_t(node) << 32));
-        atomicXor((unsigned long long*)&blk_partitions_hash, (unsigned long long)hash);
-    } else {
-        // if this is a valid move, set the flag
-        *continue_flag = true;
-        
-        const uint32_t my_size = nodes_sizes[node];
-        const uint32_t src_part = partitions[node];
-
-        // update partition sizes
-        atomicAdd(&partitions_sizes[dst_part], my_size);
-        atomicSub(&partitions_sizes[src_part], my_size);
-
-        // update my partition
-        partitions[node] = dst_part;
-        uint64_t hash = hash_uint64((uint64_t)dst_part ^ (uint64_t(node) << 32));
-        atomicXor((unsigned long long*)&blk_partitions_hash, (unsigned long long)hash);
-
-        const uint32_t* my_touching = touching + touching_offsets[node];
-        const uint32_t* not_my_touching = touching + touching_offsets[node + 1];
-
-        // scan touching hyperedges and update pins_per_partitions counts
-        for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-            const uint32_t actual_hedge_idx = *hedge_idx;
-            atomicAdd(&pins_per_partitions[actual_hedge_idx * num_partitions + dst_part], 1);
-            atomicSub(&pins_per_partitions[actual_hedge_idx * num_partitions + src_part], 1);
-        }
-    }
-
-    __syncthreads();
-    if (threadIdx.x == 0) atomicXor((unsigned long long*)partitions_hash, (unsigned long long)blk_partitions_hash);
-}
-
-// apply moves with a positive gain
-// SEQUENTIAL COMPLEXITY: n*h
-// PARALLEL OVER: n
-__global__
-void fm_refinement_apply_update_kernel(
-    const uint32_t* __restrict__ touching,
-    const dim_t* __restrict__ touching_offsets,
-    const uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
-    const uint32_t* __restrict__ move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
-    const uint32_t* __restrict__ nodes_sizes,
-    const uint32_t num_hedges,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    const uint32_t num_good_moves, // idx + 1 of the maximum in the updated scores
-    uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
-    uint32_t* __restrict__ partitions_sizes,
-    uint32_t* __restrict__ pins_per_partitions, // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
-    uint64_t* __restrict__ partitions_hash
-) {
-    // STYLE: one node (move) per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
-    
-    // block-level hash
-    __shared__ uint64_t blk_partitions_hash;
-    if (threadIdx.x == 0) blk_partitions_hash = 0;
-    __syncthreads();
-    
-    const uint32_t my_partition = partitions[tid];
-    const uint32_t my_move_part = moves[tid];
-    const uint32_t my_size = nodes_sizes[tid];
-
-    // stop at the last gain-increasing move
-    // TODO: remove "moves[tid] == UINT32_MAX", it's redundant and here "just in case", invalid moves should always be outside of num_good_moves
-    if (move_ranks[tid] >= num_good_moves || my_move_part == UINT32_MAX) {
-        uint64_t hash = hash_uint64((uint64_t)my_partition ^ (uint64_t(tid) << 32));
-        atomicXor((unsigned long long*)&blk_partitions_hash, (unsigned long long)hash);
-    } else {
-        // update partition sizes
-        atomicSub(&partitions_sizes[my_partition], my_size);
-        atomicAdd(&partitions_sizes[my_move_part], my_size);
-        
-        // update my partition
-        partitions[tid] = my_move_part;
-        uint64_t hash = hash_uint64((uint64_t)my_move_part ^ (uint64_t(tid) << 32));
-        atomicXor((unsigned long long*)&blk_partitions_hash, (unsigned long long)hash);
-
-        const uint32_t* my_touching = touching + touching_offsets[tid];
-        const uint32_t* not_my_touching = touching + touching_offsets[tid + 1];
-        
-        // scan touching hyperedges and update pins_per_partitions counts
-        for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-            const uint32_t actual_hedge_idx = *hedge_idx;
-            atomicSub(&pins_per_partitions[actual_hedge_idx * num_partitions + my_partition], 1);
-            atomicAdd(&pins_per_partitions[actual_hedge_idx * num_partitions + my_move_part], 1);
-        }
-    }
-    
-    __syncthreads();
-    if (threadIdx.x == 0) atomicXor((unsigned long long*)partitions_hash, (unsigned long long)blk_partitions_hash);
-}
-
-// compute for each hedge a score proportional to how "rare" are its nodes:
-// score(e) = w(e) / (\sum_{n \in e} 1/deg(n))
-// SEQUENTIAL COMPLEXITY: e*d
-// PARALLEL OVER: e
-// WARPS OVER: d
-__global__
-void armonic_degree_score_kernel(
-    const uint32_t* __restrict__ hedges,
-    const dim_t* __restrict__ hedges_offsets,
-    const dim_t* __restrict__ touching_offsets,
-    const float* __restrict__ hedge_weights,
-    const uint32_t num_hedges,
-    float* __restrict__ hedge_ratio
-) {
-    // STYLE: one hedge per warp!
-    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the hedge to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_hedges) return;
-
-    const dim_t hedge_start_idx = hedges_offsets[warp_id], hedge_end_idx = hedges_offsets[warp_id + 1];
-    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
-
-    float score = 0.0f;
-
-    for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_end; curr += WARP_SIZE) {
-        const uint32_t pin = *curr;
-        const uint32_t deg = touching_offsets[pin + 1] - touching_offsets[pin];
-        score += 1/(float)deg;
-    }
-
-    score = warpReduceSumLN0<float>(score);
-    
-    if (lane_id == 0)
-        hedge_ratio[warp_id] = hedge_weights[warp_id] / score;
-        //hedge_score[warp_id] = 1/score;
-}
-
-// flag each hedge as 'keep' or 'prune' with a probability conditioned on its weight and score
-// SEQUENTIAL COMPLEXITY: e
-// PARALLEL OVER: e
-__global__
-void prune_hedges_kernel(
-    const float* __restrict__ hedge_weights,
-    const float* __restrict__ hedge_ratio,
-    const uint32_t num_hedges,
-    const float threshold,
-    const uint32_t seed,
-    float* __restrict__ hedge_scaled_weights,
-    uint8_t* __restrict__ keep
-) {
-    // STYLE: one hedge per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_hedges) return;
-
-    // probability of keeping the hedge: p(e) = min(1, threshold * w(e) / score(e))
-
-    const float keep_prob = min(1.0f, threshold * hedge_ratio[tid]);
-
-    // sample random float in (0, 1]
-    curandStatePhilox4_32_10_t state;
-    curand_init(seed, tid, 0, &state);
-    const float rand = curand_uniform(&state);
-
-    keep[tid] = keep_prob >= rand;
-    hedge_scaled_weights[tid] = hedge_weights[tid] / keep_prob; // rescale weights (lower probability -> higher weight)
-}
-
-// quickly compute the connectivity resulting from a given partitioning
-// SEQUENTIAL COMPLEXITY: e*p
-// PARALLEL OVER: e
-__global__
-void compute_connectivity_kernel(
-    const uint32_t* __restrict__ pins_per_partitions,
-    const float* __restrict__ hedge_weights,
-    const uint32_t num_hedges,
-    const uint32_t num_partitions,
-    float* __restrict__ connectivity // connectivity[idx] -> total cut cost paid by the idx-th group of block-size hedges
-) {
-    // STYLE: one hedge per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_hedges) return;
-
-    __shared__ float blk_conn;
-    if (threadIdx.x == 0) blk_conn = 0.0f;
-    __syncthreads();
-
-    uint32_t lambda = 0;
-    const float hedge_weight = hedge_weights[tid];
-
-    for (uint32_t p = 0u; p < num_partitions; p++) {
-        if (pins_per_partitions[tid * num_partitions + p] > 0)
-            lambda++;
-    }
-
-    atomicAdd(&blk_conn, lambda > 0 ? hedge_weight*(lambda - 1) : 0.0f);
-
-    __syncthreads();
-    if (threadIdx.x == 0) connectivity[blockIdx.x] = blk_conn;
-}
-
-void log_partitions(
-    const uint32_t num_nodes,
-    const uint32_t max_parts,
-    const uint32_t h_max_nodes_per_part,
-    const uint32_t* d_partitions,
-    const uint32_t* d_partitions_sizes,
-    std::string text,
-    const cudaStream_t stream
-) {
-    std::vector<uint32_t> partitions_tmp(num_nodes);
-    CUDA_CHECK(cudaMemcpyAsync(partitions_tmp.data(), d_partitions, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-    std::vector<uint32_t> partitions_sizes_tmp(max_parts);
-    CUDA_CHECK(cudaMemcpyAsync(partitions_sizes_tmp.data(), d_partitions_sizes, max_parts * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::unordered_map<uint32_t, int> part_count;
-    std::cout << text << ":\n";
-    for (uint32_t i = 0; i < num_nodes; ++i) {
-        uint32_t part = partitions_tmp[i];
-        part_count[part]++;
-        if (i < std::min<uint32_t>(num_nodes, VERBOSE_INIT_LENGTH)) {
-            std::cout << "  node " << i << " -> " << part;
-            std::cout << ((i + 1) % 4 == 0 ? "\n" : "\t");
-        }
-    }
-    for (uint32_t i = 0; i < max_parts; ++i) {
-        uint32_t part_size = partitions_sizes_tmp[i];
-        if (part_size > h_max_nodes_per_part)
-            std::cerr << "  WARNING, max partition size constraint (" << h_max_nodes_per_part << ") violated by part=" << i << " with part_size=" << part_size << " !!\n";
-    }
-    int max_ps = part_count.empty() ? 0 : std::max_element(part_count.begin(), part_count.end(), [](auto &a, auto &b){ return a.second < b.second; })->second;
-    std::cout << "Non-empty partitions count: " << part_count.size() << ", Max partition size: " << max_ps << "\n";
-    std::vector<uint32_t>().swap(partitions_tmp);
-    std::vector<uint32_t>().swap(partitions_sizes_tmp);
-    std::unordered_map<uint32_t, int>().swap(part_count);
-}
-
-float compute_connectivity(
-    const runconfig &cfg,
-    const uint32_t max_parts,
-    const uint32_t num_hedges,
-    const uint32_t* d_pins_per_partitions,
-    const float* d_hedge_weights,
-    const cudaStream_t stream
-) {
-    float* d_connectivity;
-    // launch configuration - fm-ref gains kernel
-    int threads_per_block = 1024;
-    int num_threads_needed = num_hedges; // 1 thread per hedge
-    int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-    CUDA_CHECK(cudaMallocAsync(&d_connectivity, blocks * sizeof(float), stream)); // first reduce inside each block, then across blocks with thrust
-    // launch - fm-ref gains kernel
-    LAUNCH(cfg) << "compute connectivity kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-    compute_connectivity_kernel<<<blocks, threads_per_block, 0, stream>>>(
-        d_pins_per_partitions,
-        d_hedge_weights,
-        num_hedges,
-        max_parts,
-        d_connectivity // connectivity[idx] -> total cut cost paid by the idx-th partition
-    );
-    CUDA_CHECK(cudaGetLastError());
-    thrust::device_ptr<float> t_connectivity(d_connectivity);
-    float conn = thrust::reduce(thrust::cuda::par.on(stream), t_connectivity, t_connectivity + blocks);
-    CUDA_CHECK(cudaFreeAsync(d_connectivity, stream));
-    return conn;
-}
-
 // Best-Fit-Decreasing bin packing with single-node repair
 // => returns true on successful construction, false otherwise
 bool pack_bins_bfd(
@@ -416,8 +39,8 @@ bool pack_bins_bfd(
     uint32_t num_nodes,
     uint32_t max_parts,
     uint32_t max_part_size,
-    uint32_t *partitions,        // out: length >= num_nodes
-    uint32_t *partitions_sizes,  // out: length >= max_parts
+    uint32_t *partitions, // out: length >= num_nodes
+    uint32_t *partitions_sizes, // out: length >= max_parts
     uint32_t seed,
     unsigned max_repair_attempts = 64
 ) {
@@ -555,6 +178,9 @@ bool pack_bins_bfd(
 
     return true;
 }
+
+
+// OLD METHOD
 
 // initial partitioning for the k-way balanced version (no inbound constraint)
 std::tuple<uint32_t*, uint32_t*> initial_partitioning(
@@ -720,7 +346,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
 
             // =============================
             // print some temporary results
-            LOG(cfg) log_partitions(
+            LOG(cfg) logInitPartitions(
                 num_nodes,
                 max_parts,
                 h_max_nodes_per_part,
@@ -850,7 +476,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
             // =============================
             // print some temporary results
             LOG(cfg) {
-                log_partitions(num_nodes, max_parts, h_max_nodes_per_part, d_partitions, d_partitions_sizes, "Post-jacobi partitioning", stream);
+                logInitPartitions(num_nodes, max_parts, h_max_nodes_per_part, d_partitions, d_partitions_sizes, "Post-jacobi partitioning", stream);
                 float log_conn = compute_connectivity(cfg, max_parts, num_hedges, d_pins_per_partitions, d_hedge_weights, stream);
                 std::cout << "Post-jacobi connectivity: " << std::fixed << std::setprecision(3) << log_conn << " (thread=" << tid << ")\n";
             }
@@ -1040,7 +666,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
 
             // =============================
             // print some temporary results
-            LOG(cfg) log_partitions(
+            LOG(cfg) logInitPartitions(
                 num_nodes,
                 max_parts,
                 h_max_nodes_per_part,
@@ -1099,6 +725,9 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
     INFO(cfg) std::cout << "Completed initial partitioning, connectivity=" << std::fixed << std::setprecision(3) << best_conn << "\n";
     return std::make_tuple(d_best_partitions, d_best_partitions_sizes);
 }
+
+
+// MT-KAHYPAR
 
 // initial partitioning for the k-way balanced version via Mt-KaHyPar
 std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
@@ -1321,4 +950,73 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
 
     INFO(cfg) std::cout << "Completed initial partitioning via Mt-KaHyPar !\n";
     return std::make_tuple(d_partitions, d_partitions_sizes);
+}
+
+
+// HELPERS
+
+void logInitPartitions(
+    const uint32_t num_nodes,
+    const uint32_t max_parts,
+    const uint32_t h_max_nodes_per_part,
+    const uint32_t* d_partitions,
+    const uint32_t* d_partitions_sizes,
+    std::string text,
+    const cudaStream_t stream
+) {
+    std::vector<uint32_t> partitions_tmp(num_nodes);
+    CUDA_CHECK(cudaMemcpyAsync(partitions_tmp.data(), d_partitions, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    std::vector<uint32_t> partitions_sizes_tmp(max_parts);
+    CUDA_CHECK(cudaMemcpyAsync(partitions_sizes_tmp.data(), d_partitions_sizes, max_parts * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::unordered_map<uint32_t, int> part_count;
+    std::cout << text << ":\n";
+    for (uint32_t i = 0; i < num_nodes; ++i) {
+        uint32_t part = partitions_tmp[i];
+        part_count[part]++;
+        if (i < std::min<uint32_t>(num_nodes, VERBOSE_INIT_LENGTH)) {
+            std::cout << "  node " << i << " -> " << part;
+            std::cout << ((i + 1) % 4 == 0 ? "\n" : "\t");
+        }
+    }
+    for (uint32_t i = 0; i < max_parts; ++i) {
+        uint32_t part_size = partitions_sizes_tmp[i];
+        if (part_size > h_max_nodes_per_part)
+            std::cerr << "  WARNING, max partition size constraint (" << h_max_nodes_per_part << ") violated by part=" << i << " with part_size=" << part_size << " !!\n";
+    }
+    int max_ps = part_count.empty() ? 0 : std::max_element(part_count.begin(), part_count.end(), [](auto &a, auto &b){ return a.second < b.second; })->second;
+    std::cout << "Non-empty partitions count: " << part_count.size() << ", Max partition size: " << max_ps << "\n";
+    std::vector<uint32_t>().swap(partitions_tmp);
+    std::vector<uint32_t>().swap(partitions_sizes_tmp);
+    std::unordered_map<uint32_t, int>().swap(part_count);
+}
+
+float compute_connectivity(
+    const runconfig &cfg,
+    const uint32_t max_parts,
+    const uint32_t num_hedges,
+    const uint32_t* d_pins_per_partitions,
+    const float* d_hedge_weights,
+    const cudaStream_t stream
+) {
+    float* d_connectivity;
+    // launch configuration - fm-ref gains kernel
+    int threads_per_block = 1024;
+    int num_threads_needed = num_hedges; // 1 thread per hedge
+    int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+    CUDA_CHECK(cudaMallocAsync(&d_connectivity, blocks * sizeof(float), stream)); // first reduce inside each block, then across blocks with thrust
+    // launch - fm-ref gains kernel
+    LAUNCH(cfg) << "compute connectivity kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    compute_connectivity_kernel<<<blocks, threads_per_block, 0, stream>>>(
+        d_pins_per_partitions,
+        d_hedge_weights,
+        num_hedges,
+        max_parts,
+        d_connectivity // connectivity[idx] -> total cut cost paid by the idx-th partition
+    );
+    CUDA_CHECK(cudaGetLastError());
+    thrust::device_ptr<float> t_connectivity(d_connectivity);
+    float conn = thrust::reduce(thrust::cuda::par.on(stream), t_connectivity, t_connectivity + blocks);
+    CUDA_CHECK(cudaFreeAsync(d_connectivity, stream));
+    return conn;
 }

@@ -37,6 +37,7 @@ namespace config {
         uint32_t refine_repeats; // number of repetitions for the refinement routine per level
         uint32_t save_memory_up_to_level; // number of levels for which to temporarily move the initial hypergraph to the host before recursing
         bool device_touching_construction; // whether to construct touching/incidence sets on the device or the host
+        bool initial_partitions_merge; // whether to greedily merge initial partitions to minimize their number
         bool verbose_logs; // whether to log what is happening inside the algorithms
         bool verbose_info; // whether to log the step/phase where the program is at
         bool verbose_errs_and_warns; // whether to log errs and warnings

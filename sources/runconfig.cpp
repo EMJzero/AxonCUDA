@@ -39,7 +39,8 @@ namespace config {
             "  -cnc <num>  Set the count of candidates proposed per node during coarsening\n"
             "  -rfr <num>  Set the number of refinement repetitions per level\n"
             "  -smh <lvl>  Recover device memory by migrating to the host the pre-coarsening hypergraph up the provided level\n"
-            "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
+            "  -dtc        When set, construct touching sets on the device, rather than on the host (faster - uses more device memory)\n"
+            "  -ipm        When set, initial partitions are greedily merged to reduce their number (and save memory - minor quality loss)\n"
             "  -v <lvl>    Set the verbosity level: 0 metrics only, 1 steps and phases, 2 kernel launches, 3  \n"
             "  -h          Show this help message\n";
     }
@@ -59,6 +60,7 @@ namespace config {
         uint32_t refine_repeats = REFINE_REPEATS;
         uint32_t save_memory_up_to_level = SAVE_MEMORY_UP_TO_LEVEL;
         bool device_touching_construction = false;
+        bool initial_partitions_merge = false;
         bool verbose_logs = VERBOSE_LOGS;
         bool verbose_info = VERBOSE_INFO;
         bool verbose_errs_and_warns = VERBOSE_ERRS;
@@ -111,6 +113,8 @@ namespace config {
                 save_memory_up_to_level = std::stoul(argv[++i]);
             } else if (arg == "-dtc") {
                 device_touching_construction = true;
+            } else if (arg == "-ipm") {
+                initial_partitions_merge = true;
             } else if (arg == "-v") {
                 if (i + 1 >= argc) { std::cerr << "Error: -v requires a positive value between 0 and 3\n"; std::exit(1); }
                 int verbosity = std::stoul(argv[++i]);
@@ -138,6 +142,7 @@ namespace config {
             refine_repeats,
             save_memory_up_to_level,
             device_touching_construction,
+            initial_partitions_merge,
             verbose_logs,
             verbose_info,
             verbose_errs_and_warns,
