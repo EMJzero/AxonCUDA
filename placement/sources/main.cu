@@ -64,6 +64,14 @@ int main(int argc, char** argv) {
     std::cout << "  Routing energy, latency: " << std::fixed << std::setprecision(3) << hw.energyPerRouting() << " pJ, " << hw.latencyPerRouting() << " ns\n";
     std::cout << "  Wire energy, latency:    " << std::fixed << std::setprecision(3) << hw.energyPerWire() << " pJ, " << hw.latencyPerWire() << " ns\n";
 
+    std::cout << "Using settings:\n";
+    std::cout << "  Seed:                            " << cfg.seed << "\n";
+    std::cout << "  Force-directed iterations:       " << cfg.fd_iterations << "\n";
+    std::cout << "  Force-directed candidates count: " << cfg.candidates_count << "\n";
+    std::cout << "  Multi-start attempts:            " << cfg.multi_start_override << "\n";
+    std::cout << "  Label propagation repeats:       " << cfg.labelprop_repeats << "\n";
+    std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc, " : "") << (cfg.feedforward_order ? "ff " : "") << "\n";
+
     if (hg.nodes() > hw.coresAlongX() * hw.coresAlongY()) {
         ERR(cfg) std::cerr << "ERROR, the hypergraph has more nodes (" << hg.nodes() << ") than the 2D lattice has points (" << hw.coresAlongX() * hw.coresAlongY() << "), placement would fail !!\n";
         return 1;
@@ -77,11 +85,18 @@ int main(int argc, char** argv) {
     std::cout << "  Found " << device_cnt << " devices: using device " << DEVICE_ID << "\n";
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, DEVICE_ID);
-    std::cout << "  Dev. name " << props.name << "\n";
-    std::cout << "  Available VRAM: " << std::fixed << std::setprecision(1) << (float)(props.totalGlobalMem) / (1 << 30) << " GB\n";
-    std::cout << "  Shared mem. per block: " << std::fixed << std::setprecision(1) << (float)(props.sharedMemPerBlock) / (1 << 10) << " KB\n";
-    std::cout << "  Max. grid size: " << props.maxGridSize[0] << " x " << props.maxGridSize[1] << " x " << props.maxGridSize[2] << "\n";
-    std::cout << "  Max. block size: " << props.maxThreadsDim[0] << " x " << props.maxThreadsDim[1] << " x " << props.maxThreadsDim[2] << "\n";
+    std::cout << "  Device name:            " << props.name << "\n";
+    std::cout << "  GPU clock rate:         " << props.clockRate / 1e3 << " MHz\n";
+    std::cout << "  Available VRAM:         " << std::fixed << std::setprecision(1) << (float)(props.totalGlobalMem) / (1 << 30) << " GB\n";
+    const float peak_bandwidth = 2.0f * props.memoryClockRate * (props.memoryBusWidth / 8) / 1e6;
+    std::cout << "  Peak VRAM bandwidth:    " << peak_bandwidth << " GB/s\n";
+    std::cout << "  SM count:               " << props.multiProcessorCount << "\n";
+    std::cout << "  Max. threads / SM:      " << props.maxThreadsPerMultiProcessor << "\n";
+    std::cout << "  Max. threads / block:   " << props.maxThreadsPerBlock << "\n";
+    std::cout << "  MAx. registers / block: " << props.regsPerBlock << "\n";
+    std::cout << "  Max. grid size:         " << props.maxGridSize[0] << " x " << props.maxGridSize[1] << " x " << props.maxGridSize[2] << "\n";
+    std::cout << "  Max. block size:        " << props.maxThreadsDim[0] << " x " << props.maxThreadsDim[1] << " x " << props.maxThreadsDim[2] << "\n";
+    std::cout << "  Shared mem. per block:  " << std::fixed << std::setprecision(1) << (float)(props.sharedMemPerBlock) / (1 << 10) << " KB\n";
     
     INFO(cfg) std::cout << "Preparing hypergraph data...\n";
 

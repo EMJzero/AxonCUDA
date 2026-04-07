@@ -81,8 +81,6 @@ File format details can be found in comments near the end of [`hgraph.hpp`](./in
 
 Or you could just go under [`hgraphs`](./includes/hgraphs) and run:
 ```sh
-# make the script executable
-chmod +x procure_hgraphs.sh
 # fetch all hypergraphs (expected space required: 33GB of SNNs + 1GB of ISPD98)
 ./procure_hgraphs.sh
 ```
@@ -164,7 +162,7 @@ We refer to refinement gains in two ways:
 | LenNet | loihi64 | <code style="color : lime">ok</code> | 3119.209 | 509.088 |  |
 | VGG11 | loihi84 | <code style="color : lime">ok</code> | 56090.449 | 90792.703 |  |
 | AlexNet | loihi84 | <code style="color : lime">ok</code> | 16433.236 | 124265.188 |  |
-| MobileNet | loihi84 | <code style="color : red">ko</code> |  |  | not even with `-dtc`, `-cnc 16`, `-m 262144 1048576 7056`, and `PATH_SIZE 4096u` |
+| MobileNet | loihi84 | <code style="color : red">ko</code> | 3576531.750 | 428241.688 | requires `-dtc`, `-smh 12`, `-ipm`, `PATH_SIZE 4096u` |
 | Allen V1 | loihi84 | <code style="color : lime">ok</code> | 6220.164 | 42259.551 | requires `-cnc 16` |
 | 16k-rand | loihi64 | <code style="color : lime">ok</code> | 76390.469 | 902.341 |  |
 | 64k-rand | loihi64 | <code style="color : lime">ok</code> | 651617.500 | 2917.872 |  |

@@ -28,6 +28,7 @@
 #include "construction.cuh"
 #include "refinement.cuh"
 #include "init_part.cuh"
+#include "postprocess.cuh"
 
 using namespace hgraph;
 using namespace constraints;
@@ -65,6 +66,8 @@ int main(int argc, char** argv) {
     std::cout << "  Candidates count:            " << cfg.candidates_count << "\n";
     std::cout << "  Refinement repetitions:      " << cfg.refine_repeats << "\n";
     std::cout << "  Oversized multiplier factor: " << std::fixed << std::setprecision(2) << cfg.oversized_multiplier << "\n";
+    std::cout << "  Host memory spill levels:    " << cfg.save_memory_up_to_level << "\n";
+    std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc, " : "") << (cfg.initial_partitions_merge ? "ipm " : "") << "\n";
 
     std::cout << "CUDA device:\n";
     
@@ -74,11 +77,18 @@ int main(int argc, char** argv) {
     std::cout << "  Found " << device_cnt << " devices: using device " << DEVICE_ID << "\n";
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, DEVICE_ID);
-    std::cout << "  Device name: " << props.name << "\n";
-    std::cout << "  Available VRAM: " << std::fixed << std::setprecision(1) << (float)(props.totalGlobalMem) / (1 << 30) << " GB\n";
-    std::cout << "  Shared mem. per block: " << std::fixed << std::setprecision(1) << (float)(props.sharedMemPerBlock) / (1 << 10) << " KB\n";
-    std::cout << "  Max. grid size: " << props.maxGridSize[0] << " x " << props.maxGridSize[1] << " x " << props.maxGridSize[2] << "\n";
-    std::cout << "  Max. block size: " << props.maxThreadsDim[0] << " x " << props.maxThreadsDim[1] << " x " << props.maxThreadsDim[2] << "\n";
+    std::cout << "  Device name:            " << props.name << "\n";
+    std::cout << "  GPU clock rate:         " << props.clockRate / 1e3 << " MHz\n";
+    std::cout << "  Available VRAM:         " << std::fixed << std::setprecision(1) << (float)(props.totalGlobalMem) / (1 << 30) << " GB\n";
+    const float peak_bandwidth = 2.0f * props.memoryClockRate * (props.memoryBusWidth / 8) / 1e6;
+    std::cout << "  Peak VRAM bandwidth:    " << peak_bandwidth << " GB/s\n";
+    std::cout << "  SM count:               " << props.multiProcessorCount << "\n";
+    std::cout << "  Max. threads / SM:      " << props.maxThreadsPerMultiProcessor << "\n";
+    std::cout << "  Max. threads / block:   " << props.maxThreadsPerBlock << "\n";
+    std::cout << "  MAx. registers / block: " << props.regsPerBlock << "\n";
+    std::cout << "  Max. grid size:         " << props.maxGridSize[0] << " x " << props.maxGridSize[1] << " x " << props.maxGridSize[2] << "\n";
+    std::cout << "  Max. block size:        " << props.maxThreadsDim[0] << " x " << props.maxThreadsDim[1] << " x " << props.maxThreadsDim[2] << "\n";
+    std::cout << "  Shared mem. per block:  " << std::fixed << std::setprecision(1) << (float)(props.sharedMemPerBlock) / (1 << 10) << " KB\n";
 
     INFO(cfg) std::cout << "Preparing hypergraph data...\n";
 
@@ -736,9 +746,11 @@ int main(int argc, char** argv) {
             logPartitions(
                 d_partitions,
                 d_partitions_sizes,
+                d_partitions_inbound_sizes,
                 curr_num_nodes,
                 num_partitions,
-                h_max_nodes_per_part
+                h_max_nodes_per_part,
+                h_max_inbound_per_part
             );
         }
         // =============================
@@ -759,6 +771,7 @@ int main(int argc, char** argv) {
             num_hedges,
             num_partitions,
             touching_size,
+            level_idx == 0, // on the final level -> return true inbound set sizes
             d_pairs,
             d_f_scores,
             d_partitions,
@@ -788,7 +801,7 @@ int main(int argc, char** argv) {
 
     if (cfg.mode == Mode::INCC) {
         // final partitions rework: merge small ones and make partition ids zero-based
-        merge_small_partitions(
+        mergeSmallPartitions(
             cfg,
             d_partitions_sizes,
             d_partitions_inbound_sizes,

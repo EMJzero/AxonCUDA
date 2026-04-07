@@ -17,13 +17,14 @@ SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
 DATA_DIR="$(cd -P "$SCRIPT_DIR/snns" && pwd)"
 TARGET_BIN="$(cd -P "$SCRIPT_DIR/.." && pwd)/hgraph_gpu.exe"
-TARGET_ARGS=(-rfr 16 -cnc 4 -dtc -v 0)
+TARGET_ARGS=(-rfr 16 -cnc 4 -dtc -ipm -v 0) # can be later overriden per-run
 RESULTS_DIR="$DATA_DIR/results_rfr4_cnc16"
 
 PROFILING=0
 NSIGHT=0
+FAILURES=0
 
-NSYS_BASE_CMD="nsys profile --stats=true --force-overwrite=true"
+NSYS_BASE_CMD=(nsys profile --stats=true --force-overwrite=true)
 
 # Nsight Compute Legend:
 # sm__maximum_warps_per_active_cycle_pct -> Warp usage efficiency
@@ -39,11 +40,12 @@ NSYS_BASE_CMD="nsys profile --stats=true --force-overwrite=true"
 # dram__throughput.avg.pct_of_peak_sustained_elapsed -> DRAM throughput vs peak
 
 # Performance profiling:
-NCU_BASE_CMD_="ncu \
---target-processes all \
---set none \
---metrics \
-sm__maximum_warps_per_active_cycle_pct,\
+NCU_BASE_CMD_=(
+  ncu
+  --target-processes all
+  --set none
+  --metrics
+  sm__maximum_warps_per_active_cycle_pct,\
 smsp__thread_inst_executed_per_inst_executed.ratio,\
 smsp__sass_branch_targets_threads_divergent.avg,\
 smsp__sass_branch_targets_threads_divergent.sum,\
@@ -53,15 +55,17 @@ smsp__sass_thread_inst_executed_op_integer_pred_on.sum,\
 dram__bytes.sum,\
 sm__throughput.avg.pct_of_peak_sustained_elapsed,\
 sm__throughput.avg.pct_of_peak_sustained_active,\
-dram__throughput.avg.pct_of_peak_sustained_elapsed \
---csv"
+dram__throughput.avg.pct_of_peak_sustained_elapsed
+  --csv
+)
 
 # Instruction mix:
-NCU_BASE_CMD="ncu \
---target-processes all \
---set none \
---metrics \
-sm__sass_thread_inst_executed_op_dfma_pred_on.sum,\
+NCU_BASE_CMD=(
+  ncu
+  --target-processes all
+  --set none
+  --metrics
+  sm__sass_thread_inst_executed_op_dfma_pred_on.sum,\
 sm__sass_thread_inst_executed_op_dmul_pred_on.sum,\
 sm__sass_thread_inst_executed_op_dadd_pred_on.sum,\
 sm__sass_thread_inst_executed_op_ffma_pred_on.sum,\
@@ -77,8 +81,9 @@ sm__sass_thread_inst_executed_op_inter_thread_communication_pred_on.sum,\
 sm__sass_thread_inst_executed_op_memory_pred_on.sum,\
 sm__sass_thread_inst_executed_op_bit_pred_on.sum,\
 sm__sass_thread_inst_executed_op_conversion_pred_on.sum,\
-sm__sass_thread_inst_executed_op_misc_pred_on.sum \
---csv"
+sm__sass_thread_inst_executed_op_misc_pred_on.sum
+  --csv
+)
 
 # -------------------------
 # Parse flags
@@ -111,32 +116,56 @@ run_case() {
   local outfile="$2"
   shift 2
 
+  local rc=0
+
   echo "========================================"
   echo "Running ${label}"
   echo "========================================"
 
   if (( PROFILING )); then
-    (
+    if ! (
       cd "$DATA_DIR"
       "${NSYS_BASE_CMD[@]}" \
         --output="${RESULTS_DIR}/${outfile}_profile" \
         "$TARGET_BIN" "${TARGET_ARGS[@]}" "$@" \
         |& tee "${RESULTS_DIR}/${outfile}.txt"
-    )
+    ); then
+      rc=$?
+    fi
+
     rm -f "${RESULTS_DIR}/${outfile}_profile".{nsys-rep,sqlite}
+
   elif (( NSIGHT )); then
-    (
+    if ! (
       cd "$DATA_DIR"
       "${NCU_BASE_CMD[@]}" \
         --log-file "${RESULTS_DIR}/${outfile}.csv" \
         "$TARGET_BIN" "${TARGET_ARGS[@]}" "$@"
-    )
+    ); then
+      rc=$?
+    fi
   else
-    (
+    if ! (
       cd "$DATA_DIR"
       "$TARGET_BIN" "${TARGET_ARGS[@]}" "$@" \
         |& tee "${RESULTS_DIR}/${outfile}"
-    )
+    ); then
+      rc=$?
+    fi
+  fi
+
+  if (( rc == 0 )); then
+    echo "Completed ${label}"
+    return 0
+  else
+    echo "FAILED ${label} (exit code ${rc})" >&2
+    return "$rc"
+  fi
+}
+
+run_case_checked() {
+  if ! run_case "$@"; then
+    ((FAILURES+=1))
   fi
 }
 
@@ -149,26 +178,31 @@ mkdir -p "$RESULTS_DIR"
 # -------------------------
 # Custom ANNs
 # -------------------------
-run_case "8k"          "8k_model"          -r 8k_model_ordered_processed.snn -smh 0
-run_case "64k"         "64k_model"         -r 64k_model_ordered_processed.snn -smh 0
-run_case "256k"        "256k_model"        -r 256k_model_ordered_processed.snn -c loihi84
-run_case "1M"          "1M_model"          -r 1M_model_ordered_processed.snn -c loihi84
-run_case "16M"         "16M_model"         -r 16M_model_ordered_processed.snn -c loihi1024 -smh 12
+run_case_checked "8k"          "8k_model"          -r 8k_model_ordered_processed.snn -smh 0
+run_case_checked "64k"         "64k_model"         -r 64k_model_ordered_processed.snn -smh 0
+run_case_checked "256k"        "256k_model"        -r 256k_model_ordered_processed.snn -c loihi84 -smh 0
+run_case_checked "1M"          "1M_model"          -r 1M_model_ordered_processed.snn -c loihi84
+run_case_checked "16M"         "16M_model"         -r 16M_model_ordered_processed.snn -c loihi1024 -smh 12
 
 # -------------------------
 # Classic ANNs
 # -------------------------
-run_case "LeNet"       "lenet"             -r lenet_cifar_ordered_processed.snn -smh 0
-run_case "VGG11"       "vgg11"             -r vgg11_cifar_model_ordered_processed.snn -c loihi84
-run_case "AlexNet"     "alexnet"           -r alexnet_cifar_ordered_processed.snn -c loihi84
-run_case "MobileNet"   "mobilenet"         -r mobilenet_imagenet_ordered_processed.snn -c loihi1024 -smh 8
+run_case_checked "LeNet"       "lenet"             -r lenet_cifar_ordered_processed.snn -smh 0
+run_case_checked "VGG11"       "vgg11"             -r vgg11_cifar_model_ordered_processed.snn -c loihi84
+run_case_checked "AlexNet"     "alexnet"           -r alexnet_cifar_ordered_processed.snn -c loihi84
+run_case_checked "MobileNet"   "mobilenet"         -r mobilenet_imagenet_ordered_processed.snn -c loihi1024 -smh 8
 
 # -------------------------
 # SNNs
 # -------------------------
-run_case "16k rand"    "16k_rand"          -r 16384L_rand_reservoir.snn -smh 0
-run_case "64k rand"    "64k_rand"          -r 65536L_rand_reservoir.snn -smh 0
-run_case "256k rand"   "256k_rand"         -r 262144L_rand_reservoir.snn -smh 0
-run_case "Allen V1"    "allen_v1"          -r allen_v1_ordered_processed.snn -c loihi84
+run_case_checked "16k rand"    "16k_rand"          -r 16384L_rand_reservoir.snn -smh 0
+run_case_checked "64k rand"    "64k_rand"          -r 65536L_rand_reservoir.snn -smh 0
+run_case_checked "256k rand"   "256k_rand"         -r 262144L_rand_reservoir.snn -smh 0
+run_case_checked "Allen V1"    "allen_v1"          -r allen_v1_ordered_processed.snn -c loihi84 -cnc 16
+
+if (( FAILURES > 0 )); then
+  echo "All runs completed, with ${FAILURES} failure(s)." >&2
+  exit 1
+fi
 
 echo "All runs completed."

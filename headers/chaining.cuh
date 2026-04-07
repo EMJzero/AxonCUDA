@@ -69,17 +69,6 @@ void build_orphan_pairs(
     uint32_t* d_groups
 );
 
-void merge_small_partitions(
-    const runconfig &cfg,
-    const uint32_t *d_partitions_sizes,
-    const uint32_t *d_partitions_inbound_sizes,
-    const uint32_t num_nodes,
-    const uint32_t num_partitions,
-    const uint32_t h_max_nodes_per_part,
-    const uint32_t h_max_inbound_per_part,
-    uint32_t *d_partitions
-);
-
 
 // KERNELS
 

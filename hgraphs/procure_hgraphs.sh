@@ -9,7 +9,7 @@ rm snns.tar.gz
 mkdir ispd98_16x
 mkdir ispd98 && cd ispd98
 wget -O ispd98.tar.gz https://zenodo.org/records/30176/files/ISPD98_hypergraphs.tar.gz?download=1
-echo "Un-tarring hypergraphs, might take a while, sit back and relax *.* !"
+echo "Un-tarring hypergraphs, should be fairly fast ^.^ !"
 tar -xzf ispd98.tar.gz
 rm ispd98.tar.gz
 echo "Scaling up hypergraphs, might also take a while, sit back and relax °.° !"

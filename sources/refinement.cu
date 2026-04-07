@@ -3,6 +3,8 @@
 
 #include "thruster.cuh"
 
+#include <cub/cub.cuh>
+
 #include "runconfig.hpp"
 
 #include "refinement.cuh"
@@ -28,6 +30,7 @@ void refinementRepeats(
     const uint32_t num_hedges,
     const uint32_t num_partitions,
     const dim_t touching_size,
+    const bool update_final_inbound_counts,
     uint32_t *d_pairs,
     float *d_f_scores,
     uint32_t *d_partitions,
@@ -43,7 +46,7 @@ void refinementRepeats(
     size_t free_bytes, total_bytes;
     cudaMemGetInfo(&free_bytes, &total_bytes);
     // NOTE: "14" is the number of mallocs in this routine that COULD allocate up to "curr_num_nodes" entries
-    if (free_bytes < pins_per_partitions_bytes + 14 * curr_num_nodes * sizeof(uint32_t)) {
+    if (free_bytes < pins_per_partitions_bytes + (6 * curr_num_nodes + 8 * 2 * touching_size) * sizeof(uint32_t)) {
         INFO(cfg) std::cout << "Not enough memory to allocate the dense pins per partition matrix: switching to the sparse version\n";
         return refinementSparseRepeats(
             cfg,
@@ -60,6 +63,7 @@ void refinementRepeats(
             num_hedges,
             num_partitions,
             touching_size,
+            update_final_inbound_counts,
             d_pairs,
             d_f_scores,
             d_partitions,
@@ -159,8 +163,8 @@ void refinementRepeats(
         }
         // =============================
         
-        uint32_t *d_ranks = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_ranks, curr_num_nodes * sizeof(uint32_t))); // node -> number of touching hedges seen as of now
+        uint32_t *d_ranks = nullptr; // rank[node idx] -> position of node's move in the sorted sequence
+        CUDA_CHECK(cudaMalloc(&d_ranks, curr_num_nodes * sizeof(uint32_t)));
         thrust::device_ptr<uint32_t> t_ranks(d_ranks);
         thrust::device_ptr<float> t_scores(d_f_scores);
 
@@ -232,12 +236,13 @@ void refinementRepeats(
         // extra step: compute moves validity by size (same HP as the kernel above: all previous higher-gain moves will be applied)
         // explode each move into two events, one decrementing and incrementing the size of the src and dst partition respectively
         // => seeing each move as two distinct events makes us able to identify sequences of useful events first, then moves
-        uint32_t *d_size_events_partition = nullptr, *d_size_events_index = nullptr;
-        int32_t *d_size_events_delta = nullptr;
+        uint32_t *d_size_events_partition = nullptr; // size_events_partition[ev] -> partition affected by the event
+        uint32_t *d_size_events_index = nullptr; // size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
+        int32_t *d_size_events_delta = nullptr; // size_events_delta[ev] -> size variation brought by the event
         const uint32_t num_size_events = 2 * curr_num_nodes;
-        CUDA_CHECK(cudaMalloc(&d_size_events_partition, num_size_events * sizeof(uint32_t))); // size_events_partition[ev] -> partition affected by the event
-        CUDA_CHECK(cudaMalloc(&d_size_events_index, num_size_events * sizeof(uint32_t))); // size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
-        CUDA_CHECK(cudaMalloc(&d_size_events_delta, num_size_events * sizeof(int32_t))); // size_events_delta[ev] -> size variation brought by the event
+        CUDA_CHECK(cudaMalloc(&d_size_events_partition, num_size_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_size_events_index, num_size_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_size_events_delta, num_size_events * sizeof(int32_t)));
         thrust::device_ptr<uint32_t> t_size_events_partition(d_size_events_partition);
         thrust::device_ptr<uint32_t> t_size_events_index(d_size_events_index);
         thrust::device_ptr<int32_t> t_size_events_delta(d_size_events_delta);
@@ -272,7 +277,7 @@ void refinementRepeats(
         // now mark moves that would violate size constraint if the sequence were to end on them
         int32_t *d_valid_moves = nullptr;
         CUDA_CHECK(cudaMalloc(&d_valid_moves, curr_num_nodes * sizeof(int32_t))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
-        CUDA_CHECK(cudaMemset(d_valid_moves, 0, curr_num_nodes * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_valid_moves, 0x00, curr_num_nodes * sizeof(int32_t)));
         thrust::device_ptr<int32_t> t_valid_moves(d_valid_moves);
         
         {
@@ -328,15 +333,15 @@ void refinementRepeats(
         // explode each move into two events for every inbound hedge of the moved node, one decrementing and one incrementing the hedge's
         // occurrencies in the src partition's inbound set and dst partition's inbound set respectively
         // => results in n*h events (better than the n*h*p volume of conditions/counters we need to check)
-        uint32_t *d_inbound_count_events_partition = nullptr;
-        uint32_t *d_inbound_count_events_index = nullptr;
-        uint32_t *d_inbound_count_events_hedge = nullptr;
-        int32_t *d_inbound_count_events_delta = nullptr;
+        uint32_t *d_inbound_count_events_partition = nullptr; // inbound_count_events_partition[ev] -> partition affected by the event
+        uint32_t *d_inbound_count_events_index = nullptr; // inbound_count_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
+        uint32_t *d_inbound_count_events_hedge = nullptr; // d_inbound_count_events_hedge[ev] -> hedge involved in the event
+        int32_t *d_inbound_count_events_delta = nullptr; // inbound_count_events_delta[ev] -> inbound_count variation brought by the event
         const uint32_t num_inbound_count_events = 2 * touching_size; // TODO: this is slightly larger than truly needed, because we just use inbound hedges...
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_partition, num_inbound_count_events * sizeof(uint32_t))); // inbound_count_events_partition[ev] -> partition affected by the event
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_index, num_inbound_count_events * sizeof(uint32_t))); // inbound_count_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_hedge, num_inbound_count_events * sizeof(uint32_t))); // d_inbound_count_events_hedge[ev] -> hedge involved in the event
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_delta, num_inbound_count_events * sizeof(int32_t))); // inbound_count_events_delta[ev] -> inbound_count variation brought by the event
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_partition, num_inbound_count_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_index, num_inbound_count_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_hedge, num_inbound_count_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_delta, num_inbound_count_events * sizeof(int32_t)));
         CUDA_CHECK(cudaMemset(d_inbound_count_events_partition, 0xFF, num_inbound_count_events * sizeof(uint32_t))); // => use inbound_count_events_partition being UINT32_MAX to spot invalid events
         thrust::device_ptr<uint32_t> t_inbound_count_events_partition(d_inbound_count_events_partition);
         thrust::device_ptr<uint32_t> t_inbound_count_events_index(d_inbound_count_events_index);
@@ -380,9 +385,9 @@ void refinementRepeats(
         
         // new array of events, one event for each time the counter of an hedge in the inbound set (+ the overall inbounds per partition counter) goes from 0 to >0,
         // the event carrying a +1 to the inbound set size, one event for each time the counter of an hedge goes from >0 to 0 carrying a -1 to the inbound set size for that partition
-        uint32_t *d_inbound_size_events_offsets = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_offsets, (num_inbound_count_events + 1) * sizeof(uint32_t))); // inbound_size_events_offsets[event idx] -> initially a flag of whether each event will produce an increase/decrese in inbound counts, after the scan it becomes the offset of each new event
-        CUDA_CHECK(cudaMemset(d_inbound_size_events_offsets, 0u, (num_inbound_count_events + 1) * sizeof(uint32_t)));
+        dim_t *d_inbound_size_events_offsets = nullptr; // inbound_size_events_offsets[event idx] -> initially a flag of whether each event will produce an increase/decrese in inbound counts, after the scan it becomes the offset of each new event
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_offsets, (num_inbound_count_events + 1) * sizeof(dim_t)));
+        CUDA_CHECK(cudaMemset(d_inbound_size_events_offsets, 0x00, (num_inbound_count_events + 1) * sizeof(dim_t)));
         {
             // launch configuration - count inbound events kernel
             int threads_per_block = 128;
@@ -405,15 +410,16 @@ void refinementRepeats(
         }
 
         // transform the counts in offsets with a scan and find the total count of new size events
-        thrust::device_ptr<uint32_t> t_inbound_size_events_offsets(d_inbound_size_events_offsets);
+        thrust::device_ptr<dim_t> t_inbound_size_events_offsets(d_inbound_size_events_offsets);
         thrust::inclusive_scan(t_inbound_size_events_offsets, t_inbound_size_events_offsets + num_inbound_count_events + 1, t_inbound_size_events_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
-        uint32_t num_inbound_size_events = 0; // last value in the inclusive scan = full reduce = total number of touching hedges among all sets
-        CUDA_CHECK(cudaMemcpy(&num_inbound_size_events, d_inbound_size_events_offsets + num_inbound_count_events, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        uint32_t *d_inbound_size_events_partition = nullptr, *d_inbound_size_events_index = nullptr;
-        int32_t *d_inbound_size_events_delta = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_partition, num_inbound_size_events * sizeof(uint32_t))); // inbound_size_events_partition[ev] -> partition affected by the event
-        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_index, num_inbound_size_events * sizeof(uint32_t))); // inbound_size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
-        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_delta, num_inbound_size_events * sizeof(int32_t))); // inbound_size_events_delta[ev] -> inbound set size variation brought by the event
+        dim_t num_inbound_size_events = 0; // last value in the inclusive scan = full reduce = total number of touching hedges among all sets
+        CUDA_CHECK(cudaMemcpy(&num_inbound_size_events, d_inbound_size_events_offsets + num_inbound_count_events, sizeof(dim_t), cudaMemcpyDeviceToHost));
+        uint32_t *d_inbound_size_events_partition = nullptr; // inbound_size_events_partition[ev] -> partition affected by the event
+        uint32_t *d_inbound_size_events_index = nullptr; // inbound_size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
+        int32_t *d_inbound_size_events_delta = nullptr; // inbound_size_events_delta[ev] -> inbound set size variation brought by the event
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_partition, num_inbound_size_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_index, num_inbound_size_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_delta, num_inbound_size_events * sizeof(int32_t)));
         thrust::device_ptr<uint32_t> t_inbound_size_events_partition(d_inbound_size_events_partition);
         thrust::device_ptr<uint32_t> t_inbound_size_events_index(d_inbound_size_events_index);
         thrust::device_ptr<int32_t> t_inbound_size_events_delta(d_inbound_size_events_delta);
@@ -457,7 +463,7 @@ void refinementRepeats(
         // now mark moves that would violate the inbound set size constraint if the sequence were to end on them
         int32_t *d_inbound_valid_moves = nullptr;
         CUDA_CHECK(cudaMalloc(&d_inbound_valid_moves, curr_num_nodes * sizeof(int32_t))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
-        CUDA_CHECK(cudaMemset(d_inbound_valid_moves, 0u, curr_num_nodes * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_inbound_valid_moves, 0x00, curr_num_nodes * sizeof(int32_t)));
         thrust::device_ptr<int32_t> t_inbound_valid_moves(d_inbound_valid_moves);
         if(num_inbound_size_events > 0) {
             // launch configuration - flag inbound events kernel
@@ -540,6 +546,38 @@ void refinementRepeats(
         CUDA_CHECK(cudaFree(d_inbound_valid_moves));
     }
 
+    // recompute inbound set sizes
+    if (update_final_inbound_counts) {
+        uint32_t* pp_map = nullptr; // pp_map[(e * num_partitions + p)/32] -> the bit is set if "e" was already seen incident to "p"
+        const dim_t pp_per_hedge = (static_cast<dim_t>(num_partitions) + 31u) / 32u;
+        const dim_t pp_map_size = static_cast<dim_t>(num_hedges) * pp_per_hedge;
+        CUDA_CHECK(cudaMalloc(&pp_map, pp_map_size * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(pp_map, 0x00, pp_map_size * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(d_partitions_inbound_sizes, 0x00, num_partitions * sizeof(uint32_t)));
+        {
+            // launch configuration - inbound sets size kernel
+            int threads_per_block = 128; // 128/32 -> 4 warps per block
+            int warps_per_block = threads_per_block / WARP_SIZE;
+            int num_warps_needed = num_hedges; // 1 warp per hedge
+            int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+            // launch - inbound sets size kernel
+            LAUNCH(cfg) << "inbound sets size kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            inbound_sets_size_kernel<<<blocks, threads_per_block>>>(
+                d_hedges,
+                d_hedges_offsets,
+                d_srcs_count,
+                d_partitions,
+                num_hedges,
+                num_partitions,
+                pp_map,
+                d_partitions_inbound_sizes
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        CUDA_CHECK(cudaFree(pp_map));
+    }
+
     CUDA_CHECK(cudaFree(d_pins_per_partitions));
 }
 
@@ -561,6 +599,7 @@ void refinementSparseRepeats(
     const uint32_t num_hedges,
     const uint32_t num_partitions,
     const dim_t touching_size,
+    const bool update_final_inbound_counts,
     uint32_t *d_pairs,
     float *d_f_scores,
     uint32_t *d_partitions,
@@ -700,14 +739,14 @@ void refinementSparseRepeats(
         // NOTE: no need to init. "d_f_scores" if we use "d_pairs" to see which locations are valid
 
         {
-            // launch configuration - fm-ref gains kernel
+            // launch configuration - fm-ref gains sparse kernel
             // NOTE: choose threads_per_block multiple of WARP_SIZE
             int threads_per_block = 128; // 128/32 -> 4 warps per block
             int warps_per_block = threads_per_block / WARP_SIZE;
             int num_warps_needed = curr_num_nodes; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-            // launch - fm-ref gains kernel
-            LAUNCH(cfg) << "fm-ref gains kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // launch - fm-ref gains sparse kernel
+            LAUNCH(cfg) << "fm-ref gains sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             fm_refinement_gains_sparse_ppp_kernel<<<blocks, threads_per_block>>>(
                 d_touching,
                 d_touching_offsets,
@@ -744,8 +783,8 @@ void refinementSparseRepeats(
         }
         // =============================
         
-        uint32_t *d_ranks = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_ranks, curr_num_nodes * sizeof(uint32_t))); // node -> number of touching hedges seen as of now
+        uint32_t *d_ranks = nullptr; // rank[node idx] -> position of node's move in the sorted sequence
+        CUDA_CHECK(cudaMalloc(&d_ranks, curr_num_nodes * sizeof(uint32_t)));
         thrust::device_ptr<uint32_t> t_ranks(d_ranks);
         thrust::device_ptr<float> t_scores(d_f_scores);
 
@@ -780,20 +819,51 @@ void refinementSparseRepeats(
             );
         }
 
+        // ======================================
+        // low memory emergency measure: drop a certain fraction of moves
+        size_t free_bytes, total_bytes;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        const size_t upper_bound = 2 * 9 * touching_size * sizeof(uint32_t) + 2 * (curr_num_nodes + 1) * sizeof(dim_t);
+        if (free_bytes < upper_bound) {
+            // set to UINT32_MAX (invalid) the last faction of moves by rank
+            const uint32_t discard_offset = curr_num_nodes * ((float)free_bytes / upper_bound); // tailing fraction of moves by rank to discard
+            ERR(cfg) std::cout << "Emergency discard of " << discard_offset << " moves to prevent OOM during sparse refinement !!\n";
+            thrust::device_ptr<uint32_t> t_moves(d_pairs);
+            thrust::transform(
+                t_moves, t_moves + curr_num_nodes, t_ranks, t_moves,
+                [discard_offset] __host__ __device__ (const uint32_t move, const uint32_t rank) {
+                    return rank >= discard_offset ? UINT32_MAX : move;
+                }
+            );
+        }
+        // ======================================
+
+        // flag events that propose a valid move
+        // => for size events, store "1" as the flag -> use the offsets with a "*2"
+        // => for inbound events, store the node's "inbound set size" as the flag -> use the offsets with a "*2"
+        dim_t *d_size_events_offsets = nullptr; // size_events_offsets[node idx] -> size event index for the node (where to write it - if it has a valid move)
+        dim_t *d_inbound_events_offsets = nullptr; // inbound_events_offsets[node idx] -> initial inbound event index for the node (where to start writing them - if it has a valid move)
+        CUDA_CHECK(cudaMalloc(&d_size_events_offsets, (curr_num_nodes + 1) * sizeof(dim_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_events_offsets, (curr_num_nodes + 1) * sizeof(dim_t)));
+        CUDA_CHECK(cudaMemset(d_size_events_offsets, 0x00, (curr_num_nodes + 1) * sizeof(dim_t)));
+        CUDA_CHECK(cudaMemset(d_inbound_events_offsets, 0x00, (curr_num_nodes + 1) * sizeof(dim_t)));
+        thrust::device_ptr<dim_t> t_size_events_offsets(d_size_events_offsets);
+        thrust::device_ptr<dim_t> t_inbound_events_offsets(d_inbound_events_offsets);
         {
-            // launch configuration - fm-ref cascade kernel
+            // launch configuration - fm-ref cascade sparse kernel
             // NOTE: choose threads_per_block multiple of WARP_SIZE
             int threads_per_block = 128; // 128/32 -> 4 warps per block
             int warps_per_block = threads_per_block / WARP_SIZE;
             int num_warps_needed = curr_num_nodes ; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-            // launch - fm-ref cascade kernel
-            LAUNCH(cfg) << "fm-ref cascade kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // launch - fm-ref cascade sparse kernel
+            LAUNCH(cfg) << "fm-ref cascade sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             fm_refinement_cascade_sparse_ppp_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
                 d_hedges_offsets,
                 d_touching,
                 d_touching_offsets,
+                d_inbound_count,
                 d_hedge_weights,
                 d_ranks,
                 d_pairs,
@@ -805,7 +875,9 @@ void refinementSparseRepeats(
                 num_partitions,
                 ppp_per_hedge,
                 encourage,
-                d_f_scores
+                d_f_scores,
+                d_size_events_offsets,
+                d_inbound_events_offsets
             );
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -814,33 +886,48 @@ void refinementSparseRepeats(
         // not re-sorting the scores array means you have the array ordered as per the initial scores,
         // but now, this scan updates the scores "as if all previous moves were applied"!
         thrust::inclusive_scan(t_scores, t_scores + curr_num_nodes, t_scores); // in-place (we don't need scores anymore anyway)
-        // Remember: moves never get re-ranked (re-sorted) after the first time with in-isolation gains. Keep them like that and just find the valid sequence of maximum gain! This is an heuristics!
+        // REMEMBER: moves never get re-ranked (re-sorted) after the first time with in-isolation gains. Keep them like that and just find the valid sequence of maximum gain! This is an heuristics!
+
+        // flag valid moves and compute their offsets for both event types
+        thrust::exclusive_scan(t_size_events_offsets, t_size_events_offsets + curr_num_nodes + 1, t_size_events_offsets);
+        thrust::exclusive_scan(t_inbound_events_offsets, t_inbound_events_offsets + curr_num_nodes + 1, t_inbound_events_offsets);
+        // |
+        dim_t num_size_events = 0; // last value in the inclusive scan = full reduce = total number of moving nodes
+        CUDA_CHECK(cudaMemcpy(&num_size_events, d_size_events_offsets + curr_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
+        num_size_events *= 2; // => 2 events per flagged move
+        // |
+        dim_t num_inbound_events = 0; // last value in the inclusive scan = full reduce = total number of inbound hedges among all moving nodes
+        CUDA_CHECK(cudaMemcpy(&num_inbound_events, d_inbound_events_offsets + curr_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
+        num_inbound_events *= 2; // => 2 events per flagged pin
+        INFO(cfg) std::cout << "Refinement sparse events construction: " << num_size_events << " size events, " << num_inbound_events << " inbound events\n";
+
         // ======================================
         // extra step: compute moves validity by size (same HP as the kernel above: all previous higher-gain moves will be applied)
         // explode each move into two events, one decrementing and incrementing the size of the src and dst partition respectively
         // => seeing each move as two distinct events makes us able to identify sequences of useful events first, then moves
-        uint32_t *d_size_events_partition = nullptr, *d_size_events_index = nullptr;
-        int32_t *d_size_events_delta = nullptr;
-        const uint32_t num_size_events = 2 * curr_num_nodes;
-        CUDA_CHECK(cudaMalloc(&d_size_events_partition, num_size_events * sizeof(uint32_t))); // size_events_partition[ev] -> partition affected by the event
-        CUDA_CHECK(cudaMalloc(&d_size_events_index, num_size_events * sizeof(uint32_t))); // size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
-        CUDA_CHECK(cudaMalloc(&d_size_events_delta, num_size_events * sizeof(int32_t))); // size_events_delta[ev] -> size variation brought by the event
+        uint32_t *d_size_events_partition = nullptr; // size_events_partition[ev] -> partition affected by the event
+        uint32_t *d_size_events_index = nullptr; // size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
+        int32_t *d_size_events_delta = nullptr; // size_events_delta[ev] -> size variation brought by the event
+        CUDA_CHECK(cudaMalloc(&d_size_events_partition, num_size_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_size_events_index, num_size_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_size_events_delta, num_size_events * sizeof(int32_t)));
         thrust::device_ptr<uint32_t> t_size_events_partition(d_size_events_partition);
         thrust::device_ptr<uint32_t> t_size_events_index(d_size_events_index);
         thrust::device_ptr<int32_t> t_size_events_delta(d_size_events_delta);
         {
-            // launch configuration - build size events kernel
+            // launch configuration - build size events sparse kernel
             int threads_per_block = 128;
             int num_threads_needed = curr_num_nodes; // 1 thread per move
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-            // launch - build size events kernel
-            LAUNCH(cfg) << "build size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // launch - build size events sparse kernel
+            LAUNCH(cfg) << "build size events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // TODO: could filter out null moves (target = -1)?
-            build_size_events_kernel<<<blocks, threads_per_block>>>(
+            build_size_events_sparse_kernel<<<blocks, threads_per_block>>>(
                 d_pairs,
                 d_ranks,
                 d_partitions,
                 d_nodes_sizes,
+                d_size_events_offsets,
                 curr_num_nodes,
                 d_size_events_partition,
                 d_size_events_index,
@@ -849,6 +936,7 @@ void refinementSparseRepeats(
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
         }
+        CUDA_CHECK(cudaFree(d_size_events_offsets));
 
         // sort events by (partition, rank) [in lexicographical order for the tuple] and carry size_events_delta along
         auto size_events_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_size_events_partition, t_size_events_index));
@@ -859,7 +947,7 @@ void refinementSparseRepeats(
         // now mark moves that would violate size constraint if the sequence were to end on them
         int32_t *d_valid_moves = nullptr;
         CUDA_CHECK(cudaMalloc(&d_valid_moves, curr_num_nodes * sizeof(int32_t))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
-        CUDA_CHECK(cudaMemset(d_valid_moves, 0, curr_num_nodes * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_valid_moves, 0x00, curr_num_nodes * sizeof(int32_t)));
         thrust::device_ptr<int32_t> t_valid_moves(d_valid_moves);
         
         {
@@ -885,7 +973,7 @@ void refinementSparseRepeats(
         CUDA_CHECK(cudaFree(d_size_events_delta));
         // compute, as of each event, the cumulative number of partitions that are invalid by summing the count of those made/unmade invalid at each event
         thrust::inclusive_scan(t_valid_moves, t_valid_moves + curr_num_nodes, t_valid_moves);
-        
+
         // ======================================
         // preparatory step: update pins per partition into inbound (only) pins partition
         // simultaneously, also correct the calculation for partitions_inbound_sizes by removing outbounds
@@ -912,41 +1000,61 @@ void refinementSparseRepeats(
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
         }
+
+        // ======================================
+        // if memory is reeeeallly tight, spill non-coarse data structures to host
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        std::vector<bitmap> h_ppp_offsets;
+        std::vector<uint32_t> h_ppp;
+        if (free_bytes < 9 * num_inbound_events * sizeof(uint32_t)) {
+            // TODO: make these async
+            h_ppp_offsets.resize(ppp_offsets_size);
+            h_ppp.resize(ppp_size);
+            INFO(cfg) std::cout << "Emergency sparse spill of " << std::fixed << std::setprecision(3)
+                << (float)(ppp_offsets_size * sizeof(bitmap) + ppp_size * sizeof(uint32_t)) / (1 << 30)
+                << " GB from device to host ...\n";
+            CUDA_CHECK(cudaMemcpy(h_ppp_offsets.data(), d_ppp_offsets, ppp_offsets_size * sizeof(bitmap), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_ppp.data(), d_ppp, ppp_size * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaFree(d_ppp_offsets));
+            CUDA_CHECK(cudaFree(d_ppp));
+        }
+        // ======================================
+
         // ======================================
         // extra step: compute moves validity by inbound set cardinality (same HP as the kernel above: all previous higher-gain moves will be applied)
         // explode each move into two events for every inbound hedge of the moved node, one decrementing and one incrementing the hedge's
         // occurrencies in the src partition's inbound set and dst partition's inbound set respectively
         // => results in n*h events (better than the n*h*p volume of conditions/counters we need to check)
-        uint32_t *d_inbound_count_events_partition = nullptr;
-        uint32_t *d_inbound_count_events_index = nullptr;
-        uint32_t *d_inbound_count_events_hedge = nullptr;
-        int32_t *d_inbound_count_events_delta = nullptr;
-        const uint32_t num_inbound_count_events = 2 * touching_size; // TODO: this is slightly larger than truly needed, because we just use inbound hedges...
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_partition, num_inbound_count_events * sizeof(uint32_t))); // inbound_count_events_partition[ev] -> partition affected by the event
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_index, num_inbound_count_events * sizeof(uint32_t))); // inbound_count_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_hedge, num_inbound_count_events * sizeof(uint32_t))); // d_inbound_count_events_hedge[ev] -> hedge involved in the event
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_delta, num_inbound_count_events * sizeof(int32_t))); // inbound_count_events_delta[ev] -> inbound_count variation brought by the event
-        CUDA_CHECK(cudaMemset(d_inbound_count_events_partition, 0xFF, num_inbound_count_events * sizeof(uint32_t))); // => use inbound_count_events_partition being UINT32_MAX to spot invalid events
+        uint32_t *d_inbound_count_events_partition = nullptr; // inbound_count_events_partition[ev] -> partition affected by the event
+        uint32_t *d_inbound_count_events_index = nullptr; // inbound_count_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
+        uint32_t *d_inbound_count_events_hedge = nullptr; // d_inbound_count_events_hedge[ev] -> hedge involved in the event
+        int32_t *d_inbound_count_events_delta = nullptr; // inbound_count_events_delta[ev] -> inbound_count variation brought by the event
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_partition, num_inbound_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_index, num_inbound_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_hedge, num_inbound_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_delta, num_inbound_events * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_inbound_count_events_partition, 0xFF, num_inbound_events * sizeof(uint32_t))); // => use inbound_count_events_partition being UINT32_MAX to spot invalid events
         thrust::device_ptr<uint32_t> t_inbound_count_events_partition(d_inbound_count_events_partition);
         thrust::device_ptr<uint32_t> t_inbound_count_events_index(d_inbound_count_events_index);
         thrust::device_ptr<uint32_t> t_inbound_count_events_hedge(d_inbound_count_events_hedge);
         thrust::device_ptr<int32_t> t_inbound_count_events_delta(d_inbound_count_events_delta);
         {
-            // launch configuration - build hedge events kernel
+            // launch configuration - build hedge events sparse kernel
             int threads_per_block = 128; // 128/32 -> 4 warps per block
             int warps_per_block = threads_per_block / WARP_SIZE;
             int num_warps_needed = curr_num_nodes ; // 1 warp per move
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-            // launch - build hedge events kernel
-            LAUNCH(cfg) << "build hedge events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // launch - build hedge events sparse kernel
+            LAUNCH(cfg) << "build hedge events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // TODO: could filter out null moves (target = -1)?
-            build_hedge_events_kernel<<<blocks, threads_per_block>>>(
+            build_hedge_events_sparse_kernel<<<blocks, threads_per_block>>>(
                 d_pairs,
                 d_ranks,
                 d_partitions,
                 d_touching,
                 d_touching_offsets,
                 d_inbound_count,
+                d_inbound_events_offsets,
                 curr_num_nodes,
                 d_inbound_count_events_partition,
                 d_inbound_count_events_index,
@@ -956,29 +1064,127 @@ void refinementSparseRepeats(
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
         }
+        CUDA_CHECK(cudaFree(d_inbound_events_offsets));
         
         // sort events by (partition, hedge, rank) [in lexicographical order for the tuple] and carry events_delta along
         // the resulting array will have events sorted by partition, and inside each partition sorted by hedge, and inside each hedge sorted by rank!
-        auto count_events_sort_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_inbound_count_events_partition, t_inbound_count_events_hedge, t_inbound_count_events_index));
-        auto count_events_sort_key_end = count_events_sort_key_begin + num_inbound_count_events;
-        thrust::sort_by_key(count_events_sort_key_begin, count_events_sort_key_end, t_inbound_count_events_delta);
+        if (num_inbound_events > 0) {
+            uint32_t *d_count_events_sort_keys = nullptr;
+            uint32_t *d_count_events_sort_keys_buffer = nullptr;
+            uint32_t *d_count_events_sort_permutation = nullptr;
+            uint32_t *d_count_events_sort_permutation_buffer = nullptr;
+            uint32_t *d_count_events_sort_reorder_buffer = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_count_events_sort_keys, num_inbound_events * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_count_events_sort_keys_buffer, num_inbound_events * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_count_events_sort_permutation, num_inbound_events * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_count_events_sort_permutation_buffer, num_inbound_events * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_count_events_sort_reorder_buffer, num_inbound_events * sizeof(uint32_t)));
+
+            cub::DoubleBuffer<uint32_t> c_count_events_keys_double_buffer(d_count_events_sort_keys, d_count_events_sort_keys_buffer);
+            cub::DoubleBuffer<uint32_t> c_count_events_permutation_double_buffer(d_count_events_sort_permutation, d_count_events_sort_permutation_buffer);
+            void* c_count_events_sort_storage = nullptr;
+            size_t c_count_events_sort_storage_bytes = 0;
+
+            thrust::device_ptr<uint32_t> t_count_events_sort_permutation(d_count_events_sort_permutation);
+            thrust::device_ptr<uint32_t> t_count_events_sort_reorder_buffer(d_count_events_sort_reorder_buffer);
+            thrust::sequence(t_count_events_sort_permutation, t_count_events_sort_permutation + num_inbound_events);
+
+            auto write_count_events_sort_keys = [num_inbound_events, &c_count_events_keys_double_buffer, &c_count_events_permutation_double_buffer] (const uint32_t* d_field) {
+                thrust::device_ptr<uint32_t> t_sort_keys(c_count_events_keys_double_buffer.Current());
+                thrust::device_ptr<uint32_t> t_sort_permutation(c_count_events_permutation_double_buffer.Current());
+                thrust::transform(
+                    t_sort_permutation, t_sort_permutation + num_inbound_events, t_sort_keys,
+                    [d_field] __host__ __device__ (const uint32_t idx) {
+                        return d_field[idx];
+                    }
+                );
+            };
+
+            write_count_events_sort_keys(d_inbound_count_events_index);
+            cub::DeviceRadixSort::SortPairs(
+                c_count_events_sort_storage, c_count_events_sort_storage_bytes,
+                c_count_events_keys_double_buffer, c_count_events_permutation_double_buffer,
+                num_inbound_events,
+                /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream=*/0
+            );
+            const float count_events_sort_aux_gib = static_cast<float>(5ull * num_inbound_events * sizeof(uint32_t)) / (1 << 30);
+            CUB(cfg) << "radix sort requiring " << std::fixed << std::setprecision(3) << count_events_sort_aux_gib
+                << " GB of auxiliary buffers and " << std::fixed << std::setprecision(3) << static_cast<float>(c_count_events_sort_storage_bytes) / (1 << 20)
+                << " MB of temporary storage ...\n";
+            CUDA_CHECK(cudaMalloc(&c_count_events_sort_storage, c_count_events_sort_storage_bytes));
+            cub::DeviceRadixSort::SortPairs(
+                c_count_events_sort_storage, c_count_events_sort_storage_bytes,
+                c_count_events_keys_double_buffer, c_count_events_permutation_double_buffer,
+                num_inbound_events,
+                /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream=*/0
+            );
+
+            write_count_events_sort_keys(d_inbound_count_events_hedge);
+            cub::DeviceRadixSort::SortPairs(
+                c_count_events_sort_storage, c_count_events_sort_storage_bytes,
+                c_count_events_keys_double_buffer, c_count_events_permutation_double_buffer,
+                num_inbound_events,
+                /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream=*/0
+            );
+
+            write_count_events_sort_keys(d_inbound_count_events_partition);
+            cub::DeviceRadixSort::SortPairs(
+                c_count_events_sort_storage, c_count_events_sort_storage_bytes,
+                c_count_events_keys_double_buffer, c_count_events_permutation_double_buffer,
+                num_inbound_events,
+                /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream=*/0
+            );
+
+            thrust::device_ptr<uint32_t> t_count_events_sorted_permutation(c_count_events_permutation_double_buffer.Current());
+            thrust::gather(t_count_events_sorted_permutation, t_count_events_sorted_permutation + num_inbound_events, t_inbound_count_events_partition, t_count_events_sort_reorder_buffer);
+            CUDA_CHECK(cudaMemcpy(d_inbound_count_events_partition, d_count_events_sort_reorder_buffer, num_inbound_events * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            thrust::gather(t_count_events_sorted_permutation, t_count_events_sorted_permutation + num_inbound_events, t_inbound_count_events_hedge, t_count_events_sort_reorder_buffer);
+            CUDA_CHECK(cudaMemcpy(d_inbound_count_events_hedge, d_count_events_sort_reorder_buffer, num_inbound_events * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            thrust::gather(t_count_events_sorted_permutation, t_count_events_sorted_permutation + num_inbound_events, t_inbound_count_events_index, t_count_events_sort_reorder_buffer);
+            CUDA_CHECK(cudaMemcpy(d_inbound_count_events_index, d_count_events_sort_reorder_buffer, num_inbound_events * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+            thrust::device_ptr<int32_t> t_count_events_sort_reorder_buffer_i32(reinterpret_cast<int32_t*>(d_count_events_sort_reorder_buffer));
+            thrust::gather(t_count_events_sorted_permutation, t_count_events_sorted_permutation + num_inbound_events, t_inbound_count_events_delta, t_count_events_sort_reorder_buffer_i32);
+            CUDA_CHECK(cudaMemcpy(d_inbound_count_events_delta, d_count_events_sort_reorder_buffer, num_inbound_events * sizeof(int32_t), cudaMemcpyDeviceToDevice));
+
+            CUDA_CHECK(cudaFree(d_count_events_sort_keys));
+            CUDA_CHECK(cudaFree(d_count_events_sort_keys_buffer));
+            CUDA_CHECK(cudaFree(d_count_events_sort_permutation));
+            CUDA_CHECK(cudaFree(d_count_events_sort_permutation_buffer));
+            CUDA_CHECK(cudaFree(d_count_events_sort_reorder_buffer));
+            CUDA_CHECK(cudaFree(c_count_events_sort_storage));
+        }
         // inclusive scan by key of the deltas, the key being (partition, hedge) -> we now have the total number of times each hedge appears in the inbound set as of each move (in order of rank)
         auto count_events_scan_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_inbound_count_events_partition, t_inbound_count_events_hedge));
-        auto count_events_scan_key_end = count_events_scan_key_begin + num_inbound_count_events;
+        auto count_events_scan_key_end = count_events_scan_key_begin + num_inbound_events;
         thrust::inclusive_scan_by_key(count_events_scan_key_begin, count_events_scan_key_end, t_inbound_count_events_delta, t_inbound_count_events_delta);
         
+        // ======================================
+        // un-spill, crossing fingers that memory will be enough now
+        if (free_bytes < 9 * num_inbound_events * sizeof(uint32_t)) {
+            INFO(cfg) std::cout << "Emergency sparse unspill of " << std::fixed << std::setprecision(3)
+                << (float)(ppp_offsets_size * sizeof(bitmap) + ppp_size * sizeof(uint32_t)) / (1 << 30)
+                << " GB from host to device ...\n";
+            CUDA_CHECK(cudaMalloc(&d_ppp_offsets, ppp_offsets_size * sizeof(bitmap)));
+            CUDA_CHECK(cudaMalloc(&d_ppp, ppp_size * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemcpy(d_ppp_offsets, h_ppp_offsets.data(), ppp_offsets_size * sizeof(bitmap), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_ppp, h_ppp.data(), ppp_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            std::vector<bitmap>().swap(h_ppp_offsets);
+            std::vector<uint32_t>().swap(h_ppp);
+        }
+        // ======================================
+
         // new array of events, one event for each time the counter of an hedge in the inbound set (+ the overall inbounds per partition counter) goes from 0 to >0,
         // the event carrying a +1 to the inbound set size, one event for each time the counter of an hedge goes from >0 to 0 carrying a -1 to the inbound set size for that partition
-        uint32_t *d_inbound_size_events_offsets = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_offsets, (num_inbound_count_events + 1) * sizeof(uint32_t))); // inbound_size_events_offsets[event idx] -> initially a flag of whether each event will produce an increase/decrese in inbound counts, after the scan it becomes the offset of each new event
-        CUDA_CHECK(cudaMemset(d_inbound_size_events_offsets, 0u, (num_inbound_count_events + 1) * sizeof(uint32_t)));
+        dim_t *d_inbound_size_events_offsets = nullptr; // inbound_size_events_offsets[event idx] -> initially a flag of whether each event will produce an increase/decrese in inbound counts, after the scan it becomes the offset of each new event
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_offsets, (num_inbound_events + 1) * sizeof(dim_t)));
+        CUDA_CHECK(cudaMemset(d_inbound_size_events_offsets, 0x00, (num_inbound_events + 1) * sizeof(dim_t)));
         {
-            // launch configuration - count inbound events kernel
+            // launch configuration - count inbound events sparse kernel
             int threads_per_block = 128;
-            int num_threads_needed = num_inbound_count_events; // 1 thread per hedge event
+            int num_threads_needed = num_inbound_events; // 1 thread per hedge event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-            // launch - count inbound events kernel
-            LAUNCH(cfg) << "count inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // launch - count inbound events sparse kernel
+            LAUNCH(cfg) << "count inbound events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             count_inbound_size_events_sparse_ppp_kernel<<<blocks, threads_per_block>>>(
                 d_ppp_offsets,
                 d_ppp,
@@ -986,7 +1192,7 @@ void refinementSparseRepeats(
                 d_inbound_count_events_index,
                 d_inbound_count_events_hedge,
                 d_inbound_count_events_delta,
-                num_inbound_count_events,
+                num_inbound_events,
                 num_partitions,
                 ppp_per_hedge,
                 d_inbound_size_events_offsets
@@ -996,26 +1202,27 @@ void refinementSparseRepeats(
         }
 
         // transform the counts in offsets with a scan and find the total count of new size events
-        thrust::device_ptr<uint32_t> t_inbound_size_events_offsets(d_inbound_size_events_offsets);
-        thrust::inclusive_scan(t_inbound_size_events_offsets, t_inbound_size_events_offsets + num_inbound_count_events + 1, t_inbound_size_events_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
-        uint32_t num_inbound_size_events = 0; // last value in the inclusive scan = full reduce = total number of touching hedges among all sets
-        CUDA_CHECK(cudaMemcpy(&num_inbound_size_events, d_inbound_size_events_offsets + num_inbound_count_events, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        uint32_t *d_inbound_size_events_partition = nullptr, *d_inbound_size_events_index = nullptr;
-        int32_t *d_inbound_size_events_delta = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_partition, num_inbound_size_events * sizeof(uint32_t))); // inbound_size_events_partition[ev] -> partition affected by the event
-        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_index, num_inbound_size_events * sizeof(uint32_t))); // inbound_size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
-        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_delta, num_inbound_size_events * sizeof(int32_t))); // inbound_size_events_delta[ev] -> inbound set size variation brought by the event
+        thrust::device_ptr<dim_t> t_inbound_size_events_offsets(d_inbound_size_events_offsets);
+        thrust::inclusive_scan(t_inbound_size_events_offsets, t_inbound_size_events_offsets + num_inbound_events + 1, t_inbound_size_events_offsets); // in-place exclusive scan (the last element is set to zero and thus collects the full reduce)
+        dim_t num_inbound_size_events = 0; // last value in the inclusive scan = full reduce = total number of touching hedges among all sets
+        CUDA_CHECK(cudaMemcpy(&num_inbound_size_events, d_inbound_size_events_offsets + num_inbound_events, sizeof(dim_t), cudaMemcpyDeviceToHost));
+        uint32_t *d_inbound_size_events_partition = nullptr; // inbound_size_events_partition[ev] -> partition affected by the event
+        uint32_t *d_inbound_size_events_index = nullptr; // inbound_size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
+        int32_t *d_inbound_size_events_delta = nullptr; // inbound_size_events_delta[ev] -> inbound set size variation brought by the event
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_partition, num_inbound_size_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_index, num_inbound_size_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_delta, num_inbound_size_events * sizeof(int32_t)));
         thrust::device_ptr<uint32_t> t_inbound_size_events_partition(d_inbound_size_events_partition);
         thrust::device_ptr<uint32_t> t_inbound_size_events_index(d_inbound_size_events_index);
         thrust::device_ptr<int32_t> t_inbound_size_events_delta(d_inbound_size_events_delta);
 
         {
-            // launch configuration - build inbound events kernel
+            // launch configuration - build inbound events sparse kernel
             int threads_per_block = 128;
-            int num_threads_needed = num_inbound_count_events; // 1 thread per hedge event
+            int num_threads_needed = num_inbound_events; // 1 thread per hedge event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-            // launch - build inbound events kernel
-            LAUNCH(cfg) << "build inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            // launch - build inbound events sparse kernel
+            LAUNCH(cfg) << "build inbound events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             build_inbound_size_events_sparse_ppp_kernel<<<blocks, threads_per_block>>>(
                 d_ppp_offsets,
                 d_ppp,
@@ -1024,7 +1231,7 @@ void refinementSparseRepeats(
                 d_inbound_count_events_hedge,
                 d_inbound_count_events_delta,
                 d_inbound_size_events_offsets,
-                num_inbound_count_events,
+                num_inbound_events,
                 num_partitions,
                 ppp_per_hedge,
                 d_inbound_size_events_partition,
@@ -1050,7 +1257,7 @@ void refinementSparseRepeats(
         // now mark moves that would violate the inbound set size constraint if the sequence were to end on them
         int32_t *d_inbound_valid_moves = nullptr;
         CUDA_CHECK(cudaMalloc(&d_inbound_valid_moves, curr_num_nodes * sizeof(int32_t))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
-        CUDA_CHECK(cudaMemset(d_inbound_valid_moves, 0u, curr_num_nodes * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_inbound_valid_moves, 0x00, curr_num_nodes * sizeof(int32_t)));
         thrust::device_ptr<int32_t> t_inbound_valid_moves(d_inbound_valid_moves);
         if (num_inbound_size_events > 0) {
             // launch configuration - flag inbound events kernel
@@ -1076,6 +1283,7 @@ void refinementSparseRepeats(
         
         // compute, as of each event, the cumulative number of partitions that are invalid by summing the count of those made/unmade invalid at each event
         thrust::inclusive_scan(t_inbound_valid_moves, t_inbound_valid_moves + curr_num_nodes, t_inbound_valid_moves);
+
         // ======================================
         // find the move in the sequence that yields both the highest gain and a valid state (when all moves before it are applied)
         // index space 0..curr_num_nodes - 1
@@ -1135,6 +1343,38 @@ void refinementSparseRepeats(
 
     CUDA_CHECK(cudaFree(d_ppp_offsets));
     CUDA_CHECK(cudaFree(d_ppp));
+
+    // recompute inbound set sizes
+    if (update_final_inbound_counts) {
+        uint32_t* pp_map = nullptr; // pp_map[(e * num_partitions + p)/32] -> the bit is set if "e" was already seen incident to "p"
+        const dim_t pp_per_hedge = (static_cast<dim_t>(num_partitions) + 31u) / 32u;
+        const dim_t pp_map_size = static_cast<dim_t>(num_hedges) * pp_per_hedge;
+        CUDA_CHECK(cudaMalloc(&pp_map, pp_map_size * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(pp_map, 0x00, pp_map_size * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(d_partitions_inbound_sizes, 0x00, num_partitions * sizeof(uint32_t)));
+        {
+            // launch configuration - inbound sets size kernel
+            int threads_per_block = 128; // 128/32 -> 4 warps per block
+            int warps_per_block = threads_per_block / WARP_SIZE;
+            int num_warps_needed = num_hedges; // 1 warp per hedge
+            int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+            // launch - inbound sets size kernel
+            LAUNCH(cfg) << "inbound sets size kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            inbound_sets_size_kernel<<<blocks, threads_per_block>>>(
+                d_hedges,
+                d_hedges_offsets,
+                d_srcs_count,
+                d_partitions,
+                num_hedges,
+                num_partitions,
+                pp_map,
+                d_partitions_inbound_sizes
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        CUDA_CHECK(cudaFree(pp_map));
+    }
 }
 
 
@@ -1143,14 +1383,18 @@ void refinementSparseRepeats(
 void logPartitions(
     const uint32_t *d_partitions,
     const uint32_t *d_partitions_sizes,
+    const uint32_t *d_partitions_inbound_sizes,
     const uint32_t curr_num_nodes,
     const uint32_t num_partitions,
-    const uint32_t h_max_nodes_per_part
+    const uint32_t h_max_nodes_per_part,
+    const uint32_t h_max_inbound_per_part
 ) {
     std::vector<uint32_t> partitions_tmp(curr_num_nodes);
     CUDA_CHECK(cudaMemcpy(partitions_tmp.data(), d_partitions, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     std::vector<uint32_t> partitions_sizes_tmp(num_partitions);
     CUDA_CHECK(cudaMemcpy(partitions_sizes_tmp.data(), d_partitions_sizes, num_partitions * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    std::vector<uint32_t> partitions_inbound_sizes_tmp(num_partitions);
+    CUDA_CHECK(cudaMemcpy(partitions_inbound_sizes_tmp.data(), d_partitions_inbound_sizes, num_partitions * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     std::unordered_map<uint32_t, int> part_count;
     std::cout << "Partitioning results:\n";
     for (uint32_t i = 0; i < curr_num_nodes; ++i) {
@@ -1164,8 +1408,11 @@ void logPartitions(
     }
     for (uint32_t i = 0; i < num_partitions; ++i) {
         uint32_t part_size = partitions_sizes_tmp[i];
+        uint32_t part_inbound_size = partitions_inbound_sizes_tmp[i];
         if (part_size > h_max_nodes_per_part)
-            std::cerr << "  WARNING, max partition size constraint (" << h_max_nodes_per_part << ") violated by part=" << i << " with part_size=" << part_size << " !!\n";
+           std::cerr << "  WARNING, max partition size constraint (" << h_max_nodes_per_part << ") violated by part=" << i << " with part_size=" << part_size << " !!\n";
+        if (part_inbound_size > h_max_inbound_per_part)
+            std::cerr << "  WARNING, max partition inbound size constraint (" << h_max_inbound_per_part << ") violated by part=" << i << " with part_inbound_size=" << part_inbound_size << " !!\n";
     }
     int max_ps = part_count.empty() ? 0 : std::max_element(part_count.begin(), part_count.end(), [](auto &a, auto &b){ return a.second < b.second; })->second;
     std::cout << "Non-empty partitions count: " << part_count.size() << ", Max partition size: " << max_ps << "\n";

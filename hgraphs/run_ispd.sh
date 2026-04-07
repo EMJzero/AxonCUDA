@@ -22,8 +22,9 @@ RESULTS_DIR="$DATA_DIR/results_rfr4_cnc16"
 
 PROFILING=0
 NSIGHT=0
+FAILURES=0
 
-NSYS_BASE_CMD="nsys profile --stats=true --force-overwrite=true"
+NSYS_BASE_CMD=(nsys profile --stats=true --force-overwrite=true)
 
 # Nsight Compute Legend:
 # sm__maximum_warps_per_active_cycle_pct -> Warp usage efficiency
@@ -39,11 +40,12 @@ NSYS_BASE_CMD="nsys profile --stats=true --force-overwrite=true"
 # dram__throughput.avg.pct_of_peak_sustained_elapsed -> DRAM throughput vs peak
 
 # Performance profiling:
-NCU_BASE_CMD_="ncu \
---target-processes all \
---set none \
---metrics \
-sm__maximum_warps_per_active_cycle_pct,\
+NCU_BASE_CMD_=(
+  ncu
+  --target-processes all
+  --set none
+  --metrics
+  sm__maximum_warps_per_active_cycle_pct,\
 smsp__thread_inst_executed_per_inst_executed.ratio,\
 smsp__sass_branch_targets_threads_divergent.avg,\
 smsp__sass_branch_targets_threads_divergent.sum,\
@@ -53,15 +55,17 @@ smsp__sass_thread_inst_executed_op_integer_pred_on.sum,\
 dram__bytes.sum,\
 sm__throughput.avg.pct_of_peak_sustained_elapsed,\
 sm__throughput.avg.pct_of_peak_sustained_active,\
-dram__throughput.avg.pct_of_peak_sustained_elapsed \
---csv"
+dram__throughput.avg.pct_of_peak_sustained_elapsed
+  --csv
+)
 
 # Instruction mix:
-NCU_BASE_CMD="ncu \
---target-processes all \
---set none \
---metrics \
-sm__sass_thread_inst_executed_op_dfma_pred_on.sum,\
+NCU_BASE_CMD=(
+  ncu
+  --target-processes all
+  --set none
+  --metrics
+  sm__sass_thread_inst_executed_op_dfma_pred_on.sum,\
 sm__sass_thread_inst_executed_op_dmul_pred_on.sum,\
 sm__sass_thread_inst_executed_op_dadd_pred_on.sum,\
 sm__sass_thread_inst_executed_op_ffma_pred_on.sum,\
@@ -77,8 +81,9 @@ sm__sass_thread_inst_executed_op_inter_thread_communication_pred_on.sum,\
 sm__sass_thread_inst_executed_op_memory_pred_on.sum,\
 sm__sass_thread_inst_executed_op_bit_pred_on.sum,\
 sm__sass_thread_inst_executed_op_conversion_pred_on.sum,\
-sm__sass_thread_inst_executed_op_misc_pred_on.sum \
---csv"
+sm__sass_thread_inst_executed_op_misc_pred_on.sum
+  --csv
+)
 
 # -------------------------
 # Parse flags
@@ -111,32 +116,56 @@ run_case() {
   local outfile="$2"
   shift 2
 
+  local rc=0
+
   echo "========================================"
   echo "Running ${label}"
   echo "========================================"
 
   if (( PROFILING )); then
-    (
+    if ! (
       cd "$DATA_DIR"
       "${NSYS_BASE_CMD[@]}" \
         --output="${RESULTS_DIR}/${outfile}_profile" \
         "$TARGET_BIN" "${TARGET_ARGS[@]}" "$@" \
         |& tee "${RESULTS_DIR}/${outfile}.txt"
-    )
+    ); then
+      rc=$?
+    fi
+
     rm -f "${RESULTS_DIR}/${outfile}_profile".{nsys-rep,sqlite}
+
   elif (( NSIGHT )); then
-    (
+    if ! (
       cd "$DATA_DIR"
       "${NCU_BASE_CMD[@]}" \
         --log-file "${RESULTS_DIR}/${outfile}.csv" \
         "$TARGET_BIN" "${TARGET_ARGS[@]}" "$@"
-    )
+    ); then
+      rc=$?
+    fi
   else
-    (
+    if ! (
       cd "$DATA_DIR"
       "$TARGET_BIN" "${TARGET_ARGS[@]}" "$@" \
         |& tee "${RESULTS_DIR}/${outfile}"
-    )
+    ); then
+      rc=$?
+    fi
+  fi
+
+  if (( rc == 0 )); then
+    echo "Completed ${label}"
+    return 0
+  else
+    echo "FAILED ${label} (exit code ${rc})" >&2
+    return "$rc"
+  fi
+}
+
+run_case_checked() {
+  if ! run_case "$@"; then
+    ((FAILURES+=1))
   fi
 }
 
@@ -149,45 +178,50 @@ mkdir -p "$RESULTS_DIR"
 # -------------------------
 # ISPD 98 - 16x - k = 2
 # -------------------------
-run_case "01-k2"        "ispd98_01_k2"        -r ISPD98_ibm01.16xNW.hgr -k 2 0.03 -om 5
-run_case "02-k2"        "ispd98_02_k2"        -r ISPD98_ibm02.16xNW.hgr -k 2 0.03 -om 5
-run_case "03-k2"        "ispd98_03_k2"        -r ISPD98_ibm03.16xNW.hgr -k 2 0.03 -om 5
-run_case "04-k2"        "ispd98_04_k2"        -r ISPD98_ibm04.16xNW.hgr -k 2 0.03 -om 8
-run_case "05-k2"        "ispd98_05_k2"        -r ISPD98_ibm05.16xNW.hgr -k 2 0.03 -om 5
-run_case "06-k2"        "ispd98_06_k2"        -r ISPD98_ibm06.16xNW.hgr -k 2 0.03 -om 5
-run_case "07-k2"        "ispd98_07_k2"        -r ISPD98_ibm07.16xNW.hgr -k 2 0.03 -om 5
-run_case "08-k2"        "ispd98_08_k2"        -r ISPD98_ibm08.16xNW.hgr -k 2 0.03 -om 5
-run_case "09-k2"        "ispd98_09_k2"        -r ISPD98_ibm09.16xNW.hgr -k 2 0.03 -om 5
-run_case "10-k2"        "ispd98_10_k2"        -r ISPD98_ibm10.16xNW.hgr -k 2 0.03 -om 8
-run_case "11-k2"        "ispd98_11_k2"        -r ISPD98_ibm11.16xNW.hgr -k 2 0.03 -om 5
-run_case "12-k2"        "ispd98_12_k2"        -r ISPD98_ibm12.16xNW.hgr -k 2 0.03 -om 5
-run_case "13-k2"        "ispd98_13_k2"        -r ISPD98_ibm13.16xNW.hgr -k 2 0.03 -om 5
-run_case "14-k2"        "ispd98_14_k2"        -r ISPD98_ibm14.16xNW.hgr -k 2 0.03 -om 5
-run_case "15-k2"        "ispd98_15_k2"        -r ISPD98_ibm15.16xNW.hgr -k 2 0.03 -om 5
-run_case "16-k2"        "ispd98_16_k2"        -r ISPD98_ibm16.16xNW.hgr -k 2 0.03 -om 5
-run_case "17-k2"        "ispd98_17_k2"        -r ISPD98_ibm17.16xNW.hgr -k 2 0.03 -om 8
-run_case "18-k2"        "ispd98_18_k2"        -r ISPD98_ibm18.16xNW.hgr -k 2 0.03 -om 8
+run_case_checked "01-k2"        "ispd98_01_k2"        -r ISPD98_ibm01.hgr -k 2 0.03 -om 5
+run_case_checked "02-k2"        "ispd98_02_k2"        -r ISPD98_ibm02.hgr -k 2 0.03 -om 5
+run_case_checked "03-k2"        "ispd98_03_k2"        -r ISPD98_ibm03.hgr -k 2 0.03 -om 5
+run_case_checked "04-k2"        "ispd98_04_k2"        -r ISPD98_ibm04.hgr -k 2 0.03 -om 8
+run_case_checked "05-k2"        "ispd98_05_k2"        -r ISPD98_ibm05.hgr -k 2 0.03 -om 5
+run_case_checked "06-k2"        "ispd98_06_k2"        -r ISPD98_ibm06.hgr -k 2 0.03 -om 5
+run_case_checked "07-k2"        "ispd98_07_k2"        -r ISPD98_ibm07.hgr -k 2 0.03 -om 5
+run_case_checked "08-k2"        "ispd98_08_k2"        -r ISPD98_ibm08.hgr -k 2 0.03 -om 5
+run_case_checked "09-k2"        "ispd98_09_k2"        -r ISPD98_ibm09.hgr -k 2 0.03 -om 5
+run_case_checked "10-k2"        "ispd98_10_k2"        -r ISPD98_ibm10.hgr -k 2 0.03 -om 8
+run_case_checked "11-k2"        "ispd98_11_k2"        -r ISPD98_ibm11.hgr -k 2 0.03 -om 5
+run_case_checked "12-k2"        "ispd98_12_k2"        -r ISPD98_ibm12.hgr -k 2 0.03 -om 5
+run_case_checked "13-k2"        "ispd98_13_k2"        -r ISPD98_ibm13.hgr -k 2 0.03 -om 5
+run_case_checked "14-k2"        "ispd98_14_k2"        -r ISPD98_ibm14.hgr -k 2 0.03 -om 6
+run_case_checked "15-k2"        "ispd98_15_k2"        -r ISPD98_ibm15.hgr -k 2 0.03 -om 5
+run_case_checked "16-k2"        "ispd98_16_k2"        -r ISPD98_ibm16.hgr -k 2 0.03 -om 5
+run_case_checked "17-k2"        "ispd98_17_k2"        -r ISPD98_ibm17.hgr -k 2 0.03 -om 8
+run_case_checked "18-k2"        "ispd98_18_k2"        -r ISPD98_ibm18.hgr -k 2 0.03 -om 8
 
 # -------------------------
 # ISPD 98 - 16x - k = 4
 # -------------------------
-run_case "01-k4"        "ispd98_01_k4"        -r ISPD98_ibm01.16xNW.hgr -k 4 0.03 -om 5
-run_case "02-k4"        "ispd98_02_k4"        -r ISPD98_ibm02.16xNW.hgr -k 4 0.03 -om 5
-run_case "03-k4"        "ispd98_03_k4"        -r ISPD98_ibm03.16xNW.hgr -k 4 0.03 -om 5
-run_case "04-k4"        "ispd98_04_k4"        -r ISPD98_ibm04.16xNW.hgr -k 4 0.03 -om 8
-run_case "05-k4"        "ispd98_05_k4"        -r ISPD98_ibm05.16xNW.hgr -k 4 0.03 -om 5
-run_case "06-k4"        "ispd98_06_k4"        -r ISPD98_ibm06.16xNW.hgr -k 4 0.03 -om 5
-run_case "07-k4"        "ispd98_07_k4"        -r ISPD98_ibm07.16xNW.hgr -k 4 0.03 -om 5
-run_case "08-k4"        "ispd98_08_k4"        -r ISPD98_ibm08.16xNW.hgr -k 4 0.03 -om 5
-run_case "09-k4"        "ispd98_09_k4"        -r ISPD98_ibm09.16xNW.hgr -k 4 0.03 -om 5
-run_case "10-k4"        "ispd98_10_k4"        -r ISPD98_ibm10.16xNW.hgr -k 4 0.03 -om 8
-run_case "11-k4"        "ispd98_11_k4"        -r ISPD98_ibm11.16xNW.hgr -k 4 0.03 -om 5
-run_case "12-k4"        "ispd98_12_k4"        -r ISPD98_ibm12.16xNW.hgr -k 4 0.03 -om 5
-run_case "13-k4"        "ispd98_13_k4"        -r ISPD98_ibm13.16xNW.hgr -k 4 0.03 -om 5
-run_case "14-k4"        "ispd98_14_k4"        -r ISPD98_ibm14.16xNW.hgr -k 4 0.03 -om 5
-run_case "15-k4"        "ispd98_15_k4"        -r ISPD98_ibm15.16xNW.hgr -k 4 0.03 -om 5
-run_case "16-k4"        "ispd98_16_k4"        -r ISPD98_ibm16.16xNW.hgr -k 4 0.03 -om 5
-run_case "17-k4"        "ispd98_17_k4"        -r ISPD98_ibm17.16xNW.hgr -k 4 0.03 -om 8
-run_case "18-k4"        "ispd98_18_k4"        -r ISPD98_ibm18.16xNW.hgr -k 4 0.03 -om 8
+run_case_checked "01-k4"        "ispd98_01_k4"        -r ISPD98_ibm01.hgr -k 4 0.03 -om 5
+run_case_checked "02-k4"        "ispd98_02_k4"        -r ISPD98_ibm02.hgr -k 4 0.03 -om 5
+run_case_checked "03-k4"        "ispd98_03_k4"        -r ISPD98_ibm03.hgr -k 4 0.03 -om 5
+run_case_checked "04-k4"        "ispd98_04_k4"        -r ISPD98_ibm04.hgr -k 4 0.03 -om 8
+run_case_checked "05-k4"        "ispd98_05_k4"        -r ISPD98_ibm05.hgr -k 4 0.03 -om 5
+run_case_checked "06-k4"        "ispd98_06_k4"        -r ISPD98_ibm06.hgr -k 4 0.03 -om 5
+run_case_checked "07-k4"        "ispd98_07_k4"        -r ISPD98_ibm07.hgr -k 4 0.03 -om 5
+run_case_checked "08-k4"        "ispd98_08_k4"        -r ISPD98_ibm08.hgr -k 4 0.03 -om 5
+run_case_checked "09-k4"        "ispd98_09_k4"        -r ISPD98_ibm09.hgr -k 4 0.03 -om 5
+run_case_checked "10-k4"        "ispd98_10_k4"        -r ISPD98_ibm10.hgr -k 4 0.03 -om 8
+run_case_checked "11-k4"        "ispd98_11_k4"        -r ISPD98_ibm11.hgr -k 4 0.03 -om 5
+run_case_checked "12-k4"        "ispd98_12_k4"        -r ISPD98_ibm12.hgr -k 4 0.03 -om 5
+run_case_checked "13-k4"        "ispd98_13_k4"        -r ISPD98_ibm13.hgr -k 4 0.03 -om 5
+run_case_checked "14-k4"        "ispd98_14_k4"        -r ISPD98_ibm14.hgr -k 4 0.03 -om 6
+run_case_checked "15-k4"        "ispd98_15_k4"        -r ISPD98_ibm15.hgr -k 4 0.03 -om 5
+run_case_checked "16-k4"        "ispd98_16_k4"        -r ISPD98_ibm16.hgr -k 4 0.03 -om 5
+run_case_checked "17-k4"        "ispd98_17_k4"        -r ISPD98_ibm17.hgr -k 4 0.03 -om 8
+run_case_checked "18-k4"        "ispd98_18_k4"        -r ISPD98_ibm18.hgr -k 4 0.03 -om 8
+
+if (( FAILURES > 0 )); then
+  echo "All runs completed, with ${FAILURES} failure(s)." >&2
+  exit 1
+fi
 
 echo "All runs completed."

@@ -534,7 +534,7 @@ void count_inbound_size_events_kernel(
     const int32_t* __restrict__ ev_delta,
     const uint32_t num_events,
     const uint32_t num_partitions,
-    uint32_t* inbound_size_events_offsets // init. to zero
+    dim_t* inbound_size_events_offsets // init. to zero
 ) {
     // STYLE: one event per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -565,7 +565,7 @@ void build_inbound_size_events_kernel(
     const uint32_t* __restrict__ ev_index,
     const uint32_t* __restrict__ ev_hedge,
     const int32_t* __restrict__ ev_delta,
-    const uint32_t* inbound_size_events_offsets,
+    const dim_t* inbound_size_events_offsets,
     const uint32_t num_events,
     const uint32_t num_partitions,
     uint32_t* __restrict__ new_ev_partition,
@@ -611,7 +611,7 @@ void flag_inbound_events_kernel(
     const uint32_t* __restrict__ ev_index,
     const int32_t* __restrict__ ev_delta,
     const uint32_t* __restrict__ partitions_inbound_sizes, // partitions_inbound_sizes[part] = size of the inbound set for part
-    const uint32_t num_events,
+    const dim_t num_events,
     int32_t* __restrict__ valid_moves // initialized with 0s
 ) {
     // STYLE: one event per thread!
@@ -912,6 +912,7 @@ void fm_refinement_cascade_sparse_ppp_kernel(
     const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ touching,
     const dim_t* __restrict__ touching_offsets,
+    const uint32_t *inbound_count,
     const float* hedge_weights,
     const uint32_t* __restrict__ move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
     const uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
@@ -923,7 +924,9 @@ void fm_refinement_cascade_sparse_ppp_kernel(
     const uint32_t num_partitions,
     const uint32_t ppp_per_hedge,
     const bool encourage_all_moves,
-    float* __restrict__ scores // scores[move_ranks[node_idx]] -> gain for node idx's move
+    float* __restrict__ scores, // scores[move_ranks[node_idx]] -> gain for node idx's move
+    dim_t* __restrict__ size_events_offsets, // size_events_offsets[node_idx] -> set to "1" if the node has a valid move
+    dim_t* __restrict__ inbound_events_offsets // inbound_events_offsets[node idx] -> set to the node's "inbound set size", if it has a valid move
 ) {
     // STYLE: one node (move) per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
@@ -984,8 +987,103 @@ void fm_refinement_cascade_sparse_ppp_kernel(
             score += my_hedge_weight / (true_curr_part_counter * true_curr_part_counter);
     }
 
-    if (lane_id == 0)
+    if (lane_id == 0) {
         scores[my_move_rank] = score;
+        size_events_offsets[warp_id] = 1;
+        inbound_events_offsets[warp_id] = inbound_count[warp_id];
+    }
+}
+
+// see "build_size_events_kernel"
+__global__
+void build_size_events_sparse_kernel(
+    const uint32_t* __restrict__ moves,
+    const uint32_t* __restrict__ ranks,
+    const uint32_t* __restrict__ partitions,
+    const uint32_t* __restrict__ nodes_sizes,
+    const dim_t* __restrict__ size_ev_offsets,
+    const uint32_t num_nodes,
+    uint32_t* __restrict__ ev_partition,
+    uint32_t* __restrict__ ev_index,
+    int32_t* __restrict__ ev_delta
+) {
+    // STYLE: one node (move) per thread!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_nodes) return;
+
+    const uint32_t dst_part = moves[tid];
+    // create no events for invalid moves
+    if (dst_part == UINT32_MAX) return;
+    const int32_t size = static_cast<int32_t>(nodes_sizes[tid]);
+    const uint32_t rank = ranks[tid];
+
+    // first event: node leaves its current partition
+    const uint32_t e0 = 2 * size_ev_offsets[tid];
+    // second event: node enters its destination partition
+    const uint32_t e1 = e0 + 1;
+
+    ev_partition[e0] = partitions[tid];
+    ev_index[e0] = rank;
+    ev_delta[e0] = -size;
+
+    ev_partition[e1] = dst_part;
+    ev_index[e1] = rank;
+    ev_delta[e1] = size;
+}
+
+// see "build_hedge_events_kernel"
+__global__
+void build_hedge_events_sparse_kernel(
+    const uint32_t* __restrict__ moves,
+    const uint32_t* __restrict__ ranks,
+    const uint32_t* __restrict__ partitions,
+    const uint32_t* __restrict__ touching,
+    const dim_t* __restrict__ touching_offsets,
+    const uint32_t* __restrict__ inbound_count,
+    const dim_t* __restrict__ inbound_ev_offsets,
+    const uint32_t num_nodes,
+    uint32_t* __restrict__ ev_partition, // init. to UINT32_MAX (to spot invalid ones later)
+    uint32_t* __restrict__ ev_index,
+    uint32_t* __restrict__ ev_hedge,
+    int32_t* __restrict__ ev_delta
+) {
+    // STYLE: one node (move) per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the node to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_nodes) return;
+
+    const uint32_t dst_part = moves[warp_id];
+    if (dst_part == UINT32_MAX) return;
+    const uint32_t src_part = partitions[warp_id];
+    const uint32_t my_rank = ranks[warp_id];
+
+    const dim_t ev_offset = inbound_ev_offsets[warp_id];
+    uint32_t *my_ev_partition = ev_partition + 2 * ev_offset + 2 * lane_id;
+    uint32_t *my_ev_index = ev_index + 2 * ev_offset + 2 * lane_id;
+    uint32_t *my_ev_hedge = ev_hedge + 2 * ev_offset + 2 * lane_id;
+    int32_t *my_ev_delta = ev_delta + 2 * ev_offset + 2 * lane_id;
+
+    const uint32_t* inbound = touching + touching_offsets[warp_id];
+    const uint32_t my_inbound_count = inbound_count[warp_id];
+    for (uint32_t i = lane_id; i < my_inbound_count; i += WARP_SIZE) {
+        uint32_t hedge = inbound[i];
+        // first event: hedge does not touches one less time the node's current partition
+        my_ev_partition[0] = src_part;
+        my_ev_index[0] = my_rank;
+        my_ev_hedge[0] = hedge;
+        my_ev_delta[0] = -1;
+        // second event: hedge touches one more time the node's destination partition
+        my_ev_partition[1] = dst_part;
+        my_ev_index[1] = my_rank;
+        my_ev_hedge[1] = hedge;
+        my_ev_delta[1] = +1;
+        
+        my_ev_partition += 2 * WARP_SIZE;
+        my_ev_index += 2 * WARP_SIZE;
+        my_ev_hedge += 2 * WARP_SIZE;
+        my_ev_delta += 2 * WARP_SIZE;
+    }
 }
 
 // see "count_inbound_size_events_kernel"
@@ -1000,7 +1098,7 @@ void count_inbound_size_events_sparse_ppp_kernel(
     const uint32_t num_events,
     const uint32_t num_partitions,
     const uint32_t ppp_per_hedge,
-    uint32_t* inbound_size_events_offsets // init. to zero
+    dim_t* inbound_size_events_offsets // init. to zero
 ) {
     // STYLE: one event per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1032,7 +1130,7 @@ void build_inbound_size_events_sparse_ppp_kernel(
     const uint32_t* __restrict__ ev_index,
     const uint32_t* __restrict__ ev_hedge,
     const int32_t* __restrict__ ev_delta,
-    const uint32_t* inbound_size_events_offsets,
+    const dim_t* inbound_size_events_offsets,
     const uint32_t num_events,
     const uint32_t num_partitions,
     const uint32_t ppp_per_hedge,
@@ -1067,5 +1165,56 @@ void build_inbound_size_events_sparse_ppp_kernel(
         new_ev_partition[new_ev_offset] = part;
         new_ev_index[new_ev_offset] = ev_index[tid];
         new_ev_delta[new_ev_offset] = -1;
+    }
+}
+
+// straight up compute inbound set sizes from hedges
+// SEQUENTIAL COMPLEXITY: e*d
+// PARALLEL OVER: e
+// SHUFFLES OVER: d
+__global__
+void inbound_sets_size_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const uint32_t* __restrict__ partitions,
+    const uint32_t num_hedges,
+    const uint32_t num_partitions,
+    uint32_t* __restrict__ pp_map,
+    uint32_t* __restrict__ partitions_inbound_sizes
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the sample to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    const dim_t hedge_start_idx = hedges_offsets[warp_id] + srcs_count[warp_id], hedge_end_idx = hedges_offsets[warp_id + 1];
+    const uint32_t *hedge_start = hedges + hedge_start_idx, *hedge_end = hedges + hedge_end_idx;
+    uint32_t *my_pp_map = pp_map + static_cast<dim_t>(warp_id) * ((num_partitions + 31u) / 32u);
+
+    for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_end; curr += WARP_SIZE) {
+        const uint32_t part = partitions[*curr];
+        // => since multiple threads might want to write the same 32bit word, make them agree on a single update per word
+        const dim_t pp_map_idx = part >> 5u; // aka: part / 2**5
+        const uint32_t pp_map_bit = 1u << (part & 31u); // aka: put a 1 in position part % 32
+        const unsigned active = __activemask();
+        // lanes targeting the same 64+64-bit word cooperate
+        const unsigned peers = __match_any_sync(active, pp_map_idx);
+        // OR-reduce all bit requests for the same word across peers
+        const uint64_t combined_mask = __reduce_or_sync(peers, pp_map_bit);
+        const int leader = __ffs(peers) - 1;
+        uint32_t prev;
+        if (static_cast<int>(lane_id) == leader) {
+            // exactly one writer per map per iteration
+            uint32_t* pp_ptr = my_pp_map + pp_map_idx;
+            const uint32_t old_map = *pp_ptr;
+            const uint32_t updated_bitmap = old_map | combined_mask;
+            *pp_ptr = updated_bitmap;
+            prev = __shfl_sync(peers, old_map, leader);
+        } else {
+            prev = __shfl_sync(peers, 0u, leader);
+        }
+        if ((prev & pp_map_bit) == 0) atomicAdd(&partitions_inbound_sizes[part], 1u);
     }
 }
