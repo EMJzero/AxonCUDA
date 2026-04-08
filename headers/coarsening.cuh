@@ -25,9 +25,12 @@ namespace cg = cooperative_groups;
 
 // USED BY: grouping kernel
 
+// NOTE: PATH_SIZE (and PATH_SIZE_EXTENSION) is shared among repeats, this means that in the worst case you will have only PATH_SIZE / MAX_MATCHING_REPEATS entries per node!
+#define PATH_SIZE 224u // initial slots for nodes to see while traversing the pairs tree
+#define PATH_SIZE_EXTENSION 256u // additional slots to use if PATH_SIZE is exhausted (global memory - costly...)
+#define MAX_MATCHING_REPEATS 64u // maximum number of nodes a single thread can handle, must be less than 64 (due to using one-hot anti-repeat encoding)
+
 // #define MAX_GROUP_SIZE 1u // => MAX_GROUP_SIZE - 1 slots per node; 2 means pairs [IDEA NOT WORTH IT]
-#define PATH_SIZE 224u // initial slots for nodes to see while traversing the pairs tree, TODO: automatically extend if needed (costly...)
-#define MAX_MATCHING_REPEATS 64u // maximum number of nodes a single thread can handle, must be less than 32 (due to using one-hot anti-repeat encoding)
 
 
 // STEPS
@@ -107,9 +110,9 @@ void grouping_kernel(
     const uint32_t* __restrict__ scores,
     const uint32_t* __restrict__ nodes_sizes,
     const uint32_t num_nodes,
-    const uint32_t num_repeats,
     const uint32_t candidates_count,
     slot* __restrict__ group_slots,
     dp_score* __restrict__ d_dp_scores,
-    uint32_t* __restrict__ groups
+    uint32_t* __restrict__ groups,
+    uint32_t* __restrict__ extra_paths
 );

@@ -90,20 +90,31 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
     uint32_t *d_groups = nullptr; // groups[node idx] -> node's group id (zero-based)
     CUDA_CHECK(cudaMalloc(&d_groups, curr_num_nodes * sizeof(uint32_t)));
 
+    // prepare the extra path size
+    uint32_t *d_extra_paths = nullptr; // extra_paths[thread idx * PATH_SIZE_EXTENSION] -> additional path for the thread
+
     // launch configuration - grouping kernel
     {
-        int threads_per_block = 256;
+        int threads_per_block = 64;
         int num_threads_needed = curr_num_nodes; // 1 thread per node
         int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-        size_t bytes_per_thread = 0; //TODO
+        size_t bytes_per_thread = 0;
         size_t shared_bytes = threads_per_block * bytes_per_thread;
+        //uint32_t entries_per_thread = (uint32_t)(bytes_per_thread / sizeof(uint32_t));
+        // additinal checks for runtime-dependent stack size
+        //size_t stackSize;
+        //cudaDeviceGetLimit(&stackSize, cudaLimitStackSize);
+        //constexpr size_t required_stack = (PATH_SIZE + PATH_SIZE_EXTENSION + 2 * MAX_MATCHING_REPEATS) * sizeof(uint32_t);
+        //if (stackSize < required_stack) { // must increase the stacksize limit !!
+        //    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, required_stack));
+        //    INFO(cfg) std::cout << "Stack size limit increased to " << std::fixed << std::setprecision(1) << (float)(required_stack) / (1 << 10) << " KB\n";
+        //}
         // additional checks for the cooperative kernel mode
         int blocks_per_SM = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_SM, grouping_kernel, threads_per_block, shared_bytes);
         int max_blocks = blocks_per_SM * props.multiProcessorCount;
-        uint32_t num_repeats = 1;
         if (blocks > max_blocks) {
-            num_repeats = (blocks + max_blocks - 1) / max_blocks;
+            const uint32_t num_repeats = (blocks + max_blocks - 1) / max_blocks;
             LOG(cfg) std::cout << "NOTE: grouping kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
             blocks = (blocks + num_repeats - 1) / num_repeats;
             if (num_repeats > MAX_MATCHING_REPEATS) {
@@ -111,6 +122,7 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
                 abort();
             }
         }
+        CUDA_CHECK(cudaMalloc(&d_extra_paths, threads_per_block * blocks * PATH_SIZE_EXTENSION * sizeof(uint32_t)));
         // launch - grouping kernel
         LAUNCH(cfg) << "grouping kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         void *kernel_args[] = {
@@ -118,16 +130,17 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
             (void*)&d_u_scores,
             (void*)&d_nodes_sizes,
             (void*)&curr_num_nodes,
-            (void*)&num_repeats,
             (void*)&cfg.candidates_count,
             (void*)&d_slots,
             (void*)&d_dp_scores,
-            (void*)&d_groups
+            (void*)&d_groups,
+            (void*)&d_extra_paths
         };
         cudaLaunchCooperativeKernel((void*)grouping_kernel, blocks, threads_per_block, kernel_args, shared_bytes);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+    CUDA_CHECK(cudaFree(d_extra_paths));
 
     // for nodes that have no candidate and are left alone (no -valid- neighbors), try to pair them up with each other as to create as many groups as possible
     // => impose the sum of sizes and the sum of inbound set sizes < constraints

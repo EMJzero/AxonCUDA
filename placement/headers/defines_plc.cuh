@@ -27,6 +27,8 @@
 //       => infer it especially from the hardware width/height, that determine the manhattan distance range
 #define FORCE_FIXED_POINT_SCALE 262144u
 
+#define MULTISTART_ATTEMPTS -1u // -1 -> decide at runtime based on parallel resource
+
 
 // USED BY: recursive bipartitioning
 

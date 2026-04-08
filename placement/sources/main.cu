@@ -68,9 +68,9 @@ int main(int argc, char** argv) {
     std::cout << "  Seed:                            " << cfg.seed << "\n";
     std::cout << "  Force-directed iterations:       " << cfg.fd_iterations << "\n";
     std::cout << "  Force-directed candidates count: " << cfg.candidates_count << "\n";
-    std::cout << "  Multi-start attempts:            " << cfg.multi_start_override << "\n";
+    std::cout << "  Multi-start attempts:            " << (cfg.multi_start_override == UINT32_MAX ? "<max-occupancy>" : cfg.multi_start_override) << "\n";
     std::cout << "  Label propagation repeats:       " << cfg.labelprop_repeats << "\n";
-    std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc, " : "") << (cfg.feedforward_order ? "ff " : "") << "\n";
+    std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc " : "") << (cfg.feedforward_order ? "ff " : "") << "\n";
 
     if (hg.nodes() > hw.coresAlongX() * hw.coresAlongY()) {
         ERR(cfg) std::cerr << "ERROR, the hypergraph has more nodes (" << hg.nodes() << ") than the 2D lattice has points (" << hw.coresAlongX() * hw.coresAlongY() << "), placement would fail !!\n";

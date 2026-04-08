@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 DATA_DIR="$(cd -P "$SCRIPT_DIR/snns" && pwd)"
 TARGET_BIN="$(cd -P "$SCRIPT_DIR/.." && pwd)/hgraph_gpu.exe"
 TARGET_ARGS=(-rfr 16 -cnc 4 -dtc -ipm -v 0) # can be later overriden per-run
-RESULTS_DIR="$DATA_DIR/results_rfr4_cnc16"
+RESULTS_DIR="$DATA_DIR/results_cnc4_rfr16"
 
 PROFILING=0
 NSIGHT=0

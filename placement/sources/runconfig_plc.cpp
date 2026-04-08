@@ -51,7 +51,7 @@ namespace config_plc {
         uint32_t labelprop_repeats = LABELPROP_REPEATS;
         uint32_t fd_iterations = FD_ITERATIONS;
         uint32_t candidates_count = MAX_CANDIDATE_MOVES;
-        uint32_t multi_start_override = UINT32_MAX;
+        uint32_t multi_start_override = MULTISTART_ATTEMPTS;
         bool feedforward_order = false; // NB: runs sequentially on the HOST!
         bool device_touching_construction = false;
         uint64_t seed = SEED;

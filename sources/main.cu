@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
     std::cout << "  Refinement repetitions:      " << cfg.refine_repeats << "\n";
     std::cout << "  Oversized multiplier factor: " << std::fixed << std::setprecision(2) << cfg.oversized_multiplier << "\n";
     std::cout << "  Host memory spill levels:    " << cfg.save_memory_up_to_level << "\n";
-    std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc, " : "") << (cfg.initial_partitions_merge ? "ipm " : "") << "\n";
+    std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc " : "") << (cfg.initial_partitions_merge ? "ipm " : "") << "\n";
 
     std::cout << "CUDA device:\n";
     

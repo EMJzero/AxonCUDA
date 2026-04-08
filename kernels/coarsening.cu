@@ -212,6 +212,29 @@ void candidates_kernel(
     }
 }
 
+// HELPERS: for accessing the grouping path
+__device__ __forceinline__ uint32_t get_path(uint32_t* path, uint32_t* extra_path, const uint32_t offset, const uint32_t idx) {
+    const uint32_t actual_idx = offset + idx;
+    if (actual_idx < PATH_SIZE) { // still using pre-allocated local memory
+        return path[actual_idx];
+    } else { // using the memory extension allocated on the stack
+        assert(actual_idx < PATH_SIZE_EXTENSION + PATH_SIZE); // available path size exceeded !!
+        assert(extra_path != nullptr); // something broke, stack not yet allocated !!
+        return extra_path[actual_idx - PATH_SIZE];
+    }
+}
+// |
+__device__ __forceinline__ void set_path(uint32_t* path, uint32_t*& extra_path, const uint32_t offset, const uint32_t idx, const uint32_t val) {
+    const uint32_t actual_idx = offset + idx;
+    if (actual_idx < PATH_SIZE) { // still using pre-allocated local memory
+        path[actual_idx] = val;
+    } else { // using the memory extension allocated on the stack
+        assert(actual_idx < PATH_SIZE_EXTENSION + PATH_SIZE); // available path size exceeded !!
+        //if (extra_path == nullptr) extra_path = (uint32_t*)alloca(PATH_SIZE_EXTENSION * sizeof(uint32_t)); // stack allocation
+        extra_path[actual_idx - PATH_SIZE] = val;
+    }
+}
+
 // create groups of at most MAX_GROUP_SIZE ( =2 for now ) nodes, highest score first
 // SEQUENTIAL COMPLEXITY: n*log n
 // PARALLEL OVER: n
@@ -221,18 +244,21 @@ void grouping_kernel(
     const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be grouped with pairs[idx] (0 if undefined)
     const uint32_t* __restrict__ nodes_sizes,
     const uint32_t num_nodes,
-    const uint32_t num_repeats,
     const uint32_t candidates_count,
     slot* __restrict__ group_slots, // initialized with -1 on the id
     dp_score* __restrict__ dp_scores, // dynamic programming alternating scores, initialize to 0s
-    uint32_t* __restrict__ groups // uninitialized, final group id of each node (non-zero based for now)
+    uint32_t* __restrict__ groups, // uninitialized, final group id of each node (non-zero based for now)
+    uint32_t* __restrict__ extra_paths // extra path size allocated globally
 ) {
     // SETUP FOR GLOBAL SYNC
     cg::grid_group grid = cg::this_grid();
 
-    // STYLE: 'num_repeats' node per thread!
+    // STYLE: "num_repeats" nodes per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t tcount = gridDim.x * blockDim.x;
+
+    const uint32_t num_repeats = (num_nodes + tcount - 1) / tcount;
+    const uint32_t actual_repeats = tid < num_nodes ? 1u + (num_nodes - 1u - tid) / tcount : 0u;
 
     /*
     * Logic: a walk up (and down) the tree for grouping!
@@ -329,12 +355,21 @@ void grouping_kernel(
     */
 
     int32_t path_length[MAX_MATCHING_REPEATS];
+    
+    uint32_t path[PATH_SIZE]; // in registers memory (if small enough)
+    uint32_t* extra_path = extra_paths + tid * PATH_SIZE_EXTENSION; // in global memory
 
-    uint32_t path[PATH_SIZE];
-    const uint32_t actual_path_size = PATH_SIZE / num_repeats;
-    uint32_t completed_repeats = 0u;
+    uint32_t total_path_length = 0u; // cumulative between repeats - the offset where the current path starts
 
-    for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+    // TODO:
+    // - create a copy of this file in the current state
+    // - before calling this kernel, set the cuda stack size limit to PATH_SIZE*max_repeats*sizeof(uint32_t)? Then remember to reset it!
+    // - allocate a PATH_SIZE*repeats buffer at the start of each thread, on its stack
+    // - if a repeat hits the PATH_SIZE limit, rather than an assert, allow up to MAX_PATH_EXTENSIONS (=2 maybe) new allocations
+
+    uint64_t completed_repeats = 0u;
+
+    for (int32_t repeat = 0; repeat < actual_repeats; repeat++) {
         const uint32_t curr_tid = tid + repeat * tcount;
         // initialize yourself to a one-node group, unless someone already claimed you
         if (curr_tid < num_nodes) atomicCAS(&reinterpret_cast<unsigned long long*>(group_slots)[curr_tid], pack_slot(0u, UINT32_MAX), pack_slot(0u, curr_tid));
@@ -342,15 +377,14 @@ void grouping_kernel(
 
     for (uint32_t i = 0; i < candidates_count; i++) {
         // repeat for every node that you need to handle
-        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+        for (int32_t repeat = 0; repeat < actual_repeats; repeat++) {
             const uint32_t curr_tid = tid + repeat * tcount;
 
             // if you are not a valid node
             if (curr_tid >= num_nodes) break;
             // if you formed a pair, stop
-            if (completed_repeats & (1u << repeat)) continue;
+            if (completed_repeats & (1ull << repeat)) continue;
 
-            uint32_t* curr_path = path + actual_path_size * repeat;
             int32_t curr_path_length = 0;
 
             uint32_t current = curr_tid; // current node in the tree of pairs
@@ -385,8 +419,7 @@ void grouping_kernel(
                         }
                     }
                     if (die) break;*/
-                    assert(curr_path_length < actual_path_size);
-                    curr_path[curr_path_length++] = target;
+                    set_path(path, extra_path, total_path_length, curr_path_length++, target);
                     current = target;
                     target = target_target;
                     if (target == UINT32_MAX) break; // alternative root: a node with no target
@@ -395,43 +428,36 @@ void grouping_kernel(
                     score_with = target_score_wout_sum + scores[current * candidates_count + i]; // if the next node up the tree will get paired, then his score is his own candidate score, and all children's "w/out"
                 }
                 // no need to handle root pair, since we already broke the pair and made the lower-id node the sole root
-                // => the result does not change, since the lower-id node will be contended between the gains of the two subtrees
-                // handle "root(s)" as a pair of nodes pointing to each other from the POV of the lower-id node of the two
-                //if (current == target_target && current < target) {
-                    // tie back to your target (other root node) iff there is more to gain
-                    //const uint32_t with_sum = score_with + atomicAdd(&dp_scores[target].with, 0); // sum of the two roots' with dp_score and their score
-                    //const uint32_t holder_with_minus_wout = get_slot(group_slots, target).score;
-                    //const uint32_t wout_sum = score_wout + atomicAdd(&dp_scores[target].with, 0) + holder_with_minus_wout; // sum of the two root's wout dp_scores
-                    //if (with_sum > wout_sum) ...
-                //}
             }
 
             path_length[repeat] = curr_path_length;
+            total_path_length += curr_path_length;
         }
 
         // global synch
         grid.sync();
 
         // repeat for every node that you need to handle
-        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+        // NOTE: do these backward as to unfold the path from the rear
+        for (int32_t repeat = actual_repeats - 1; repeat >= 0; repeat--) {
             const uint32_t curr_tid = tid + repeat * tcount;
 
             // if you are not a valid node
             if (curr_tid >= num_nodes) break;
             // if you formed a pair, stop
-            if (completed_repeats & (1u << repeat)) continue;
+            if (completed_repeats & (1ull << repeat)) continue;
 
-            uint32_t* curr_path = path + actual_path_size * repeat;
             int32_t curr_path_length = path_length[repeat];
-            path_length[repeat] = 0;
+            total_path_length -= curr_path_length;
+            path_length[repeat] = 0; // reset for the next round
 
             // go down the tree
             // it the root had no target, path[path_length - 1] is the root, if the root was a mutual-poiting pair, path[path_length - 1] is the first encountered node of the pair
             uint32_t current, target;
             for (curr_path_length = curr_path_length - 2; curr_path_length >= 0; curr_path_length--) {
                 // NOTE: on the first iteration, coming from the upward walk, "current" is the last node that got its slot updated
-                target = curr_path[curr_path_length + 1]; // this is "who current would have liked to be with", the node one step back up the ladder towards root
-                current = curr_path[curr_path_length];
+                target = get_path(path, extra_path, total_path_length, curr_path_length + 1); // this is "who current would have liked to be with", the node one step back up the ladder towards root
+                current = get_path(path, extra_path, total_path_length, curr_path_length);
                 if (group_slots[target].id == current) {
                     // TODO: maybe writing only after reading and checking if someone else already wrote can spare cache coherence chaos - concurrent writes are still fine
                     group_slots[current].id = current;
@@ -444,7 +470,7 @@ void grouping_kernel(
             }
             // the path did not include the "curr_tid" node, handle it here iff you did not happen to group path[0] with path[1] during the last iteration above (leading to path_length == -2)
             if (curr_path_length == -1) {
-                target = curr_path[0];
+                target = get_path(path, extra_path, total_path_length, 0);
                 current = curr_tid;
                 if (group_slots[target].id == current) {
                     group_slots[current].id = current;
@@ -459,13 +485,13 @@ void grouping_kernel(
         grid.sync();
 
         // anyone not yet selected (score != UINT32_MAX), set your score to 0 to enable the next pairing round, then sync again and continue
-        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+        for (int32_t repeat = 0; repeat < actual_repeats; repeat++) {
             const uint32_t curr_tid = tid + repeat * tcount;
             if (curr_tid >= num_nodes) break;
             // if you formed a pair, stop
-            if (completed_repeats & (1u << repeat)) continue;
+            if (completed_repeats & (1ull << repeat)) continue;
             if (group_slots[curr_tid].score == UINT32_MAX) {
-                completed_repeats |= (1u << repeat);
+                completed_repeats |= (1ull << repeat);
                 continue;
             }
             group_slots[curr_tid].score = 0;
