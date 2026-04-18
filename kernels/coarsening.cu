@@ -230,7 +230,6 @@ __device__ __forceinline__ void set_path(uint32_t* path, uint32_t*& extra_path, 
         path[actual_idx] = val;
     } else { // using the memory extension allocated on the stack
         assert(actual_idx < PATH_SIZE_EXTENSION + PATH_SIZE); // available path size exceeded !!
-        //if (extra_path == nullptr) extra_path = (uint32_t*)alloca(PATH_SIZE_EXTENSION * sizeof(uint32_t)); // stack allocation
         extra_path[actual_idx - PATH_SIZE] = val;
     }
 }
@@ -257,8 +256,9 @@ void grouping_kernel(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t tcount = gridDim.x * blockDim.x;
 
-    const uint32_t num_repeats = (num_nodes + tcount - 1) / tcount;
+    //const uint32_t num_repeats = (num_nodes + tcount - 1) / tcount;
     const uint32_t actual_repeats = tid < num_nodes ? 1u + (num_nodes - 1u - tid) / tcount : 0u;
+    if (actual_repeats == 0) return;
 
     /*
     * Logic: a walk up (and down) the tree for grouping!
@@ -355,7 +355,7 @@ void grouping_kernel(
     */
 
     int32_t path_length[MAX_MATCHING_REPEATS];
-    
+
     uint32_t path[PATH_SIZE]; // in registers memory (if small enough)
     uint32_t* extra_path = extra_paths + tid * PATH_SIZE_EXTENSION; // in global memory
 
@@ -372,7 +372,7 @@ void grouping_kernel(
     for (int32_t repeat = 0; repeat < actual_repeats; repeat++) {
         const uint32_t curr_tid = tid + repeat * tcount;
         // initialize yourself to a one-node group, unless someone already claimed you
-        if (curr_tid < num_nodes) atomicCAS(&reinterpret_cast<unsigned long long*>(group_slots)[curr_tid], pack_slot(0u, UINT32_MAX), pack_slot(0u, curr_tid));
+        atomicCAS(&reinterpret_cast<unsigned long long*>(group_slots)[curr_tid], pack_slot(0u, UINT32_MAX), pack_slot(0u, curr_tid));
     }
 
     for (uint32_t i = 0; i < candidates_count; i++) {
@@ -380,8 +380,6 @@ void grouping_kernel(
         for (int32_t repeat = 0; repeat < actual_repeats; repeat++) {
             const uint32_t curr_tid = tid + repeat * tcount;
 
-            // if you are not a valid node
-            if (curr_tid >= num_nodes) break;
             // if you formed a pair, stop
             if (completed_repeats & (1ull << repeat)) continue;
 
@@ -442,8 +440,6 @@ void grouping_kernel(
         for (int32_t repeat = actual_repeats - 1; repeat >= 0; repeat--) {
             const uint32_t curr_tid = tid + repeat * tcount;
 
-            // if you are not a valid node
-            if (curr_tid >= num_nodes) break;
             // if you formed a pair, stop
             if (completed_repeats & (1ull << repeat)) continue;
 
@@ -487,7 +483,6 @@ void grouping_kernel(
         // anyone not yet selected (score != UINT32_MAX), set your score to 0 to enable the next pairing round, then sync again and continue
         for (int32_t repeat = 0; repeat < actual_repeats; repeat++) {
             const uint32_t curr_tid = tid + repeat * tcount;
-            if (curr_tid >= num_nodes) break;
             // if you formed a pair, stop
             if (completed_repeats & (1ull << repeat)) continue;
             if (group_slots[curr_tid].score == UINT32_MAX) {
@@ -503,9 +498,8 @@ void grouping_kernel(
     }
 
     // write inside "groups" the minimum id among each node's slots, used to identify its group, eventually, zero-base those ids
-    for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+    for (uint32_t repeat = 0; repeat < actual_repeats; repeat++) {
         const uint32_t curr_tid = tid + repeat * tcount;
-        if (curr_tid >= num_nodes) break;
         groups[curr_tid] = group_slots[curr_tid].id;
     }
 }

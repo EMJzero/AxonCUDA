@@ -25,9 +25,10 @@
 
 // TODO: infer this at runtime, make it a device-side constant
 //       => infer it especially from the hardware width/height, that determine the manhattan distance range
-#define FORCE_FIXED_POINT_SCALE 262144u
+#define FORCE_FIXED_POINT_SCALE 131072u
 
 #define MULTISTART_ATTEMPTS -1u // -1 -> decide at runtime based on parallel resource
+#define NUM_HOST_THREADS -1u // -1 -> decide at runtime based cores count
 
 
 // USED BY: recursive bipartitioning

@@ -48,16 +48,21 @@ Then, make sure `mtkahypar` is a valid executable in your environment.
 
 Build this project:
 ```sh
+# optional: override target compute capability (ex. with 'sm_80')
+sed -i 's/native/sm_80/' makefile
 # straight build
 make clean && make
-# build for multiple GPU architectures (e.g. A100, RTX 2080ti)
-make -f makefile.portable
 ```
 
 
 ## Usage
 
 Refer to the help menu `./hgraph_gpu.exe -h` for detailed usage instructions.
+
+AxonCUDA supports two partitioning modes.
+Inbound constrained minimal partitioning, that attempts to construct the fewest partitions under size and inbound set size constraints per-partition.
+K-way balanced partitioning, with a fixed number of partitions and a constraint only on partition size.
+Both modes optimize for minimum connectivity, but cut-net and SOED also improve as a side-effect (see [metrics](#hypergraph-partitioning-metrics)).
 
 Examples of typical invocations are as follows:
 ```sh
@@ -68,6 +73,22 @@ Examples of typical invocations are as follows:
 # partition an hypergraph under k-way balanced constraints
 ./hgraph_gpu.exe -r hgraphs/some_hgr.hgr -k 2 0.03
 ```
+
+Partitioning settings:
+- `-r <hgraph>`: path to the hypergraph to partition;
+- `-c <name>`: choose a named constraints set, among hard-coded ones, for inbound constrained minimal partitioning;
+- `-m <size> <inbound> <p-cnt>`: set partitions size, inbound size, and count constraints for inbound constrained minimal partitioning;
+- `-k <k> <ε>`: set partitions count and balance parameter for k-way balanced partitioning;
+
+> Unless `-k` is present, the partitioning mode defaults to inbound constrained minimal partitioning.
+
+Recommended options:
+- `-dtc`: speedup loading time by building and deduplicating initial incidence sets directly on the GPU;
+- `-ipm`: speedup refinement by reducing the number of initial partitions through greedy merging;
+
+Helpful options:
+- `-smh <lvl>`: increasing 'lvl' can prevent going out of memory when there are many coarsening levels or simply many nodes/nets;
+- `-om <mult>`: increase if you an assert for full hash tables triggers during initial neighbors construction;
 
 ## Procuring Hypergraphs
 
@@ -162,7 +183,7 @@ We refer to refinement gains in two ways:
 | LenNet | loihi64 | <code style="color : lime">ok</code> | 3119.209 | 509.088 |  |
 | VGG11 | loihi84 | <code style="color : lime">ok</code> | 56090.449 | 90792.703 |  |
 | AlexNet | loihi84 | <code style="color : lime">ok</code> | 16433.236 | 124265.188 |  |
-| MobileNet | loihi84 | <code style="color : red">ko</code> | 3576531.750 | 428241.688 | requires `-dtc`, `-smh 12`, `-ipm`, `PATH_SIZE 4096u` |
+| MobileNet | loihi84 | <code style="color : red">ko</code> | 3335512.000 | 372353.156 | requires `-dtc`, `-smh 12`, `-ipm` |
 | Allen V1 | loihi84 | <code style="color : lime">ok</code> | 6220.164 | 42259.551 | requires `-cnc 16` |
 | 16k-rand | loihi64 | <code style="color : lime">ok</code> | 76390.469 | 902.341 |  |
 | 64k-rand | loihi64 | <code style="color : lime">ok</code> | 651617.500 | 2917.872 |  |
@@ -192,6 +213,8 @@ All problems usually manifest as asserts being triggered:
 - `GM hash-set full!` in any `apply_X` or `neighbors` kernel, means oversized segments for deduplication were not large enough, increase `-om <mul>` from the CLI...
 - `invalid partitioning returned` in k-way mode after initial Mt-KaHyPar solution means no valid initial partitioning likely existed, try raising `KWAY_INIT_UPPER_THREASHOLD`...
 - too much host RAM usage: add the `-dtc` flag if your device has more VRAM than the host has RAM! Also recommended for a good speedup...
+
+> After any modification, remember to recompile (`make`)!
 
 All the mentioned constants can be found either in [`defines.cuh`](./headers/defines.cuh) or in the offending kernel's header file under [`./headers`](./headers/).
 

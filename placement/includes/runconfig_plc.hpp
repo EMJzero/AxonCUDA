@@ -27,6 +27,7 @@ namespace config_plc {
         uint32_t fd_iterations; // number of force-directed refinement iterations to perform
         uint32_t candidates_count; // number of candidate swaps proposed per node during force-directed refinement
         uint32_t multi_start_override; // imposes the number of multi-start attempts at placement
+        uint32_t num_host_threads; // imposes the number of host threads and GPU streams to spawn to handle the multi-start attempts
         bool feedforward_order; // if true, use the greedy sequential feedforward initial partitioning (runs on the host !!)
         bool device_touching_construction; // whether to construct touching/incidence sets on the device or the host
         uint64_t seed; // seed for the multi-start and recursive bisection methods

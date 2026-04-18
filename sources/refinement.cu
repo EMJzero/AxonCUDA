@@ -101,7 +101,7 @@ void refinementRepeats(
             int num_threads_needed = num_hedges; // 1 thread per hedge
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - pins per partition kernel
-            LAUNCH(cfg) << "pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // NOTE: having this available during FM refinement makes its complexity linear in the connectivity, instead of quadratic!
             pins_per_partition_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
@@ -128,7 +128,7 @@ void refinementRepeats(
             int num_warps_needed = curr_num_nodes; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - fm-ref gains kernel
-            LAUNCH(cfg) << "fm-ref gains kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "fm-ref gains kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             fm_refinement_gains_kernel<<<blocks, threads_per_block>>>(
                 d_touching,
                 d_touching_offsets,
@@ -207,7 +207,7 @@ void refinementRepeats(
             int num_warps_needed = curr_num_nodes ; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - fm-ref cascade kernel
-            LAUNCH(cfg) << "fm-ref cascade kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "fm-ref cascade kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             fm_refinement_cascade_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
                 d_hedges_offsets,
@@ -252,7 +252,7 @@ void refinementRepeats(
             int num_threads_needed = curr_num_nodes; // 1 thread per move
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - build size events kernel
-            LAUNCH(cfg) << "build size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "build size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // TODO: could filter out null moves (target = -1)?
             build_size_events_kernel<<<blocks, threads_per_block>>>(
                 d_pairs,
@@ -286,7 +286,7 @@ void refinementRepeats(
             int num_threads_needed = num_size_events; // 1 thread per event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - flag size events kernel
-            LAUNCH(cfg) << "flag size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "flag size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             flag_size_events_kernel<<<blocks, threads_per_block>>>(
                 d_size_events_partition,
                 d_size_events_index,
@@ -313,7 +313,7 @@ void refinementRepeats(
             int num_threads_needed = num_hedges; // 1 thread per hedge
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - inbound pins per partition kernel
-            LAUNCH(cfg) << "inbound pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "inbound pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // NOTE: inbound-only version of the above used for constraints checks...
             inbound_pins_per_partition_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
@@ -354,7 +354,7 @@ void refinementRepeats(
             int num_warps_needed = curr_num_nodes ; // 1 warp per move
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - build hedge events kernel
-            LAUNCH(cfg) << "build hedge events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "build hedge events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // TODO: could filter out null moves (target = -1)?
             build_hedge_events_kernel<<<blocks, threads_per_block>>>(
                 d_pairs,
@@ -394,7 +394,7 @@ void refinementRepeats(
             int num_threads_needed = num_inbound_count_events; // 1 thread per hedge event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - count inbound events kernel
-            LAUNCH(cfg) << "count inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "count inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             count_inbound_size_events_kernel<<<blocks, threads_per_block>>>(
                 d_pins_per_partitions,
                 d_inbound_count_events_partition,
@@ -430,7 +430,7 @@ void refinementRepeats(
             int num_threads_needed = num_inbound_count_events; // 1 thread per hedge event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - build inbound events kernel
-            LAUNCH(cfg) << "build inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "build inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             build_inbound_size_events_kernel<<<blocks, threads_per_block>>>(
                 d_pins_per_partitions,
                 d_inbound_count_events_partition,
@@ -471,7 +471,7 @@ void refinementRepeats(
             int num_threads_needed = num_inbound_size_events; // 1 thread per event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - flag inbound events kernel
-            LAUNCH(cfg) << "flag inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "flag inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             flag_inbound_events_kernel<<<blocks, threads_per_block>>>(
                 d_inbound_size_events_partition,
                 d_inbound_size_events_index,
@@ -512,7 +512,7 @@ void refinementRepeats(
             int num_threads_needed = curr_num_nodes; // 1 thread per move to apply
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - fm-ref apply kernel
-            LAUNCH(cfg) << "fm-ref apply (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "fm-ref apply (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             fm_refinement_apply_kernel<<<blocks, threads_per_block>>>(
                 d_touching,
                 d_touching_offsets,
@@ -561,7 +561,7 @@ void refinementRepeats(
             int num_warps_needed = num_hedges; // 1 warp per hedge
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - inbound sets size kernel
-            LAUNCH(cfg) << "inbound sets size kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "inbound sets size kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             inbound_sets_size_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
                 d_hedges_offsets,
@@ -663,7 +663,7 @@ void refinementSparseRepeats(
             int num_warps_needed = num_hedges; // 1 warp per hedge
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - sparse pins per partition count kernel
-            LAUNCH(cfg) << "sparse pins per partition count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "sparse pins per partition count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // NOTE: having this available during FM refinement makes its complexity linear in the connectivity, instead of quadratic!
             sparse_pins_per_partition_count_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
@@ -718,7 +718,7 @@ void refinementSparseRepeats(
             int num_warps_needed = num_hedges; // 1 warp per hedge
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - sparse pins per partition write kernel
-            LAUNCH(cfg) << "sparse pins per partition write kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "sparse pins per partition write kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // NOTE: having this available during FM refinement makes its complexity linear in the connectivity, instead of quadratic!
             sparse_pins_per_partition_write_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
@@ -746,7 +746,7 @@ void refinementSparseRepeats(
             int num_warps_needed = curr_num_nodes; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - fm-ref gains sparse kernel
-            LAUNCH(cfg) << "fm-ref gains sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "fm-ref gains sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             fm_refinement_gains_sparse_ppp_kernel<<<blocks, threads_per_block>>>(
                 d_touching,
                 d_touching_offsets,
@@ -857,7 +857,7 @@ void refinementSparseRepeats(
             int num_warps_needed = curr_num_nodes ; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - fm-ref cascade sparse kernel
-            LAUNCH(cfg) << "fm-ref cascade sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "fm-ref cascade sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             fm_refinement_cascade_sparse_ppp_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
                 d_hedges_offsets,
@@ -920,7 +920,7 @@ void refinementSparseRepeats(
             int num_threads_needed = curr_num_nodes; // 1 thread per move
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - build size events sparse kernel
-            LAUNCH(cfg) << "build size events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "build size events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // TODO: could filter out null moves (target = -1)?
             build_size_events_sparse_kernel<<<blocks, threads_per_block>>>(
                 d_pairs,
@@ -956,7 +956,7 @@ void refinementSparseRepeats(
             int num_threads_needed = num_size_events; // 1 thread per event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - flag size events kernel
-            LAUNCH(cfg) << "flag size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "flag size events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             flag_size_events_kernel<<<blocks, threads_per_block>>>(
                 d_size_events_partition,
                 d_size_events_index,
@@ -984,7 +984,7 @@ void refinementSparseRepeats(
             int num_warps_needed = num_hedges; // 1 warp per hedge
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - inbound sparse pins per partition update kernel
-            LAUNCH(cfg) << "inbound sparse pins per partition update kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "inbound sparse pins per partition update kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // NOTE: inbound-only version of the above used for constraints checks...
             sparse_inbound_pins_per_partition_update_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
@@ -1045,7 +1045,7 @@ void refinementSparseRepeats(
             int num_warps_needed = curr_num_nodes ; // 1 warp per move
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - build hedge events sparse kernel
-            LAUNCH(cfg) << "build hedge events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "build hedge events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // TODO: could filter out null moves (target = -1)?
             build_hedge_events_sparse_kernel<<<blocks, threads_per_block>>>(
                 d_pairs,
@@ -1108,7 +1108,7 @@ void refinementSparseRepeats(
                 /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream=*/0
             );
             const float count_events_sort_aux_gib = static_cast<float>(5ull * num_inbound_events * sizeof(uint32_t)) / (1 << 30);
-            CUB(cfg) << "radix sort requiring " << std::fixed << std::setprecision(3) << count_events_sort_aux_gib
+            CUB(cfg) std::cout << "CUB radix sort requiring " << std::fixed << std::setprecision(3) << count_events_sort_aux_gib
                 << " GB of auxiliary buffers and " << std::fixed << std::setprecision(3) << static_cast<float>(c_count_events_sort_storage_bytes) / (1 << 20)
                 << " MB of temporary storage ...\n";
             CUDA_CHECK(cudaMalloc(&c_count_events_sort_storage, c_count_events_sort_storage_bytes));
@@ -1184,7 +1184,7 @@ void refinementSparseRepeats(
             int num_threads_needed = num_inbound_events; // 1 thread per hedge event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - count inbound events sparse kernel
-            LAUNCH(cfg) << "count inbound events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "count inbound events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             count_inbound_size_events_sparse_ppp_kernel<<<blocks, threads_per_block>>>(
                 d_ppp_offsets,
                 d_ppp,
@@ -1222,7 +1222,7 @@ void refinementSparseRepeats(
             int num_threads_needed = num_inbound_events; // 1 thread per hedge event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - build inbound events sparse kernel
-            LAUNCH(cfg) << "build inbound events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "build inbound events sparse kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             build_inbound_size_events_sparse_ppp_kernel<<<blocks, threads_per_block>>>(
                 d_ppp_offsets,
                 d_ppp,
@@ -1265,7 +1265,7 @@ void refinementSparseRepeats(
             int num_threads_needed = num_inbound_size_events; // 1 thread per event
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - flag inbound events kernel
-            LAUNCH(cfg) << "flag inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "flag inbound events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             flag_inbound_events_kernel<<<blocks, threads_per_block>>>(
                 d_inbound_size_events_partition,
                 d_inbound_size_events_index,
@@ -1307,7 +1307,7 @@ void refinementSparseRepeats(
             int num_threads_needed = curr_num_nodes; // 1 thread per move to apply
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - fm-ref apply kernel
-            LAUNCH(cfg) << "fm-ref apply (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "fm-ref apply (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             fm_refinement_apply_kernel<<<blocks, threads_per_block>>>(
                 d_touching,
                 d_touching_offsets,
@@ -1359,7 +1359,7 @@ void refinementSparseRepeats(
             int num_warps_needed = num_hedges; // 1 warp per hedge
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - inbound sets size kernel
-            LAUNCH(cfg) << "inbound sets size kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "inbound sets size kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             inbound_sets_size_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
                 d_hedges_offsets,

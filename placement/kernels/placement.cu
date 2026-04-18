@@ -130,8 +130,10 @@ void tensions_kernel(
             my_pairs[LEFT] = UINT32_MAX - LEFT - 1; // flag for "empty spot"
             my_scores[LEFT] = forces[tid*4 + LEFT];
         }
-    } else
+    } else {
+        my_pairs[LEFT] = UINT32_MAX;
         my_scores[LEFT] = 0.0f;
+    }
 
     if (my_place.x < max_width - 1) {
         const uint32_t neighbor = inv_placement[my_place.y * max_width + my_place.x + 1];
@@ -142,8 +144,10 @@ void tensions_kernel(
             my_pairs[RIGHT] = UINT32_MAX - RIGHT - 1; // flag for "empty spot"
             my_scores[RIGHT] = forces[tid*4 + RIGHT];
         }
-    } else
+    } else {
+        my_pairs[RIGHT] = UINT32_MAX;
         my_scores[RIGHT] = 0.0f;
+    }
 
     if (my_place.y > 0) {
         const uint32_t neighbor = inv_placement[(my_place.y - 1) * max_width + my_place.x];
@@ -154,8 +158,10 @@ void tensions_kernel(
             my_pairs[UP] = UINT32_MAX - UP - 1; // flag for "empty spot"
             my_scores[UP] = forces[tid*4 + UP];
         }
-    } else
+    } else {
+        my_pairs[UP] = UINT32_MAX;
         my_scores[UP] = 0.0f;
+    }
 
     if (my_place.y < max_height - 1) {
         const uint32_t neighbor = inv_placement[(my_place.y + 1) * max_width + my_place.x];
@@ -166,8 +172,10 @@ void tensions_kernel(
             my_pairs[DOWN] = UINT32_MAX - DOWN - 1; // flag for "empty spot"
             my_scores[DOWN] = forces[tid*4 + DOWN];
         }
-    } else
+    } else {
+        my_pairs[DOWN] = UINT32_MAX;
         my_scores[DOWN] = 0.0f;
+    }
 
     // write pairs and scores, from highest to lowest score
     uint32_t* final_pairs = pairs + tid * candidates_count;
@@ -175,18 +183,20 @@ void tensions_kernel(
     for (uint32_t i = 0; i < candidates_count; i++) {
         uint32_t max_pair = UINT32_MAX;
         float max_score = 0.0f;
-        uint32_t max_idx = 0;
+        uint32_t max_idx = UINT32_MAX;
         for (uint32_t j = 0; j < 4; j++) {
-            if (my_scores[j] > max_score) {
+            if (my_scores[j] > max_score || (my_scores[j] == max_score && my_scores[j] > 0 && my_pairs[j] > max_pair)) {
                 max_pair = my_pairs[j];
                 max_score = my_scores[j];
                 max_idx = j;
             }
         }
         final_pairs[i] = max_pair;
-        final_scores[i] = (uint32_t)(max_score*FORCE_FIXED_POINT_SCALE); // go to fixed point to later use scores for book-keeping -> negative scores go to 0
-        my_pairs[max_idx] = UINT32_MAX;
-        my_scores[max_idx] = 0.0f;
+        final_scores[i] = (uint32_t)min((uint64_t)(UINT32_MAX - 4), (uint64_t)(max_score*FORCE_FIXED_POINT_SCALE)); // go to fixed point to later use scores for book-keeping -> negative scores go to 0
+        if (max_idx != UINT32_MAX) {
+            my_pairs[max_idx] = UINT32_MAX;
+            my_scores[max_idx] = 0.0f;
+        }
     }
 }
 
@@ -198,7 +208,6 @@ void exclusive_swaps_kernel(
     const uint32_t* __restrict__ pairs, // pairs[idx] is the partner idx wants to be swapped with
     const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be swapped with pairs[idx]
     const uint32_t num_nodes,
-    const uint32_t num_repeats,
     const uint32_t candidates_count,
     slot* __restrict__ swap_slots, // initialized with -1 on the id
     uint32_t* __restrict__ swap_flags // initialized to 0, set to 1 for the lower-id node of a swap-pair
@@ -209,6 +218,10 @@ void exclusive_swaps_kernel(
     // STYLE: 'num_repeats' node per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t tcount = gridDim.x * blockDim.x;
+
+    //const uint32_t num_repeats = (num_nodes + tcount - 1) / tcount;
+    const uint32_t actual_repeats = tid < num_nodes ? 1u + (num_nodes - 1u - tid) / tcount : 0u;
+    if (actual_repeats == 0) return;
 
     /*
     * Logic: a walk up (and down) the tree for grouping!
@@ -224,26 +237,25 @@ void exclusive_swaps_kernel(
 
     int32_t path_length[MAX_SWAPS_MATCHING_REPEATS];
     uint32_t path[SWAPS_PATH_SIZE];
-    const uint32_t actual_path_size = SWAPS_PATH_SIZE / num_repeats;
-    uint32_t completed_repeats = 0u;
+    uint32_t total_path_length = 0u; // cumulative between repeats - the offset where the current path starts
 
-    for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+    uint64_t completed_repeats = 0u;
+
+    for (int32_t repeat = 0; repeat < actual_repeats; repeat++) {
         const uint32_t curr_tid = tid + repeat * tcount;
         // initialize yourself to a one-node swap (no-swap), unless someone already claimed you
-        if (curr_tid < num_nodes) atomicCAS(&reinterpret_cast<unsigned long long*>(swap_slots)[curr_tid], pack_slot(0u, UINT32_MAX), pack_slot(0u, curr_tid));
+        atomicCAS(&reinterpret_cast<unsigned long long*>(swap_slots)[curr_tid], pack_slot(0u, UINT32_MAX), pack_slot(0u, curr_tid));
     }
 
     for (uint32_t i = 0; i < candidates_count; i++) {
         // repeat for every node that you need to handle
-        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+        for (int32_t repeat = 0; repeat < actual_repeats; repeat++) {
             const uint32_t curr_tid = tid + repeat * tcount;
 
-            // if you are not a valid node
-            if (curr_tid >= num_nodes) break;
             // if you formed a pair, stop
-            if (completed_repeats & (1u << repeat)) continue;
+            if (completed_repeats & (1ull << repeat)) continue;
 
-            uint32_t* curr_path = path + actual_path_size * repeat;
+            uint32_t* curr_path = path + total_path_length;
             int32_t curr_path_length = 0;
 
             uint32_t current = curr_tid; // current node in the tree of pairs
@@ -262,7 +274,7 @@ void exclusive_swaps_kernel(
                     // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
                     outcome = atomic_max_on_slot(swap_slots, target, current, score);
                     if (!outcome) break;
-                    assert(curr_path_length < actual_path_size);
+                    assert(curr_path_length + total_path_length < SWAPS_PATH_SIZE);
                     curr_path[curr_path_length++] = target;
                     current = target;
                     target = target_target;
@@ -278,22 +290,23 @@ void exclusive_swaps_kernel(
             }
 
             path_length[repeat] = curr_path_length;
+            total_path_length += curr_path_length;
         }
 
         // global synch
         grid.sync();
 
         // repeat for every node that you need to handle
-        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+        // NOTE: do these backward as to unfold the path from the rear
+        for (int32_t repeat = actual_repeats - 1; repeat >= 0; repeat--) {
             const uint32_t curr_tid = tid + repeat * tcount;
 
-            // if you are not a valid node
-            if (curr_tid >= num_nodes) break;
             // if you formed a pair, stop
-            if (completed_repeats & (1u << repeat)) continue;
+            if (completed_repeats & (1ull << repeat)) continue;
 
-            uint32_t* curr_path = path + actual_path_size * repeat;
             int32_t curr_path_length = path_length[repeat];
+            total_path_length -= curr_path_length;
+            uint32_t* curr_path = path + total_path_length;
             path_length[repeat] = 0;
 
             // go down the tree
@@ -324,13 +337,12 @@ void exclusive_swaps_kernel(
         // global synch
         grid.sync();
 
-        for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+        for (uint32_t repeat = 0; repeat < actual_repeats; repeat++) {
             const uint32_t curr_tid = tid + repeat * tcount;
-            if (curr_tid >= num_nodes) break;
             // if you formed a pair, stop
-            if (completed_repeats & (1u << repeat)) continue;
+            if (completed_repeats & (1ull << repeat)) continue;
             if (swap_slots[curr_tid].score > UINT32_MAX - candidates_count) {
-                completed_repeats |= (1u << repeat);
+                completed_repeats |= (1ull << repeat);
                 continue;
             }
             swap_slots[curr_tid].score = 0;
@@ -341,9 +353,8 @@ void exclusive_swaps_kernel(
     }
 
     // write inside "swaps" the id of the node you are thus entitled to swap with
-    for (uint32_t repeat = 0; repeat < num_repeats; repeat++) {
+    for (uint32_t repeat = 0; repeat < actual_repeats; repeat++) {
         const uint32_t curr_tid = tid + repeat * tcount;
-        if (curr_tid >= num_nodes) break;
         // lowest-id node sets the create-event flag
         if (swap_slots[curr_tid].score > UINT32_MAX - candidates_count) {
             const uint32_t other_tid = swap_slots[curr_tid].id;
@@ -643,4 +654,143 @@ void apply_swaps_kernel(
             inv_placement[plac_lo.y * max_width + plac_lo.x] = UINT32_MAX;
         }
     }
+}
+
+// compute the max src-dst manhattan distance per hedge
+// SEQUENTIAL COMPLEXITY: e*d^2
+// NOTE: the 'd^2' is only due to the serialization over sources => it is only 'd' when there is one source
+// PARALLEL OVER: e
+// SHUFFLES OVER: d
+__global__
+void max_src_dst_distance_kernel(
+    const coords* __restrict__ placement,
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const float* __restrict__ hedge_weights,
+    const uint32_t num_hedges,
+    float* __restrict__ result
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the node to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    /*
+    * Idea:
+    * - for each hedge, find the max src-dst manhattan distance (proxy for latency)
+    * - scale it by the hedge's weight
+    * - all threads in the warp load one source
+    * - threads go over destinations, and find the most distance one, reducing for maximum distance
+    * - repeat for the next source, accumulate the total distance
+    */
+
+    const uint32_t* srcs_start = hedges + hedges_offsets[warp_id];
+    const uint32_t* dsts_start = srcs_start + srcs_count[warp_id];
+    const uint32_t* dsts_end = hedges + hedges_offsets[warp_id + 1];
+
+    uint32_t tot_distance = 0u;
+
+    for (const uint32_t* src_ptr = srcs_start; src_ptr < dsts_start; src_ptr++) {
+        const coords src_plc = placement[*src_ptr];
+        uint32_t max_distance = 0u;
+        for (const uint32_t* dst_ptr = dsts_start + lane_id; dst_ptr < dsts_end; dst_ptr += WARP_SIZE) {
+            const coords dst_plc = placement[*dst_ptr];
+            max_distance = max(max_distance, manhattan(src_plc, dst_plc));
+        }
+        tot_distance += max_distance;
+    }
+
+    tot_distance = warpReduceSumLN0<uint32_t>(tot_distance);
+
+    if (lane_id == 0)
+        result[warp_id] = tot_distance * hedge_weights[warp_id];
+}
+
+// compute the min spanning tree weight between pins per hedge
+// SEQUENTIAL COMPLEXITY: e*d^2
+// PARALLEL OVER: e
+// SHUFFLES OVER: d
+__global__
+void min_spanning_tree_weight_kernel(
+    const coords* __restrict__ placement,
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const float* __restrict__ hedge_weights,
+    const uint32_t num_hedges,
+    float* __restrict__ result
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the node to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    /*
+    * Spanning tree algorithm (Prim-style):
+    * - each warp gets to handle an hedge, that is a fully connected and weighted graph
+    * - for each pin, track its min current distance from any pin already in the MST and a flag telling if the pin is itself in the MST already
+    * - arbitrarily add the first pin to the MST
+    *   - for consistency, always add the last pin
+    * - reduce (argmin) the pin with smallest distance to the MST, and add it to it
+    *   - every other pin updates its min distance from the MST based on the new pin (lower it iff closer to the new pin)
+    * - repeat until no pin remains outside the MST
+    * - no need to track which edges were used for the MST, we just need to accumulate the total weight used when adding pins to it
+    */
+
+    const uint32_t* hedge_start = hedges + hedges_offsets[warp_id];
+    const uint32_t hedge_size = hedges_offsets[warp_id + 1] - hedges_offsets[warp_id] - 1;
+    if (hedge_size + 1 <= 1) {
+        if (lane_id == 0) result[warp_id] = 0.0f;
+        return;
+    }
+    const uint32_t lane_pins_count = lane_id < hedge_size ? 1u + (hedge_size - 1u - lane_id) / WARP_SIZE : 0u;
+
+    assert(lane_pins_count <= REG_PINS_CAPACITY); // TODO: alternative version with global memory spill
+    uint32_t mst_distance[REG_PINS_CAPACITY];
+    uint32_t in_mst_flag[(REG_PINS_CAPACITY + 31u) / 32u] = {0u}; // one bit per pin
+
+    uint32_t tot_span = 0u;
+
+    coords new_mst_pin_plc = placement[hedge_start[hedge_size]]; // last pin in the hedge
+
+    // initialize distance to the first MST pin (last one)
+    for (uint32_t pin_idx = 0u; pin_idx < lane_pins_count; pin_idx++) {
+        const coords pin_plc = placement[hedge_start[pin_idx * WARP_SIZE + lane_id]];
+        mst_distance[pin_idx] = manhattan(new_mst_pin_plc, pin_plc);
+    }
+
+    while (true) {
+        // argmin for next pin to add to the MST
+        uint32_t min_dst = UINT32_MAX;
+        uint32_t min_pin = UINT32_MAX;
+        for (uint32_t pin_idx = 0u; pin_idx < lane_pins_count; pin_idx++) {
+            if (mst_distance[pin_idx] < min_dst && !(in_mst_flag[pin_idx >> 5u] & (1u << (pin_idx & 31u)))) {
+                min_dst = mst_distance[pin_idx];
+                min_pin = pin_idx * WARP_SIZE + lane_id;
+            }
+        }
+        const bin max_bin = warpReduceMax<uint32_t>(min_dst, min_pin);
+        if (max_bin.payload == UINT32_MAX) break; // MST completed
+        if (max_bin.payload == min_pin) { // flag winning pin
+            const uint32_t pin_idx = min_pin / WARP_SIZE;
+            in_mst_flag[pin_idx >> 5u] |= (1u << (pin_idx & 31u));
+        }
+        min_dst = max_bin.val;
+        min_pin = max_bin.payload;
+
+        // update each node's min distance from the MST
+        // TODO: could optimize by skipping already flagged pins
+        new_mst_pin_plc = placement[hedge_start[min_pin]];
+        for (uint32_t pin_idx = 0u; pin_idx < lane_pins_count; pin_idx++) {
+            const coords pin_plc = placement[hedge_start[pin_idx * WARP_SIZE + lane_id]];
+            mst_distance[pin_idx] = min(mst_distance[pin_idx], manhattan(new_mst_pin_plc, pin_plc));
+        }
+        
+        tot_span += min_dst;
+    }
+
+    if (lane_id == 0)
+        result[warp_id] = tot_span * hedge_weights[warp_id];
 }

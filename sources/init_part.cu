@@ -311,7 +311,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_threads_needed = num_nodes; // 1 thread per node
                 blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - random init kernel
-                LAUNCH(cfg) << "random init kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
+                LAUNCH(cfg) RUN << "random init kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
                 init_partitions_random<<<blocks, threads_per_block, 0, stream>>>(
                     num_nodes,
                     INIT_SEED + repeats * MAX_CONSECUTIVE_INIT_FAILURES + consecutive_failures,
@@ -364,7 +364,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
             num_threads_needed = num_hedges; // 1 thread per hedge
             blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - pins per partition kernel
-            LAUNCH(cfg) << "pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
+            LAUNCH(cfg) RUN << "pins per partition kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
             // NOTE: having this available during FM refinement makes its complexity linear in the connectivity, instead of quadratic!
             pins_per_partition_only_kernel<<<blocks, threads_per_block, 0, stream>>>(
                 d_hedges,
@@ -388,7 +388,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_warps_needed = num_nodes ; // 1 warp per node
                 blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
                 // launch - jacobi gains kernel
-                LAUNCH(cfg) << "jacobi gains kernel (iter=" << jacobi << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
+                LAUNCH(cfg) RUN << "jacobi gains kernel (iter=" << jacobi << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
                 fm_refinement_gains_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_touching,
                     d_touching_offsets,
@@ -436,7 +436,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_threads_needed = num_nodes; // 1 thread per move to apply
                 blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - jacobi apply kernel
-                LAUNCH(cfg) << "jacobi apply kernel (iter=" << jacobi << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
+                LAUNCH(cfg) RUN << "jacobi apply kernel (iter=" << jacobi << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ")...\n";
                 jacobi_apply_moves_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_touching,
                     d_touching_offsets,
@@ -497,7 +497,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_warps_needed = num_nodes ; // 1 warp per node
                 blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
                 // launch - fm-ref gains kernel
-                LAUNCH(cfg) << "fm-ref gains kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
+                LAUNCH(cfg) RUN << "fm-ref gains kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
                 fm_refinement_gains_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_touching,
                     d_touching_offsets,
@@ -541,7 +541,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
 
                 // launch configuration - fm-ref cascade kernel - same as fm-ref gains kernel
                 // launch - fm-ref cascade kernel
-                LAUNCH(cfg) << "fm-ref cascade kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
+                LAUNCH(cfg) RUN << "fm-ref cascade kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
                 fm_refinement_cascade_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_hedges,
                     d_hedges_offsets,
@@ -568,7 +568,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_threads_needed = num_nodes; // 1 thread per move
                 blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - build size events kernel
-                LAUNCH(cfg) << "build size events kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
+                LAUNCH(cfg) RUN << "build size events kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
                 build_size_events_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_moves,
                     d_ranks,
@@ -593,7 +593,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 num_threads_needed = num_size_events; // 1 thread per event
                 blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - flag size events kernel
-                LAUNCH(cfg) << "flag size events kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
+                LAUNCH(cfg) RUN << "flag size events kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
                 flag_size_events_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_size_events_partition,
                     d_size_events_index,
@@ -628,7 +628,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     num_threads_needed = num_nodes; // 1 thread per move to apply
                     blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                     // launch - fm-ref apply kernel
-                    LAUNCH(cfg) << "fm-ref apply (iter=" << fm << ") (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
+                    LAUNCH(cfg) RUN << "fm-ref apply (iter=" << fm << ") (" << num_good_moves << " good moves) kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
                     fm_refinement_apply_update_kernel<<<blocks, threads_per_block, 0, stream>>>(
                         d_touching,
                         d_touching_offsets,
@@ -758,7 +758,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     int num_warps_needed = num_hedges; // 1 warp per hedge
     int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
     // launch - armonic score kernel
-    LAUNCH(cfg) << "armonic score kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    LAUNCH(cfg) RUN << "armonic score kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
     armonic_degree_score_kernel<<<blocks, threads_per_block>>>(
         d_hedges,
         d_hedges_offsets,
@@ -786,7 +786,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
     int num_threads_needed = num_hedges; // 1 thread per hedge
     blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
     // launch - prune hedges kernel
-    LAUNCH(cfg) << "prune hedges kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    LAUNCH(cfg) RUN << "prune hedges kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
     prune_hedges_kernel<<<blocks, threads_per_block>>>(
         d_hedge_weights,
         d_hedge_ratio,
@@ -1006,7 +1006,7 @@ float compute_connectivity(
     int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
     CUDA_CHECK(cudaMallocAsync(&d_connectivity, blocks * sizeof(float), stream)); // first reduce inside each block, then across blocks with thrust
     // launch - fm-ref gains kernel
-    LAUNCH(cfg) << "compute connectivity kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    LAUNCH(cfg) RUN << "compute connectivity kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
     compute_connectivity_kernel<<<blocks, threads_per_block, 0, stream>>>(
         d_pins_per_partitions,
         d_hedge_weights,

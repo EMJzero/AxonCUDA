@@ -45,7 +45,7 @@ void candidatesProposal(
         size_t bytes_per_warp = 3 * HIST_SIZE * sizeof(uint32_t);
         size_t shared_bytes = warps_per_block * bytes_per_warp;
         // launch - candidates kernel
-        LAUNCH(cfg) << "candidates kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "candidates kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         candidates_kernel<<<blocks, threads_per_block, shared_bytes>>>(
             d_hedges,
             d_hedges_offsets,
@@ -101,14 +101,6 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
         size_t bytes_per_thread = 0;
         size_t shared_bytes = threads_per_block * bytes_per_thread;
         //uint32_t entries_per_thread = (uint32_t)(bytes_per_thread / sizeof(uint32_t));
-        // additinal checks for runtime-dependent stack size
-        //size_t stackSize;
-        //cudaDeviceGetLimit(&stackSize, cudaLimitStackSize);
-        //constexpr size_t required_stack = (PATH_SIZE + PATH_SIZE_EXTENSION + 2 * MAX_MATCHING_REPEATS) * sizeof(uint32_t);
-        //if (stackSize < required_stack) { // must increase the stacksize limit !!
-        //    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, required_stack));
-        //    INFO(cfg) std::cout << "Stack size limit increased to " << std::fixed << std::setprecision(1) << (float)(required_stack) / (1 << 10) << " KB\n";
-        //}
         // additional checks for the cooperative kernel mode
         int blocks_per_SM = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_SM, grouping_kernel, threads_per_block, shared_bytes);
@@ -124,7 +116,7 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
         }
         CUDA_CHECK(cudaMalloc(&d_extra_paths, threads_per_block * blocks * PATH_SIZE_EXTENSION * sizeof(uint32_t)));
         // launch - grouping kernel
-        LAUNCH(cfg) << "grouping kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "grouping kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         void *kernel_args[] = {
             (void*)&d_pairs,
             (void*)&d_u_scores,

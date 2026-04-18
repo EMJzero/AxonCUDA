@@ -310,7 +310,7 @@ void build_orphan_pairs(
     int threads_per_block = 256;
     int num_threads_needed = num_free / 2; // 1 thread per one-in-two free nodes
     int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-    LAUNCH(cfg) << "pair orphans kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    LAUNCH(cfg) RUN << "pair orphans kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
     pair_kth_smallest_with_kth_largest<<<blocks, threads_per_block>>>(
         d_free_indices,
         num_free,

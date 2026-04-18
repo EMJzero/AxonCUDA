@@ -27,7 +27,9 @@ uint32_t* locality_ordering(
     const float* d_hedge_weights,
     const uint32_t* d_touching,
     const dim_t* d_touching_offsets,
-    const uint64_t seed
+    const uint64_t seed,
+    const cudaStream_t stream,
+    const int tid
 );
 
 void split_partitions_rand(
@@ -35,7 +37,9 @@ void split_partitions_rand(
     uint32_t* d_partitions,
     uint32_t num_nodes,
     uint32_t num_parts,
-    curandGenerator_t gen
+    curandGenerator_t gen,
+    const cudaStream_t stream,
+    const int tid
 );
 
 
@@ -133,9 +137,9 @@ void flag_reversals_kernel(
 
 __global__
 void apply_reversals_kernel(
-    const uint32_t* segment,
-    const uint32_t* offsets,
-    const bool* flag,
+    const uint32_t* __restrict__ segment,
+    const uint32_t* __restrict__ offsets,
+    const bool* __restrict__ flag,
     const uint32_t size,
-    uint32_t* data
+    uint32_t* __restrict__ data
 );

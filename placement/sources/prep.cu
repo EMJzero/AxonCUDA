@@ -72,7 +72,7 @@ std::tuple<uint32_t*, dim_t*> buildTouching(
         int num_warps_needed = num_hedges; // 1 warp per hedge
         int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
         // launch - touching count
-        LAUNCH(cfg) << "touching count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "touching count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         touching_count_kernel<<<blocks, threads_per_block>>>(
             d_hedges,
             d_hedges_offsets,
@@ -99,7 +99,7 @@ std::tuple<uint32_t*, dim_t*> buildTouching(
         int num_warps_needed = num_hedges; // 1 warp per hedge
         int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
         // launch - touching build kernel
-        LAUNCH(cfg) << "touching build kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "touching build kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         touching_build_kernel<<<blocks, threads_per_block>>>(
             d_hedges,
             d_hedges_offsets,

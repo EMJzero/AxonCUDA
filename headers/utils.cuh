@@ -53,12 +53,19 @@ inline cudaError_t cudaFreeLogged(T* ptr, const char* varname, const char* file,
 
 // kernel launches
 #define LAUNCH(cfg) \
-    if (!cfg.verbose_kernel_launches) {} else std::cout << "Running "
+    if (!cfg.verbose_kernel_launches) {} else std::cout
 
 // CUB calls
 #define CUB(cfg) \
-    if (!cfg.verbose_kernel_launches) {} else std::cout << "CUB "
+    if (!cfg.verbose_kernel_launches) {} else
 
+// additional common logging text
+
+#define RUN \
+    << "Running "
+
+#define TID(tid) \
+    << "[tid=" << (tid) << "] "
 
 // NOTE: everything tagged as "wrp" or "warp" assumes that all lanes are active, unless otherwise specified!
 

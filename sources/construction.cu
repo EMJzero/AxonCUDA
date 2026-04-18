@@ -87,7 +87,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouching(
         int num_warps_needed = num_hedges; // 1 warp per hedge
         int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
         // launch - touching count
-        LAUNCH(cfg) << "touching count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "touching count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         touching_count_kernel<<<blocks, threads_per_block>>>(
             d_hedges,
             d_hedges_offsets,
@@ -120,7 +120,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouching(
         int num_warps_needed = num_hedges; // 1 warp per hedge
         int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
         // launch - touching build kernel
-        LAUNCH(cfg) << "touching build kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "touching build kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         touching_build_kernel<<<blocks, threads_per_block>>>(
             d_hedges,
             d_hedges_offsets,
@@ -157,7 +157,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouching(
         d_touching_offsets, d_inbound_end_offsets,
         /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0
     );
-    CUB(cfg) << "segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(touching_size * sizeof(uint32_t)) / (1 << 30)
+    CUB(cfg) std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(touching_size * sizeof(uint32_t)) / (1 << 30)
         << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_touching_storage_bytes) / (1 << 20)
         << " MB of temporary storage ...\n";
     CUDA_CHECK(cudaMalloc(&c_touching_storage, c_touching_storage_bytes));
@@ -213,7 +213,7 @@ dim_t sampleMaxNeighborhoodSize(
             int num_warps_needed = samples_per_repeat; // 1 warp per sample (node)
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - neighbors sample kernel
-            LAUNCH(cfg) << "neighbors sample kernel (repeat=" << repeat + 1 << "/" << repeats << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "neighbors sample kernel (repeat=" << repeat + 1 << "/" << repeats << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             neighbors_sample_kernel<<<blocks, threads_per_block>>>(
                 d_hedges,
                 d_hedges_offsets,
@@ -276,7 +276,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
         // launch configuration - neighborhoods count kernel
         int blocks = num_nodes; // 1 block per node
         int threads_per_block = 256; // 256/32 -> 8 warps per block
-        LAUNCH(cfg) << "neighborhoods count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "neighborhoods count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         // launch - neighborhoods count kernel
         neighborhoods_count_kernel<<<blocks, threads_per_block>>>(
             d_hedges,
@@ -306,7 +306,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
         int warps_per_block = threads_per_block / WARP_SIZE;
         int num_warps_needed = num_nodes ; // 1 warp per node
         int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-        LAUNCH(cfg) << "neighborhoods pack kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "neighborhoods pack kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         // launch - neighborhoods scatter kernel
         pack_segments<<<blocks, threads_per_block>>>(
             d_oversized_neighbors,
@@ -320,7 +320,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
         // launch configuration - neighborhoods scatter kernel
         int blocks = num_nodes; // 1 block per node
         int threads_per_block = 256; // 256/32 -> 8 warps per block
-        LAUNCH(cfg) << "neighborhoods scatter kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "neighborhoods scatter kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         // launch - neighborhoods scatter kernel
         neighborhoods_scatter_kernel<<<blocks, threads_per_block>>>(
             d_hedges,
@@ -375,7 +375,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
         int num_threads_needed = new_num_nodes; // 1 thread per group
         int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
         // launch - coarsening kernel (neighbors - sum of group sizes)
-        LAUNCH(cfg) << "coarsening kernel (neighbors - sum of group sizes) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "coarsening kernel (neighbors - sum of group sizes) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         sum_of_grouped_neighbors_count<<<blocks, threads_per_block>>>(
             d_neighbors_offsets,
             d_ungroups,
@@ -411,7 +411,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
             size_t bytes_per_warp = MAX_SM_WARP_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
             size_t shared_bytes = warps_per_block * bytes_per_warp;
             // launch - coarsening kernel (neighbors - count)
-            LAUNCH(cfg) << "coarsening kernel (neighbors - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "coarsening kernel (neighbors - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             apply_coarsening_neighbors_count<<<blocks, threads_per_block, shared_bytes>>>(
                 d_neighbors,
                 d_neighbors_offsets,
@@ -442,7 +442,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
             int warps_per_block = threads_per_block / WARP_SIZE;
             int num_warps_needed = new_num_nodes; // 1 warp per group
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-            LAUNCH(cfg) << "coarsening kernel (neighbors - pack) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "coarsening kernel (neighbors - pack) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             // launch - neighborhoods scatter kernel
             pack_segments_varsize<<<blocks, threads_per_block>>>(
                 d_coarse_oversized_neighbors,
@@ -473,7 +473,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
             int blocks = new_num_nodes; // 1 block per group
             int threads_per_block = 256; // 256/32 -> 8 warps per block
             // launch - rebuild kernel (neighbors - count)
-            LAUNCH(cfg) << "rebuild kernel (neighbors - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "rebuild kernel (neighbors - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             rebuild_coarsening_neighbors_count<<<blocks, threads_per_block>>>(
                 d_hedges,
                 d_hedges_offsets,
@@ -513,7 +513,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
                 int warps_per_block = threads_per_block / WARP_SIZE;
                 int num_warps_needed = new_num_nodes; // 1 warp per group
                 int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-                LAUNCH(cfg) << "coarsening kernel (neighbors - pack) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+                LAUNCH(cfg) RUN << "coarsening kernel (neighbors - pack) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
                 // launch - neighborhoods scatter kernel
                 pack_segments_varsize<<<blocks, threads_per_block>>>(
                     d_coarse_oversized_neighbors,
@@ -537,7 +537,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
                 int blocks = new_num_nodes; // 1 block per group
                 int threads_per_block = 256; // 256/32 -> 8 warps per block
                 // launch - rebuild kernel (neighbors - scatter)
-                LAUNCH(cfg) << "rebuild kernel (neighbors - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+                LAUNCH(cfg) RUN << "rebuild kernel (neighbors - scatter) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
                 rebuild_coarsening_neighbors_scatter<<<blocks, threads_per_block>>>(
                     d_hedges,
                     d_hedges_offsets,
@@ -594,7 +594,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
     size_t bytes_per_warp = MAX_SM_WARP_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
     size_t shared_bytes = warps_per_block * bytes_per_warp;
     // launch - coarsening kernel (hedges - count)
-    LAUNCH(cfg) << "coarsening kernel (hedges - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    LAUNCH(cfg) RUN << "coarsening kernel (hedges - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
     apply_coarsening_hedges_count<<<blocks, threads_per_block, shared_bytes>>>(
         d_hedges,
         d_hedges_offsets,
@@ -617,7 +617,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
     CUDA_CHECK(cudaMalloc(&d_coarse_hedges_buffer, new_hedges_size * sizeof(uint32_t)));
     // launch configuration - coarsening kernel (hedges - scatter - dsts) - same as coarsening kernel (hedges - count)
     // launch - coarsening kernel (hedges - scatter - dsts)
-    LAUNCH(cfg) << "coarsening kernel (hedges - scatter - dsts) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    LAUNCH(cfg) RUN << "coarsening kernel (hedges - scatter - dsts) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
     apply_coarsening_hedges_scatter_dsts<<<blocks, threads_per_block, shared_bytes>>>(
         d_hedges,
         d_hedges_offsets,
@@ -639,7 +639,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
         new_hedges_size, num_hedges, d_coarse_hedges_offsets, d_coarse_hedges_offsets + 1,
         /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0
     );
-    CUB(cfg) << "segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_hedges_size * sizeof(uint32_t)) / (1 << 30)
+    CUB(cfg) std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_hedges_size * sizeof(uint32_t)) / (1 << 30)
         << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_hedges_storage_bytes) / (1 << 20)
         << " MB of temporary storage ...\n";
     cudaMalloc(&c_hedges_storage, c_hedges_storage_bytes);
@@ -656,7 +656,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
 
     // launch configuration - coarsening kernel (hedges - scatter - srcs) - same as coarsening kernel (hedges - count)
     // launch - coarsening kernel (hedges - scatter - srcs)
-    LAUNCH(cfg) << "coarsening kernel (hedges - scatter - srcs) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+    LAUNCH(cfg) RUN << "coarsening kernel (hedges - scatter - srcs) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
     apply_coarsening_hedges_scatter_srcs<<<blocks, threads_per_block, shared_bytes>>>(
         d_hedges,
         d_hedges_offsets,
@@ -702,7 +702,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
         int num_threads_needed = num_hedges; // 1 thread per hedge
         int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
         // launch - coarsening kernel (touching - count)
-        LAUNCH(cfg) << "coarsening kernel (touching - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "coarsening kernel (touching - count) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         apply_coarsening_touching_count<<<blocks, threads_per_block>>>(
             d_coarse_hedges,
             d_coarse_hedges_offsets,
@@ -730,7 +730,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
         size_t bytes_per_warp = MAX_SM_WARP_DEDUPE_BUFFER_SIZE * sizeof(uint32_t);
         size_t shared_bytes = warps_per_block * bytes_per_warp;
         // launch - coarsening kernel (touching - scatter - inbound)
-        LAUNCH(cfg) << "coarsening kernel (touching - scatter - inbound) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "coarsening kernel (touching - scatter - inbound) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         apply_coarsening_touching_scatter_inbound<<<blocks, threads_per_block, shared_bytes>>>(
             d_touching,
             d_touching_offsets,
@@ -754,7 +754,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
             new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1,
             /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0
         );
-        CUB(cfg) << "segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_touching_size * sizeof(uint32_t)) / (1 << 30)
+        CUB(cfg) std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_touching_size * sizeof(uint32_t)) / (1 << 30)
             << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_touching_storage_bytes) / (1 << 20)
             << " MB of temporary storage ...\n";
         cudaMalloc(&c_touching_storage, c_touching_storage_bytes);
@@ -769,7 +769,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
         
         // launch configuration - coarsening kernel (touching - scatter - outbound) - same as coarsening kernel (touching - scatter - inbound)
         // launch - coarsening kernel (touching - scatter - outbound)
-        LAUNCH(cfg) << "coarsening kernel (touching - scatter - outbound) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "coarsening kernel (touching - scatter - outbound) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         apply_coarsening_touching_scatter_outbound<<<blocks, threads_per_block, shared_bytes>>>(
             d_touching,
             d_touching_offsets,

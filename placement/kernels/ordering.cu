@@ -382,11 +382,11 @@ void flag_reversals_kernel(
 // reverse elements in each flagged segment
 __global__
 void apply_reversals_kernel(
-    const uint32_t* segment, // segment[n] -> segment idx of which data[i] is part
-    const uint32_t* offsets, // offsets[i] -> start idx of the i-th segment in "data"
-    const bool* flag, // flag[i] -> true if the i-th segment in "data" is to be reversed
+    const uint32_t* __restrict__ segment, // segment[n] -> segment idx of which data[i] is part
+    const uint32_t* __restrict__ offsets, // offsets[i] -> start idx of the i-th segment in "data"
+    const bool* __restrict__ flag, // flag[i] -> true if the i-th segment in "data" is to be reversed
     const uint32_t size, // size of data
-    uint32_t* data // data[n] -> segments of values being reversed
+    uint32_t* __restrict__ data // data[n] -> segments of values being reversed
 ) {
     // STYLE: one node per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;

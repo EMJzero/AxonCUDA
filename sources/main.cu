@@ -161,16 +161,17 @@ int main(int argc, char** argv) {
     
     // device streams
     // TODO: use these!!
-    cudaStream_t compute_stream = nullptr;
-    cudaStream_t transfer_stream = nullptr;
-    CUDA_CHECK(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
-    CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_stream, cudaStreamNonBlocking));
-    int least_priority = 0;
-    int greatest_priority = 0;
-    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
+    
+    //cudaStream_t compute_stream = nullptr;
+    //cudaStream_t transfer_stream = nullptr;
+    //CUDA_CHECK(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
+    //CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_stream, cudaStreamNonBlocking));
+    //int least_priority = 0;
+    //int greatest_priority = 0;
+    //CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
     // give higher priority access to memory bandwidth to the compute kernel
-    CUDA_CHECK(cudaStreamCreateWithPriority(&compute_stream, cudaStreamNonBlocking, greatest_priority));
-    CUDA_CHECK(cudaStreamCreateWithPriority(&transfer_stream, cudaStreamNonBlocking, least_priority));
+    //CUDA_CHECK(cudaStreamCreateWithPriority(&compute_stream, cudaStreamNonBlocking, greatest_priority));
+    //CUDA_CHECK(cudaStreamCreateWithPriority(&transfer_stream, cudaStreamNonBlocking, least_priority));
     
     // device pointers
     uint32_t *d_hedges = nullptr; // hedges[hedges_offsets[hedge idx]] -> contigous array of pins of hedge (stored as src+destinations, with the srcs first)
@@ -716,7 +717,7 @@ int main(int argc, char** argv) {
             int num_warps_needed = curr_num_nodes ; // 1 warp per node
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - uncoarsening kernel (partitions)
-            LAUNCH(cfg) << "uncoarsening kernel (partitions) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            LAUNCH(cfg) RUN << "uncoarsening kernel (partitions) (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
             apply_uncoarsening_partitions<<<blocks, threads_per_block>>>(
                 d_groups,
                 d_coarse_partitions,
@@ -877,8 +878,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaStreamDestroy(transfer_stream));
-    CUDA_CHECK(cudaStreamDestroy(compute_stream));
+    //CUDA_CHECK(cudaStreamDestroy(transfer_stream));
+    //CUDA_CHECK(cudaStreamDestroy(compute_stream));
 
     CUDA_CHECK(cudaEventRecord(d_time_stop));
     CUDA_CHECK(cudaEventSynchronize(d_time_stop));
@@ -931,7 +932,7 @@ int main(int argc, char** argv) {
         // save results
         saveResult(cfg, partitioned_hg, partitions);
     } else {
-        ERR(cfg) std::cerr << "WARNING, invalid partitining !!\n";
+        std::cerr << "ERROR, invalid partitining !!\n";
         return 1;
     }
 

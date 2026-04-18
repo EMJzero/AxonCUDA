@@ -36,6 +36,7 @@ namespace config_plc {
             "  -fdi <num>  Set the number of force-directed refinement iterations\n"
             "  -cnc <num>  Set the count of candidate swaps proposed per node during force-directed refinement\n"
             "  -mso <num>  Overrides the number of multi-start attempts (default is chosen to maximally occupy the GPU)\n"
+            "  -thr <num>  Overrides the number of threads and streams to spawn (default equals multi-start attempts)\n"
             "  -ff         Replaces the 1D ordering heuristic with host-side sequential feedforward ordering\n"
             "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
             "  -seed <num> Set the algorithm's seed to <num> (default: " << SEED << ") (ignored when '-ff' is passed)\n"
@@ -52,6 +53,7 @@ namespace config_plc {
         uint32_t fd_iterations = FD_ITERATIONS;
         uint32_t candidates_count = MAX_CANDIDATE_MOVES;
         uint32_t multi_start_override = MULTISTART_ATTEMPTS;
+        uint32_t num_host_threads = NUM_HOST_THREADS;
         bool feedforward_order = false; // NB: runs sequentially on the HOST!
         bool device_touching_construction = false;
         uint64_t seed = SEED;
@@ -82,6 +84,11 @@ namespace config_plc {
             } else if (arg == "-mso") {
                 if (i + 1 >= argc) { std::cerr << "Error: -mso requires a positive integer value\n"; std::exit(1); }
                 multi_start_override = std::stoul(argv[++i]);
+                if (multi_start_override == 0) { std::cerr << "Error: -mso must greater than zero\n"; std::exit(1); }
+            } else if (arg == "-thr") {
+                if (i + 1 >= argc) { std::cerr << "Error: -thr requires a positive integer value\n"; std::exit(1); }
+                num_host_threads = std::stoul(argv[++i]);
+                if (num_host_threads == 0) { std::cerr << "Error: -thr must greater than zero\n"; std::exit(1); }
             } else if (arg == "-cnc") {
                 if (i + 1 >= argc) { std::cerr << "Error: -cnc requires a positive integer value\n"; std::exit(1); }
                 candidates_count = std::stoul(argv[++i]);
@@ -113,6 +120,7 @@ namespace config_plc {
             fd_iterations,
             candidates_count,
             multi_start_override,
+            num_host_threads,
             feedforward_order,
             device_touching_construction,
             seed,

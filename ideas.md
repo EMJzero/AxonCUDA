@@ -747,3 +747,49 @@ NEW pins-per-partition sparse data structure:
     the count of bits in the uint64_t value that are 1 before your own bit; add the offset, and the final counter to get the cell exact offset
 ---> maybe I could even sacrifice memory, make the counters 64bit too, and not have any need for the offsets of rows, I could just do a scan over the whole matrix at
      once and accumulate all offsets in the then-64bit counters...
+
+----
+
+Solution to the slow OpenMP multistart technique in placement:
+- the issue clearly is shitty coalescing of memory accesses with simultaneous kernel launches
+- rethink the multistart strategy and move it all on the device -> create multiple solutions, and have single kernel launch, for each of my kernels, spawn a thread per node per solution, or a warp per node per solution, and all solutions update in parallel
+=> this is batching of multi-start attempts in a single kernel launch!
+=> for once, you can launch kernels with TWO DIMENSIONS in blocks, one dimension over nodes/hedges, the other over "solutions" or "attempts"!ù
+- maybe it does not make sense to do this for the initial placement, that can run with OpenMP, but it does and will make sense for force directed refinement, that can be fully parallel! Still a pain to separate events per attempt, but whatever...
+
+----
+
+Placement quality estimation:
+
+
+Idea - Steiner approximation:
+- for each hedge, approximate its minimum Steiner tree span
+- you cannot "ricochet" off of other lattice points
+- for each node, add to the total distance the distance between it, and the closes among all other nodes in the same hedge
+  => this the facto creates a minimum spanning tree over the hedge's pins, connecting each pin to the other one closes to it
+    => the "minimum spanning tree" is defined over a higher-level fully connected graph where only lattice points occupied by
+       the hedge's pins exist, and each edge is weighted by the manhattan distance between said points
+    => hence, with the minimum spanning tree, you always pay the minimum path distance between node pairs, even if, in reality, you reuse links
+  => the minimum spanning tree will surely have span <= 2x the minimum Steiner tree
+- minimum spanning tree complexity: iterate over hedges, over pins of each, and for each pin over pins again (to find the closest), e+d^2
+Little issue:
+- a pin already part of the minimum spanning tree must not be reconsidered by subsequent nodes...
+
+Solution:
+- a random pin (e.g. the source, if one) starts as "marked"
+- every pin calculates its distance from its closest marked pin, and tries to atomically acquire it with it
+- pin contend the acquisiting by who is closer, the fine one holding, connects to the marked pin, adds its distance to the total,
+  and becomes itself marked, while the previously marked pin is excluded
+- repeat until every pin is excluded or marked
+=> sequential over 'd' ...
+=>=> can't we do Dijkstra inside each hedge!? In parallel, per pin, as if it were distributed?
+
+Spanning tree algorithm:
+- each warp gets to handle an hedge, that is a fully connected and weighted graph
+- for each pin, track its min current distance from any pin already in the MST and a flag telling if the pin is itself in the MST already
+- arbitrarily add the first pin to the MST
+  - for consistency, always add the last pin
+- reduce (argmin) the pin with smallest distance to the MST, and add it to it
+  - every other pin updates its min distance from the MST based on the new pin (lower it iff closer to the new pin)
+- repeat until no pin remains outside the MST
+- no need to track which edges were used for the MST, we just need to accumulate the total weight used when adding pins to it
