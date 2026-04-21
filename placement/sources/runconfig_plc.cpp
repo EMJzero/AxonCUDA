@@ -31,7 +31,7 @@ namespace config_plc {
             "Options:\n"
             "  -r <file>   Reload hypergraph from file\n"
             "  -s <file>   Save placement data to file\n"
-            "  -c <name>   Constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024 - default is loihi64)\n"
+            "  -c <name>   Constraints set to use (valid ones: truenorth, loihi, loihi64, loihi84, loihi1024 - default is loihi64)\n"
             "  -lpr <num>  Set the number of label propagation repeats during recursive bisection initial partitioning\n"
             "  -fdi <num>  Set the number of force-directed refinement iterations\n"
             "  -cnc <num>  Set the count of candidate swaps proposed per node during force-directed refinement\n"
@@ -166,6 +166,7 @@ namespace config_plc {
 
     HardwareModel setupNMH(runconfig &cfg) {
         std::unordered_map<std::string, HardwareModel (*)()> configurations {
+            { "loihi", HardwareModel::createLoihi },
             { "loihi64", HardwareModel::createLoihiLarge },
             { "loihi84", HardwareModel::createLoihiJin84 },
             { "loihi1024", HardwareModel::createLoihiJin1024 },

@@ -953,9 +953,12 @@ namespace hgraph {
             if (header.empty()) throw std::runtime_error("Empty .hgr file");
 
             std::istringstream hs(header);
-            uint32_t E, V;
+            uint64_t Eull, Vull;
             uint32_t fmt = 0;
-            hs >> E >> V;
+            hs >> Eull >> Vull;
+            if (Eull > std::numeric_limits<uint32_t>::max()) throw std::runtime_error("Hyperedge count exceeds uint32 range.");
+            if (Vull > std::numeric_limits<uint32_t>::max()) throw std::runtime_error("Node count exceeds uint32 range.");
+            uint32_t E = (uint32_t)Eull, V = (uint32_t)Vull;
             if (!(hs >> fmt)) fmt = 0;
 
             bool edge_weights = (fmt == 1 || fmt == 11);
@@ -1046,7 +1049,39 @@ namespace hgraph {
                 f << "\n";
             }
         }
-    
+
+        // write partitioning to a file, one line per node, containing its partition id
+        static void savePartitioning(const std::string& path, std::vector<uint32_t> partitions) {
+            std::ofstream f(path);
+            if (!f) throw std::runtime_error("Cannot open output file");
+            for (const auto& p : partitions)
+                f << p << "\n";
+        }
+
+        // each node's partition id on its line by node idx
+        std::vector<uint32_t> loadPartitioning(const std::string& path) {
+            std::ifstream part_file(path);
+            if (!part_file) throw std::runtime_error("Cannot open partitioning file.");
+
+            std::vector<uint32_t> partitions(node_count_);
+            std::string line;
+            uint32_t node_idx = 0;
+            while (std::getline(part_file, line)) {
+                if (node_idx >= node_count_) throw std::runtime_error("Partitioning file has more entries than the hypergraph has nodes.");
+                std::istringstream line_stream(line);
+                uint64_t partition_id = 0;
+                if (!(line_stream >> partition_id)) throw std::runtime_error("Invalid partition id at node " + std::to_string(node_idx) + ".");
+                line_stream >> std::ws;
+                if (!line_stream.eof()) throw std::runtime_error("Unexpected trailing data at node " + std::to_string(node_idx) + ".");
+                if (partition_id > std::numeric_limits<uint32_t>::max()) throw std::runtime_error("Partition id at node " + std::to_string(node_idx) + " exceeds uint32_t range.");
+                partitions[node_idx++] = static_cast<uint32_t>(partition_id);
+            }
+
+            if (node_idx != node_count_) throw std::runtime_error( "Partitioning file has " + std::to_string(node_idx) + " entries, but the hypergraph has " + std::to_string(node_count_) + " nodes.");
+
+            return partitions;
+        }
+
     };
 
 };

@@ -17,8 +17,8 @@ SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
 DATA_DIR="$(cd -P "$SCRIPT_DIR/part_snns" && pwd)"
 TARGET_BIN="$(cd -P "$SCRIPT_DIR/.." && pwd)/hplace_gpu.exe"
-TARGET_ARGS=(-lpr 16 -fdi 32 -dtc -v 0 -mso 16 -thr 1) # can be later overriden per-run
-RESULTS_DIR="$DATA_DIR/results_lpr16_fdi32"
+TARGET_ARGS=(-lpr 16 -fdi 32 -dtc -v 0 -mso 64 -thr 1) # can be later overriden per-run
+RESULTS_DIR="$DATA_DIR/results_lpr16_fdi32_mso64"
 
 PROFILING=0
 NSIGHT=0
@@ -181,7 +181,7 @@ mkdir -p "$RESULTS_DIR"
 # -------------------------
 # Custom ANNs
 # -------------------------
-run_case_checked "8k"          "8k_model_part"
+run_case_checked "8k"          "8k_model_part" -c loihi
 run_case_checked "64k"         "64k_model_part"
 run_case_checked "256k"        "256k_model_part" -c loihi84
 run_case_checked "1M"          "1M_model_part" -c loihi84
@@ -190,10 +190,10 @@ run_case_checked "16M"         "16M_model_part" -c loihi1024
 # -------------------------
 # Classic ANNs
 # -------------------------
-run_case_checked "LeNet"       "lenet_part"
+run_case_checked "LeNet"       "lenet_part" -c loihi
 run_case_checked "VGG11"       "vgg11_part" -c loihi84
 run_case_checked "AlexNet"     "alexnet_part" -c loihi84
-run_case_checked "MobileNet"   "mobilenet_part" -c loihi1024
+run_case_checked "MobileNet"   "mobilenet_part" -c loihi84
 
 # -------------------------
 # SNNs

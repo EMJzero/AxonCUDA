@@ -249,10 +249,7 @@ namespace config {
         if (!cfg.part_path.empty()) {
             try {
                 std::cout << "Saving partitioning to: " << cfg.part_path << " (each node's partition id on its line by node idx) ...\n";
-                std::ofstream f(cfg.part_path);
-                if (!f) throw std::runtime_error("Cannot open output file");
-                for (const auto& p : partitions)
-                    f << p << "\n";
+                HyperGraph::savePartitioning(cfg.part_path, partitions);
                 std::cout << "Partitioning saved to " << cfg.part_path << "\n";
                 std::cout << "Partitioning file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(cfg.part_path)) / (1 << 20) << " MB\n";
             } catch (const std::exception& e) {

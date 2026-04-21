@@ -195,7 +195,7 @@ namespace hwgeom {
 
     inline void coords_to_file(const std::vector<Coord2D>& v, const std::string& path) {
         std::ofstream out(path, std::ios::binary);
-        if (!out) throw std::runtime_error("Cannot open file");
+        if (!out) throw std::runtime_error("Failed to save coordinates, cannot open file.");
         std::size_t size = v.size();
         out.write(reinterpret_cast<const char*>(&size), sizeof(size));
         out.write(reinterpret_cast<const char*>(v.data()), size * sizeof(Coord2D));
@@ -203,7 +203,7 @@ namespace hwgeom {
 
     inline std::vector<Coord2D> coords_from_file(const std::string& path) {
         std::ifstream in(path, std::ios::binary);
-        if (!in) throw std::runtime_error("Cannot open file");
+        if (!in) throw std::runtime_error("Failed to load coordinates, cannot open file.");
         std::size_t size;
         in.read(reinterpret_cast<char*>(&size), sizeof(size));
         std::vector<Coord2D> v(size);
@@ -376,6 +376,22 @@ namespace hwmodel {
             const std::vector<hwgeom::Coord2D>& placement) const;
 
         // predefined harwdare models
+        static HardwareModel createLoihi() {
+            HardwareModelConfig cfg_loihi;
+            cfg_loihi.name = "Loihi";
+            cfg_loihi.neurons_per_core = 1024;
+            cfg_loihi.synapses_per_core = 4096;
+            cfg_loihi.cores_per_chip_x = 16;
+            cfg_loihi.cores_per_chip_y = 8;
+            cfg_loihi.chips_per_system_x = 1;
+            cfg_loihi.chips_per_system_y = 1;
+            cfg_loihi.energy_per_routing = 1.7;
+            cfg_loihi.energy_per_wire = 3.5;
+            cfg_loihi.latency_per_routing = 2.1;
+            cfg_loihi.latency_per_wire = 5.3;
+            return HardwareModel(cfg_loihi);
+        };
+
         static HardwareModel createLoihiLarge() {
             HardwareModelConfig cfg_loihi_large;
             cfg_loihi_large.name = "Loihi Large";

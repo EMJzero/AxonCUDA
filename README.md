@@ -17,9 +17,10 @@ Tested with:
 - CUDA Version: 12.4
 - GCC 13.4.0
 - GPUs:
-  - GH100
+  - GH200
   - A100-SXM4-40GB
   - RTX 2080ti
+  - A6000
 
 ## Setup
 
@@ -117,10 +118,12 @@ A partitioning of $G$ is defined as a function $\rho(V) \rightarrow P$, where $P
 
 Let $\Omega$ be the maximum number of nodes allowed for a partition, and $\Delta$ its maximum number of distinct inbound hyperedges.
 Formally, our constraints imply:
-$$
-\forall p \in P, \: |p| \leq \Omega \\
-|\textstyle\bigcup_{n \in p} in(n)| \leq \Delta
-$$
+```math
+\begin{aligned}
+\forall p \in P, \: |p| &\leq \Omega \\
+|\textstyle\bigcup_{n \in p} in(n)| &\leq \Delta
+\end{aligned}
+```
 
 For convenience, we discuss algorithmic complexity using the following variables w.r.t. a generic hgraph:
 - $n$ : number of hgraph nodes, $|V|$
@@ -134,32 +137,32 @@ For convenience, we discuss algorithmic complexity using the following variables
 Let $G = (N, E, \omega)$ be a hypergraph with $N$ nodes and $E \subseteq \mathcal{P}(N)$ hyperedges each with weight $\omega(e)$, where $\omega : E \rightarrow \mathbb{R}$.
 Let $P \subseteq \mathcal{P}(N)$ a partition of $N$.
 For a hyperedge $e \in E$, define its **connectivity** as
-$$
+```math
 \lambda(e) = \left|\{\, i \mid e \cap V_i \neq \emptyset \,\}\right|.
-$$
+```
 Then a partition's quality metrics are:
 
 **Cut Size (Cut Hyperedges)**
 Counts the number of hyperedges that span more than one block:
-$$
+```math
 \text{CutSize} = \sum_{e \in E} \omega(e) \cdot \mathbf{1}\{\lambda(e) > 1\}.
-$$
+```
 
 ---
 
 **Connectivity (km1)**
 Sums the excess connectivity of each hyperedge:
-$$
+```math
 \text{Conn} = \sum_{e \in E} \omega(e) \cdot \bigl(\lambda(e) - 1\bigr).
-$$
+```
 
 ---
 
 **SOED (Sum of External Degrees)**
 Weights excess connectivity by hyperedge size:
-$$
+```math
 \text{SOED} = \sum_{e \in E} \omega(e) \cdot |e| \cdot \bigl(\lambda(e) - 1\bigr),
-$$
+```
 <!--where $|e|$ is the number of nodes in hyperedge $e$.-->
 
 ## Speaking of Gains
@@ -173,21 +176,21 @@ We refer to refinement gains in two ways:
 
 ## Working HyperGraphs
 
-| **hypergraph** | **hardware** | **status** | connectivity | time [ms] | notes |
+| **hypergraph** | **constraints** | **status** | connectivity | time [ms] | notes |
 | --- | --- | --- | --- | --- | --- |
-| 8k-model | loihi64 | <code style="color : lime">ok</code> | 5841.066 | 623.817 |  |
-| 64k-model | loihi64 | <code style="color : lime">ok</code> | 45069.793 | 3857.316 |  |
-| 256k-model | loihi84 | <code style="color : lime">ok</code> | 46601.867 | 25402.265 |  |
-| 1M-model | loihi84 | <code style="color : lime">ok</code> | 157072.922 | 132653.438 |  |
+| 8k-model | loihi64 | <code style="color : lime">ok</code> | 5241.233 | 534.197 |  |
+| 64k-model | loihi64 | <code style="color : lime">ok</code> | 40403.949 | 3852.321 |  |
+| 256k-model | loihi84 | <code style="color : lime">ok</code> | 42202.102 | 25124.571 |  |
+| 1M-model | loihi84 | <code style="color : lime">ok</code> | 136837.625 | 232653.438 |  |
 | 16M-model | loihi84 | <code style="color : red">ko</code> |  |  | OOM |
-| LenNet | loihi64 | <code style="color : lime">ok</code> | 3119.209 | 509.088 |  |
-| VGG11 | loihi84 | <code style="color : lime">ok</code> | 56090.449 | 90792.703 |  |
-| AlexNet | loihi84 | <code style="color : lime">ok</code> | 16433.236 | 124265.188 |  |
+| LenNet | loihi64 | <code style="color : lime">ok</code> | 2716.121 | 508.468 |  |
+| VGG11 | loihi84 | <code style="color : lime">ok</code> | 51220.008 | 90740.923 |  |
+| AlexNet | loihi84 | <code style="color : lime">ok</code> | 15634.667 | 124028.297 |  |
 | MobileNet | loihi84 | <code style="color : red">ko</code> | 3335512.000 | 372353.156 | requires `-dtc`, `-smh 12`, `-ipm` |
-| Allen V1 | loihi84 | <code style="color : lime">ok</code> | 6220.164 | 42259.551 | requires `-cnc 16` |
-| 16k-rand | loihi64 | <code style="color : lime">ok</code> | 76390.469 | 902.341 |  |
-| 64k-rand | loihi64 | <code style="color : lime">ok</code> | 651617.500 | 2917.872 |  |
-| 256k-rand | loihi64 | <code style="color : lime">ok</code> | 3892063.750 | 24596.059 |  |
+| Allen V1 | loihi84 | <code style="color : lime">ok</code> | 6220.164 | 42259.551 | suggested `-cnc 16` |
+| 16k-rand | loihi64 | <code style="color : lime">ok</code> | 72359.555 | 902.281 |  |
+| 64k-rand | loihi64 | <code style="color : lime">ok</code> | 629264.000 | 2923.482 |  |
+| 256k-rand | loihi64 | <code style="color : lime">ok</code> | 3747706.750 | 24485.122 |  |
 
 > All results reported under the "default" configuration.
 > All "ko"s are out-of-memory instances...
@@ -212,6 +215,9 @@ All problems usually manifest as asserts being triggered:
   - if even with `PATH_SIZE = 1024` the problem persist, the likely suspect is an asymmetric neighbors histogram from `candidates_kernel`, run with `-v 3` for more info. That said, bugs aside, the only reasonable cause is an overflow due to `FIXED_POINT_SCALE`, try lowering it...
 - `GM hash-set full!` in any `apply_X` or `neighbors` kernel, means oversized segments for deduplication were not large enough, increase `-om <mul>` from the CLI...
 - `invalid partitioning returned` in k-way mode after initial Mt-KaHyPar solution means no valid initial partitioning likely existed, try raising `KWAY_INIT_UPPER_THREASHOLD`...
+- in case of an unexpected `invalid partitining` under known valid constraints:
+  - inspect the total hyperedges weight (printed after the hypergraph is loaded), and if it is close to the `uint32 / FIXED_POINT_SCALE` limit, the cause is likely an overflow after applying `FIXED_POINT_SCALE`, try lowering it...
+  - otherwise, make sure the hypergraph has less than $2^{32}$ nodes or hyperedges, as the code is currently hardwired to identify those with 32 bits...
 - too much host RAM usage: add the `-dtc` flag if your device has more VRAM than the host has RAM! Also recommended for a good speedup...
 
 > After any modification, remember to recompile (`make`)!
@@ -224,5 +230,13 @@ AxonCUDA is a free software provided under the MIT License.
 If you use AxonCUDA in an academic setting please cite the appropriate papers.
 
 ```bibtex
-COMING SOON :)
+@misc{AxonCUDA-prototype-AsHES,
+    title={Incidence Constraints in Hypergraph Partitioning on GPU},
+    author={Marco Ronzani and Cristina Silvano},
+    year={2026},
+    eprint={2604.14411},
+    archivePrefix={arXiv},
+    primaryClass={cs.DC},
+    url={https://arxiv.org/abs/2604.14411},
+}
 ```
