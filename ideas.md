@@ -793,3 +793,18 @@ Spanning tree algorithm:
   - every other pin updates its min distance from the MST based on the new pin (lower it iff closer to the new pin)
 - repeat until no pin remains outside the MST
 - no need to track which edges were used for the MST, we just need to accumulate the total weight used when adding pins to it
+
+
+----
+
+Compute cutnet IDEA:
+- prepare a copy of the segmented hedge buffer
+- map operation to replace each pin with its partition
+- segmented sort inside each hedge
+- filter operation to keep only (within each segmente) the even numbers that are followed by their value +1 (their odd partition in the pair)
+  - not need exactly to remove the elements, but to spot relevant ones
+- flag surviving elements and prefix sum the flags, this gives you a unique offset per element
+- for each surviving element create an event containing the tuple (hedge weight, partition id / 2), divide by 2 to get the parent partition's id
+  - could put in the event the hedge's id, and recover the weight later, but little would changes
+  - could sort immediately after filtering, but work with a larger buffer...
+- sort events by parent partition id, and do a segmented reduce within each parent id, that's each parent partition's cutnet cost

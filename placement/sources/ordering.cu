@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include <algorithm>
 
+#include <cub/cub.cuh>
+
 #include "thruster.cuh"
 
 #include "runconfig_plc.hpp"
@@ -83,11 +85,175 @@ void split_partitions_rand(
     CUDA_CHECK(cudaFreeAsync(d_partitions_cpy, stream));
 }
 
+void compute_partitions_cutnet(
+    const runconfig &cfg,
+    const uint32_t* d_hedges,
+    const dim_t* d_hedges_offsets,
+    const float* d_hedge_weights,
+    const uint32_t* d_partitions,
+    const uint32_t num_hedges,
+    const uint32_t num_parts,
+    const dim_t hedges_size,
+    float* d_cutnet,
+    const cudaStream_t stream,
+    const int tid
+) {
+    auto thrust_exec = thrust::cuda::par.on(stream);
+
+    /*
+    * IDEA:
+    * - prepare a copy of the segmented hedge buffer
+    * - map operation to replace each pin with its partition
+    * - segmented sort inside each hedge
+    * - filter operation to keep only (within each segmente) the even numbers that are followed by their value +1 (their odd partition in the pair)
+    *   - not need exactly to remove the elements, but to spot relevant ones
+    * - flag surviving elements and prefix sum the flags, this gives you a unique offset per element
+    * - for each surviving element create an event containing the tuple (hedge weight, partition id / 2), divide by 2 to get the parent partition's id
+    *   - could put in the event the hedge's id, and recover the weight later, but little would changes
+    *   - could sort immediately after filtering, but work with a larger buffer...
+    * - sort events by parent partition id, and do a segmented reduce within each parent id, that's each parent partition's cutnet cost
+    *
+    * TODO: switch from the segmented sort to deduplicating part_pins in shared-memory for each hedge, and directly yielding the count of unique partitions per hedge
+    *       from the count and offsets (aka, flags) you then allocate the buffer and repeat the deduplication to write final cuts
+    */
+
+    uint32_t* d_part_pins = nullptr; // part_pins[hedges_offsets[hedge idx] + pin idx] -> partition the pin is in
+    CUDA_CHECK(cudaMallocAsync(&d_part_pins, hedges_size * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_part_pins, d_hedges, hedges_size * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+
+    thrust::device_ptr<uint32_t> t_part_pins(d_part_pins);
+    thrust::device_ptr<const uint32_t> t_partitions(d_partitions);
+    thrust::device_ptr<const dim_t> t_hedges_offsets(d_hedges_offsets);
+    thrust::device_ptr<float> t_cutnet(d_cutnet);
+
+    // map pins to their partition -> map each entry part_pins[i] to partitions[t_part_pins[i]]
+    thrust::gather(thrust_exec, t_part_pins, t_part_pins + hedges_size, t_partitions, t_part_pins);
+
+    // segmented sort of part_pins (using the segments from hedges)
+    uint32_t* d_part_pins_buffer = nullptr; // CUB segmented sort buffer
+    CUDA_CHECK(cudaMallocAsync(&d_part_pins_buffer, hedges_size * sizeof(uint32_t), stream));
+    cub::DoubleBuffer<uint32_t> c_part_pins_double_buffer(d_part_pins, d_part_pins_buffer);
+    void* c_part_pins_storage = nullptr;
+    size_t c_part_pins_storage_bytes = 0;
+    cub::DeviceSegmentedRadixSort::SortKeys(
+        c_part_pins_storage, c_part_pins_storage_bytes, c_part_pins_double_buffer,
+        hedges_size, num_hedges, d_hedges_offsets, d_hedges_offsets + 1,
+        /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, stream
+    );
+    CUB(cfg) std::cout TID(tid) << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(hedges_size * sizeof(uint32_t)) / (1 << 30)
+        << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_part_pins_storage_bytes) / (1 << 20)
+        << " MB of temporary storage ...\n";
+    CUDA_CHECK(cudaMallocAsync(&c_part_pins_storage, c_part_pins_storage_bytes, stream));
+    cub::DeviceSegmentedRadixSort::SortKeys(
+        c_part_pins_storage, c_part_pins_storage_bytes, c_part_pins_double_buffer,
+        hedges_size, num_hedges, d_hedges_offsets, d_hedges_offsets + 1,
+        /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, stream
+    );
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (c_part_pins_double_buffer.Current() != d_part_pins) {
+        uint32_t* tmp = d_part_pins_buffer;
+        d_part_pins_buffer = d_part_pins;
+        d_part_pins = tmp;
+    }
+    CUDA_CHECK(cudaFreeAsync(d_part_pins_buffer, stream));
+    CUDA_CHECK(cudaFreeAsync(c_part_pins_storage, stream));
+
+    dim_t* d_flags = nullptr; // event_weight[idx] -> weight of the hedge being cut in event idx
+    CUDA_CHECK(cudaMallocAsync(&d_flags, (hedges_size + 1) * sizeof(dim_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(d_flags, 0x00, (hedges_size + 1) * sizeof(dim_t), stream));
+    thrust::device_ptr<dim_t> t_flags(d_flags);
+    {
+        // launch configuration - flag cutnet events kernel
+        int threads_per_block = 128; // 128/32 -> 4 warps per block
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        int num_warps_needed = num_hedges; // 1 warp per hedge
+        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+        // launch - flag cutnet events kernel
+        LAUNCH(cfg) TID(tid) RUN << "flag cutnet events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        flag_cutnet_events_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            d_part_pins,
+            d_hedges_offsets,
+            num_hedges,
+            d_flags
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    // exclusive prefix sum of flags, then extract the last value (total sum) as the events count
+    thrust::exclusive_scan(thrust_exec, t_flags, t_flags + hedges_size + 1, t_flags);
+    dim_t events_count = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&events_count, d_flags + hedges_size, sizeof(dim_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    float* d_event_weight = nullptr; // event_weight[idx] -> weight of the hedge being cut in event idx
+    uint32_t* d_event_part = nullptr; // event_part[idx] -> partition/2 affected by event idx
+
+    if (events_count > 0) {
+        CUDA_CHECK(cudaMallocAsync(&d_event_weight, events_count * sizeof(float), stream));
+        CUDA_CHECK(cudaMallocAsync(&d_event_part, events_count * sizeof(uint32_t), stream));
+
+        thrust::device_ptr<float> t_event_weight(d_event_weight);
+        thrust::device_ptr<uint32_t> t_event_part(d_event_part);
+
+        // for each part_pins entry that previously generated a flag, use the new prefix-summed flags as the index in event_weight and event_part
+        // where to let that part_pins entry write its content (in event_part) and its hedge's weight (in event_weight)
+        {
+            // launch configuration - cutnet event generation kernel
+            int threads_per_block = 128; // 128/32 -> 4 warps per block
+            int warps_per_block = threads_per_block / WARP_SIZE;
+            int num_warps_needed = num_hedges; // 1 warp per hedge
+            int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+            // launch - cutnet event generation kernel
+            LAUNCH(cfg) TID(tid) RUN << "cutnet event generation kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            cutnet_event_generation_kernel<<<blocks, threads_per_block, 0, stream>>>(
+                d_part_pins,
+                d_hedges_offsets,
+                d_hedge_weights,
+                d_flags,
+                num_hedges,
+                d_event_weight,
+                d_event_part
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+
+        // sort event_weight and event_part both according to event_part
+        thrust::sort_by_key(thrust_exec, t_event_part, t_event_part + events_count, t_event_weight);
+
+        // reduce-sum each segment of event_weight with the same event_part value and store the result in cutnet[t_event_part[.]]
+        uint32_t* d_unique_event_part = nullptr; // unique_event_part[idx] -> idx-th partition/2 that generated at least one cutnet event
+        float* d_unique_event_weight = nullptr; // unique_event_weight[idx] -> reduced cutnet contribution for unique_event_part[idx]
+        CUDA_CHECK(cudaMallocAsync(&d_unique_event_part, events_count * sizeof(uint32_t), stream));
+        CUDA_CHECK(cudaMallocAsync(&d_unique_event_weight, events_count * sizeof(float), stream));
+        thrust::device_ptr<uint32_t> t_unique_event_part(d_unique_event_part);
+        thrust::device_ptr<float> t_unique_event_weight(d_unique_event_weight);
+        auto reduced_end = thrust::reduce_by_key(
+            thrust_exec,
+            t_event_part, t_event_part + events_count, t_event_weight,
+            t_unique_event_part, t_unique_event_weight
+        );
+        dim_t unique_events_count = thrust::get<0>(reduced_end) - t_unique_event_part;
+        thrust::scatter(thrust_exec, t_unique_event_weight, t_unique_event_weight + unique_events_count, t_unique_event_part, t_cutnet);
+
+        CUDA_CHECK(cudaFreeAsync(d_unique_event_part, stream));
+        CUDA_CHECK(cudaFreeAsync(d_unique_event_weight, stream));
+        CUDA_CHECK(cudaFreeAsync(d_event_weight, stream));
+        CUDA_CHECK(cudaFreeAsync(d_event_part, stream));
+    } else {
+        thrust::fill(thrust_exec, t_cutnet, t_cutnet + num_parts / 2, FLT_MAX);
+    }
+
+    CUDA_CHECK(cudaFreeAsync(d_part_pins, stream));
+    CUDA_CHECK(cudaFreeAsync(d_flags, stream));
+}
+
 // return a high-locality, seeded 1D ordering of nodes
 uint32_t* locality_ordering(
     const runconfig &cfg,
     const uint32_t num_nodes,
     const uint32_t num_hedges,
+    const dim_t hedges_size,
     const uint32_t* d_hedges,
     const dim_t* d_hedges_offsets,
     const float* d_hedge_weights,
@@ -124,7 +290,7 @@ uint32_t* locality_ordering(
     * - yes, you need two partition arrays, one for super-partitions (the layer about you in the tree), and one for newly built ones
     */
 
-    /* 
+    /*
     * How to generate partition ids:
     * - given a partition with id "p", currently being bisected, its two child partitions will have ids:
     *   - p*2   - p*2 + 1
@@ -132,8 +298,6 @@ uint32_t* locality_ordering(
     * - uneven partitions will lead to some non-existing id, be wary
     * - when re-merging partitions, fuse all even "p"s with their odd successor and give both the "p/2" id
     */
-
-    // TODO: add a stop mechanic when you start oscillating in labelprop!!
 
     assert(num_nodes > 0); // how, why, what?!
 
@@ -162,6 +326,14 @@ uint32_t* locality_ordering(
     thrust::device_ptr<uint32_t> t_even_event_idx(d_even_event_idx);
     thrust::device_ptr<uint32_t> t_odd_event_idx(d_odd_event_idx);
 
+    // IDEA:
+    // - initialize this on each level from current partitions
+    // - after label prop, compute the new cutnet (=connectivity) for each pair of partitions
+    // - iff a partitions pair's cutnet improved, copy over here the new partition ids for the nodes of that pair of partitions
+    // - before going to the next level, make this the actual partitioning
+    uint32_t* d_last_best_partitions = nullptr; // last_best_partitions [node idx] -> last best partition (of bypartitions) the node was in
+    CUDA_CHECK(cudaMallocAsync(&d_last_best_partitions, num_nodes * sizeof(uint32_t), stream));
+
     uint32_t level_idx = 0u;
     while (num_parts < (num_nodes + 1) / 2) { // as long as partitions do not strictly contain 1 or 2 nodes...
         INFO(cfg) std::cout TID(tid) << "Bisection level " << level_idx << " number of partitions=" << num_parts << "\n";
@@ -179,6 +351,31 @@ uint32_t* locality_ordering(
         );
 
         num_parts *= 2;
+
+        // initialize best partitions
+        CUDA_CHECK(cudaMemcpyAsync(d_last_best_partitions, d_partitions, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+
+        float* d_cutnet = nullptr; // cutnet [part idx / 2 | (part idx + 1) / 2] -> current cutnet for the pair of partitions
+        float* d_last_best_cutnet = nullptr; // last_best_cutnet [part idx / 2 | (part idx + 1) / 2] -> last best cutnet for that pair of partitions
+        CUDA_CHECK(cudaMallocAsync(&d_cutnet, (num_parts / 2) * sizeof(float), stream));
+        CUDA_CHECK(cudaMallocAsync(&d_last_best_cutnet, (num_parts / 2) * sizeof(float), stream));
+        thrust::device_ptr<float> t_cutnet(d_cutnet);
+        thrust::device_ptr<float> t_last_best_cutnet(d_last_best_cutnet);
+
+        // compute initial partitions cutnet
+        compute_partitions_cutnet(
+            cfg,
+            d_hedges,
+            d_hedges_offsets,
+            d_hedge_weights,
+            d_partitions,
+            num_hedges,
+            num_parts,
+            hedges_size,
+            d_last_best_cutnet,
+            stream,
+            tid
+        );
 
         for (uint32_t lp_repeat = 0u; lp_repeat < cfg.labelprop_repeats; lp_repeat++) {
             // compute gains (and moves) in-isolation
@@ -350,7 +547,7 @@ uint32_t* locality_ordering(
             CUDA_CHECK(cudaMemsetAsync(d_even_event_idx, 0xFF, (num_parts / 2) * sizeof(uint32_t), stream));
             auto d_event_argmax = thrust::make_transform_output_iterator(
                 t_even_event_idx, // discard the "max" part of the "argmax" return tuple
-                [] __device__ (auto x) { return (thrust::get<0>(x) < 0) ? UINT32_MAX : thrust::get<1>(x); }
+                [] __device__ (auto x) { return (thrust::get<0>(x) <= 0.0f) ? UINT32_MAX : thrust::get<1>(x); }
             );
             thrust::reduce_by_key(
                 thrust_exec,
@@ -363,12 +560,12 @@ uint32_t* locality_ordering(
             // apply pairs of improving moves
             // add together the gain of equi-ranked moves between bisected partitions as the gain of the pair to swap
             {
-                // launch configuration - apply move events kernels
+                // launch configuration - apply move events kernel
                 int threads_per_block = 256;
                 int num_threads_needed = even_events_count; // 1 thread per event
                 int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
-                // launch - apply move events kernels
-                LAUNCH(cfg) TID(tid) RUN << "apply move events kernels (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+                // launch - apply move events kernel
+                LAUNCH(cfg) TID(tid) RUN << "apply move events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
                 apply_move_events_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_even_event_idx,
                     d_even_event_part,
@@ -383,6 +580,47 @@ uint32_t* locality_ordering(
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }
 
+            // compute the new partitions cutnet
+            compute_partitions_cutnet(
+                cfg,
+                d_hedges,
+                d_hedges_offsets,
+                d_hedge_weights,
+                d_partitions,
+                num_hedges,
+                num_parts,
+                hedges_size,
+                d_cutnet,
+                stream,
+                tid
+            );
+
+            // track the best partitioning found so far at this level
+            {
+                // launch configuration - update best partitions kernel
+                int threads_per_block = 256;
+                int num_threads_needed = num_nodes; // 1 thread per node
+                int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+                // launch - update best partitions kernel
+                LAUNCH(cfg) TID(tid) RUN << "update best partitions kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+                update_best_partitions_kernel<<<blocks, threads_per_block, 0, stream>>>(
+                    d_partitions,
+                    d_cutnet,
+                    d_last_best_cutnet,
+                    num_nodes,
+                    d_last_best_partitions
+
+                );
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+
+            // update the best cutnets per partitions pair found so far at this level
+            thrust::transform(
+                thrust_exec, t_last_best_cutnet, t_last_best_cutnet + num_parts / 2,
+                t_cutnet, t_last_best_cutnet, thrust::minimum<float>{}
+            );
+
             CUDA_CHECK(cudaFreeAsync(d_even_event_part, stream));
             CUDA_CHECK(cudaFreeAsync(d_even_event_score, stream));
             CUDA_CHECK(cudaFreeAsync(d_even_event_node, stream));
@@ -392,12 +630,22 @@ uint32_t* locality_ordering(
             CUDA_CHECK(cudaFreeAsync(d_part_even_event_offsets, stream));
             CUDA_CHECK(cudaFreeAsync(d_part_odd_event_offsets, stream));
         }
+
+        // recover best partitions
+        uint32_t* d_temp_partitions = d_last_best_partitions;
+        d_last_best_partitions = d_partitions;
+        d_partitions = d_temp_partitions;
+        t_partitions = thrust::device_ptr<uint32_t>(d_partitions);
+
+        CUDA_CHECK(cudaFreeAsync(d_cutnet, stream));
+        CUDA_CHECK(cudaFreeAsync(d_last_best_cutnet, stream));
     }
 
     CUDA_CHECK(cudaFreeAsync(d_moves, stream));
     CUDA_CHECK(cudaFreeAsync(d_scores, stream));
     CUDA_CHECK(cudaFreeAsync(d_even_event_idx, stream));
     CUDA_CHECK(cudaFreeAsync(d_odd_event_idx, stream));
+    CUDA_CHECK(cudaFreeAsync(d_last_best_partitions, stream));
 
     // one final bisection to go down to 1-element partitions
     split_partitions_rand(
@@ -539,6 +787,37 @@ uint32_t* locality_ordering(
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     CURAND_CHECK(curandDestroyGenerator(gen));
+
+    // =============================
+    // measure 1D order locality
+    // metric: width spanned by each hedge (lowest pin idx - to - highest pin idx) times its weight
+    LOG(cfg) {
+        float* d_hedge_span = nullptr; // hedge_span[hedge idx] -> max-pin-idx - min-pin-idx times the hedge's weight
+        CUDA_CHECK(cudaMallocAsync(&d_hedge_span, num_hedges * sizeof(float), stream));
+        {
+            // launch configuration - measure sequence locality kernel
+            int threads_per_block = 256;
+            int num_threads_needed = num_hedges; // 1 thread per (half) partition
+            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+            // launch - measure sequence locality kernel
+            LAUNCH(cfg) TID(tid) RUN << "measure sequence locality kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            measure_sequence_locality_kernel<<<blocks, threads_per_block, 0, stream>>>(
+                d_hedges,
+                d_hedges_offsets,
+                d_hedge_weights,
+                d_order_idx,
+                num_hedges,
+                d_hedge_span
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        thrust::device_ptr<float> t_hedge_span(d_hedge_span);
+        float tot_span = thrust::reduce(thrust_exec, t_hedge_span, t_hedge_span + num_hedges);
+        CUDA_CHECK(cudaFreeAsync(d_hedge_span, stream));
+        std::cout TID(tid) << "Initial sequence (1D) weighted locality: " << std::fixed << std::setprecision(3) << tot_span << "\n";
+    }
+    // =============================
 
     return d_order_idx;
 }

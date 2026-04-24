@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <fstream>
 #include <sstream>
+#include <utility>
 #include <iostream>
 #include <filesystem>
 #include <unordered_map>
@@ -37,6 +38,8 @@ namespace config_plc {
             "  -cnc <num>  Set the count of candidate swaps proposed per node during force-directed refinement\n"
             "  -mso <num>  Overrides the number of multi-start attempts (default is chosen to maximally occupy the GPU)\n"
             "  -thr <num>  Overrides the number of threads and streams to spawn (default equals multi-start attempts)\n"
+            "  -sfc <name> Determines the 1D-to-2D mapping used to preserve locality after ordering nodes, valid names are:\n"
+            "      - hilb: Hilbert space-filling curve (default)    - snak: square-ish serpentine sweep    - zord: Z-order curve\n"
             "  -ff         Replaces the 1D ordering heuristic with host-side sequential feedforward ordering\n"
             "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
             "  -seed <num> Set the algorithm's seed to <num> (default: " << SEED << ") (ignored when '-ff' is passed)\n"
@@ -54,6 +57,7 @@ namespace config_plc {
         uint32_t candidates_count = MAX_CANDIDATE_MOVES;
         uint32_t multi_start_override = MULTISTART_ATTEMPTS;
         uint32_t num_host_threads = NUM_HOST_THREADS;
+        SpaceFillingCurve space_filling_curve = SpaceFillingCurve::HILB;
         bool feedforward_order = false; // NB: runs sequentially on the HOST!
         bool device_touching_construction = false;
         uint64_t seed = SEED;
@@ -93,6 +97,10 @@ namespace config_plc {
                 if (i + 1 >= argc) { std::cerr << "Error: -cnc requires a positive integer value\n"; std::exit(1); }
                 candidates_count = std::stoul(argv[++i]);
                 if (candidates_count > MAX_CANDIDATE_MOVES) { std::cerr << "Error: -cnc must be less or equal to " << MAX_CANDIDATE_MOVES << "\n"; std::exit(1); }
+            } else if (arg == "-sfc") {
+                if (i + 1 >= argc) { std::cerr << "Error: -sfc requires a curve name\n"; std::exit(1); }
+                std::string curve_name = argv[++i];
+                if (!parseSFC(curve_name, space_filling_curve)) { std::cerr << "Error: -sfc requested an invalid curve name \n"; std::exit(1); }
             } else if (arg == "-ff") {
                 feedforward_order = true;
             } else if (arg == "-dtc") {
@@ -121,6 +129,7 @@ namespace config_plc {
             candidates_count,
             multi_start_override,
             num_host_threads,
+            space_filling_curve,
             feedforward_order,
             device_touching_construction,
             seed,
@@ -196,5 +205,23 @@ namespace config_plc {
                 std::exit(1);
             }
         }
+    }
+
+    const char* SFCtoString(SpaceFillingCurve curve) {
+        for (const auto& [value, name] : SPACE_FILLING_CURVE_NAMES) {
+            if (value == curve)
+                return name;
+        }
+        return "unknown";
+    }
+
+    bool parseSFC(const std::string& name, SpaceFillingCurve& curve) {
+        for (const auto& [value, text] : SPACE_FILLING_CURVE_NAMES) {
+            if (name == text) {
+                curve = value;
+                return true;
+            }
+        }
+        return false;
     }
 }

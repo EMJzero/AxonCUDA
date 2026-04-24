@@ -28,6 +28,81 @@ void split_partitions_kernel(
 }
 
 
+// CUTNET EVALUATION
+
+// extract into events the even partition-mapped pins of an hedge that are followed (after sorting) by their sibling partition
+// SEQUENTIAL COMPLEXITY: e*d
+// PARALLEL OVER: e
+// SHUFFLES OVER: d
+__global__
+void flag_cutnet_events_kernel(
+    const uint32_t* __restrict__ part_pins,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t num_hedges,
+    dim_t* __restrict__ flags
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the node to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    const dim_t my_hedge_offset = hedges_offsets[warp_id];
+    const dim_t not_my_hedge_offset = hedges_offsets[warp_id + 1];
+    if (not_my_hedge_offset <= my_hedge_offset + 1u) return; // empty hedge or singleton hedge cannot generate a cut event
+    dim_t my_offset = my_hedge_offset + lane_id;
+
+    // each thread in the warp reads one every WARP_SIZE pins
+    // => always ignore the last pin, since it has no successor
+    for (; my_offset + 1u < not_my_hedge_offset; my_offset += WARP_SIZE) {
+        const uint32_t part_pin = part_pins[my_offset];
+        if ((part_pin & 1u) == 1) continue; // odd partition
+        const uint32_t next_part_pin = part_pins[my_offset + 1];
+        if (next_part_pin != part_pin + 1) continue; // no cut, the pin's sibling partition doesn't appear in this hedge
+        flags[my_offset] = 1u;
+    }
+}
+
+// extract into events the even partition-mapped pins of an hedge that are followed (after sorting) by their sibling partition
+// SEQUENTIAL COMPLEXITY: e*d
+// PARALLEL OVER: e
+// SHUFFLES OVER: d
+__global__
+void cutnet_event_generation_kernel(
+    const uint32_t* __restrict__ part_pins,
+    const dim_t* __restrict__ hedges_offsets,
+    const float* __restrict__ hedge_weights,
+    const dim_t* __restrict__ flags,
+    const uint32_t num_hedges,
+    float* __restrict__ event_weight,
+    uint32_t* __restrict__ event_part
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the node to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    const dim_t my_hedge_offset = hedges_offsets[warp_id];
+    const dim_t not_my_hedge_offset = hedges_offsets[warp_id + 1];
+    if (not_my_hedge_offset <= my_hedge_offset + 1u) return; // empty hedge or singleton hedge cannot generate a cut event
+    dim_t my_offset = my_hedge_offset + lane_id;
+    const float my_weight = hedge_weights[warp_id];
+
+    // each thread in the warp reads one every WARP_SIZE pins
+    // => always ignore the last pin, since it has no successor
+    for (; my_offset + 1u < not_my_hedge_offset; my_offset += WARP_SIZE) {
+        const uint32_t part_pin = part_pins[my_offset];
+        if ((part_pin & 1u) == 1) continue; // odd partition
+        const uint32_t next_part_pin = part_pins[my_offset + 1];
+        if (next_part_pin != part_pin + 1) continue; // no cut, the pin's sibling partition doesn't appear in this hedge
+        const dim_t event_offset = flags[my_offset];
+        event_weight[event_offset] = my_weight;
+        event_part[event_offset] = part_pin / 2;
+    }
+}
+
+
 // LABEL PROPAGATION
 
 // find in which partition (between a pair that was just bisected) each node wants to stay in
@@ -79,7 +154,7 @@ void label_propagation_kernel(
         const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
         const float my_hedge_weight = hedge_weights[actual_hedge_idx];
         for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
-            uint32_t pin = *my_hedge;
+            const uint32_t pin = *my_hedge;
             if (pin == warp_id) continue;
             if (partitions[pin] == my_partition) // the pin is on my same side
                 curr_p_score += my_hedge_weight;
@@ -212,7 +287,7 @@ void label_cascade_kernel(
     }
 
     uint32_t my_node = my_event_node[event_id];
-    
+
     const uint32_t my_partition = partitions[my_node];
     const uint32_t other_partition = (my_partition & 1u) == 0 ? my_partition + 1 : my_partition - 1;
 
@@ -235,7 +310,7 @@ void label_cascade_kernel(
         const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
         const float my_hedge_weight = hedge_weights[actual_hedge_idx];
         for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
-            uint32_t pin = *my_hedge;
+            const uint32_t pin = *my_hedge;
             if (pin == my_node) continue;
             if (partitions[pin] == my_partition) {
                 if (my_ranks[pin] == UINT32_MAX || my_ranks[pin] > event_id) // the pin is on my same side and didn't move before me
@@ -245,7 +320,7 @@ void label_cascade_kernel(
             } else if (partitions[pin] == other_partition) {
                 if (other_ranks[pin] == UINT32_MAX || other_ranks[pin] - other_part_events_offset > my_part_event_rank) // the pin is on the other side of the bisection and didn't move before me
                     other_p_score += my_hedge_weight;
-                else // the pin was on the other side of the bisection, but move before me
+                else // the pin was on the other side of the bisection, but move before me (or -with- me)
                     curr_p_score += my_hedge_weight;
             }
         }
@@ -294,6 +369,31 @@ void apply_move_events_kernel(
     
     partitions[my_node] = (my_part_half << 1) + 1u; // partitions[my_node] was even by construction
     partitions[other_node] = (my_part_half << 1);
+}
+
+// for every node, if its current partition improved in cutnet w.r.t. the best so far, overwrite its best partition with the current one
+__global__
+void update_best_partitions_kernel(
+    const uint32_t* __restrict__ partitions,
+    const float* __restrict__ cutnet,
+    const float* __restrict__ last_best_cutnet,
+    const uint32_t num_nodes,
+    uint32_t* __restrict__ last_best_partitions
+) {
+    // STYLE: one node per thread!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_nodes) return;
+
+    // TODO: could be ran only for nodes that actually switched sides...
+
+    uint32_t part = partitions[tid];
+    uint32_t parent_part = part / 2;
+    float my_cutnet = cutnet[parent_part];
+    float my_last_best_cutnet = last_best_cutnet[parent_part];
+
+    // if your partition pair's cutnet improved, update your last best partition
+    if (my_last_best_cutnet > my_cutnet)
+        last_best_partitions[tid] = part;
 }
 
 
@@ -405,4 +505,39 @@ void apply_reversals_kernel(
     uint32_t tmp = data[tid];
     data[tid] = data[other];
     data[other] = tmp;
+}
+
+// compute the weighted span of each hedge
+__global__
+void measure_sequence_locality_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const float* __restrict__ hedge_weights,
+    const uint32_t* __restrict__ order_idx,
+    const uint32_t num_hedges,
+    float* __restrict__ hedge_span
+) {
+    // STYLE: one hedge per thread!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_hedges) return;
+
+    // TODO: upgrade to go over pins with a whole WARP
+
+    const uint32_t* my_hedge = hedges + hedges_offsets[tid];
+    const uint32_t* not_my_hedge = hedges + hedges_offsets[tid + 1];
+
+    uint32_t min_pin_idx = UINT32_MAX;
+    uint32_t max_pin_idx = 0u;
+
+    for (; my_hedge < not_my_hedge; my_hedge++) {
+        const uint32_t pin = *my_hedge;
+        const uint32_t idx = order_idx[pin];
+        if (idx < min_pin_idx) min_pin_idx = idx;
+        if (idx > max_pin_idx) max_pin_idx = idx;
+    }
+
+    if (min_pin_idx == UINT32_MAX)
+        hedge_span[tid] = 0.0f;
+    else
+        hedge_span[tid] = (max_pin_idx - min_pin_idx) * hedge_weights[tid];
 }

@@ -33,7 +33,7 @@
 
 // USED BY: recursive bipartitioning
 
-#define LABELPROP_REPEATS 16
+#define LABELPROP_REPEATS 8
 
 
 // USED BY: candidate moves kernel
@@ -44,4 +44,4 @@
 
 // USED BY: force-directed refinement
 
-#define FD_ITERATIONS 32 // 1024
+#define FD_ITERATIONS 64 // 1024

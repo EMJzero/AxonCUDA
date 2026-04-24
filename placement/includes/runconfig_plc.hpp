@@ -19,6 +19,18 @@ namespace hwmodel {
 
 namespace config_plc {
 
+    enum class SpaceFillingCurve {
+        HILB, // Hilbert curve
+        SNAK, // S-like snake curve
+        ZORD // Z-order curve
+    };
+
+    static constexpr std::pair<SpaceFillingCurve, const char*> SPACE_FILLING_CURVE_NAMES[] = {
+        { SpaceFillingCurve::HILB, "hilb" },
+        { SpaceFillingCurve::SNAK, "snak" },
+        { SpaceFillingCurve::ZORD, "zord" }
+    };
+
     struct runconfig {
         std::string load_path; // path to the hgraph to load 'n' partition
         std::string save_path; // path where to save the placement data
@@ -28,6 +40,7 @@ namespace config_plc {
         uint32_t candidates_count; // number of candidate swaps proposed per node during force-directed refinement
         uint32_t multi_start_override; // imposes the number of multi-start attempts at placement
         uint32_t num_host_threads; // imposes the number of host threads and GPU streams to spawn to handle the multi-start attempts
+        SpaceFillingCurve space_filling_curve; // space filling curve to use for the 1D-to-2D locality-preserving mapping
         bool feedforward_order; // if true, use the greedy sequential feedforward initial partitioning (runs on the host !!)
         bool device_touching_construction; // whether to construct touching/incidence sets on the device or the host
         uint64_t seed; // seed for the multi-start and recursive bisection methods
@@ -35,7 +48,6 @@ namespace config_plc {
         bool verbose_info; // whether to log the step/phase where the program is at
         bool verbose_errs_and_warns; // whether to log errs and warnings
         bool verbose_kernel_launches; // whether to log every kernel launch or not
-
     };
 
     void printHelp();
@@ -47,4 +59,8 @@ namespace config_plc {
     hwmodel::HardwareModel setupNMH(runconfig &cfg);
 
     void saveResult(runconfig &cfg, std::vector<hwgeom::Coord2D> h_placement);
+
+    const char* SFCtoString(SpaceFillingCurve curve);
+
+    bool parseSFC(const std::string& name, SpaceFillingCurve& curve);
 }

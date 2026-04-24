@@ -22,6 +22,7 @@ uint32_t* locality_ordering(
     const runconfig &cfg,
     const uint32_t num_nodes,
     const uint32_t num_hedges,
+    const dim_t hedges_size,
     const uint32_t* d_hedges,
     const dim_t* d_hedges_offsets,
     const float* d_hedge_weights,
@@ -50,6 +51,25 @@ void split_partitions_kernel(
     const uint32_t* __restrict__ part_offsets,
     const uint32_t num_nodes,
     uint32_t* __restrict__ partitions
+);
+
+__global__
+void flag_cutnet_events_kernel(
+    const uint32_t* __restrict__ part_pins,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t num_hedges,
+    dim_t* __restrict__ flags
+);
+
+__global__
+void cutnet_event_generation_kernel(
+    const uint32_t* __restrict__ part_pins,
+    const dim_t* __restrict__ hedges_offsets,
+    const float* __restrict__ hedge_weights,
+    const dim_t* __restrict__ flags,
+    const uint32_t num_hedges,
+    float* __restrict__ event_weight,
+    uint32_t* __restrict__ event_part
 );
 
 __global__
@@ -115,6 +135,15 @@ void apply_move_events_kernel(
 );
 
 __global__
+void update_best_partitions_kernel(
+    const uint32_t* __restrict__ partitions,
+    const float* __restrict__ cutnet,
+    const float* __restrict__ last_best_cutnet,
+    const uint32_t num_nodes,
+    uint32_t* __restrict__ last_best_partitions
+);
+
+__global__
 void sibling_tree_connection_strength_kernel(
     const uint32_t* __restrict__ hedges,
     const dim_t* __restrict__ hedges_offsets,
@@ -142,4 +171,14 @@ void apply_reversals_kernel(
     const bool* __restrict__ flag,
     const uint32_t size,
     uint32_t* __restrict__ data
+);
+
+__global__
+void measure_sequence_locality_kernel(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const float* __restrict__ hedge_weights,
+    const uint32_t* __restrict__ order_idx,
+    const uint32_t num_hedges,
+    float* __restrict__ hedge_span
 );

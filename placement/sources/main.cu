@@ -17,6 +17,7 @@
 #include <omp.h>
 
 #include "hgraph.hpp"
+#include "curves.hpp"
 #include "nmhardware.hpp"
 #include "runconfig_plc.hpp"
 
@@ -77,6 +78,7 @@ int main(int argc, char** argv) {
     if (cfg.num_host_threads == UINT32_MAX) std::cout << "<max-occupancy>\n";
     else std::cout << cfg.num_host_threads << "\n";
     std::cout << "  Label propagation repeats:       " << cfg.labelprop_repeats << "\n";
+    std::cout << "  Space-filling curve:             " << SFCtoString(cfg.space_filling_curve) << "\n";
     std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc " : "") << (cfg.feedforward_order ? "ff " : "") << "\n";
 
     if (hg.nodes() > hw.coresAlongX() * hw.coresAlongY()) {
@@ -108,7 +110,7 @@ int main(int argc, char** argv) {
     INFO(cfg) std::cout << "Preparing hypergraph data...\n";
 
     // build incidence sets on the host only if explicitly required
-    if (!cfg.device_touching_construction)
+    if (!cfg.device_touching_construction || cfg.feedforward_order)
         hg.buildIncidenceSets();
 
     uint32_t num_hedges = static_cast<uint32_t>(hg.hedges().size());
@@ -165,6 +167,9 @@ int main(int argc, char** argv) {
     // |
     // best results
     float best_whops = FLT_MAX; // total weight of hedge hops in the current best solution
+    // |
+    // 1D to 2D map
+    coords *d_1dto2d_placement = nullptr; // 1dto2d_placement[node idx] -> x and y coordinates for the node's sequence mapping from 1D to 2D
     
     // allocate device memory
     CUDA_CHECK(cudaMalloc(&d_hedges, hg.hedgesFlat().size() * sizeof(uint32_t)));
@@ -173,6 +178,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_hedge_weights, num_hedges * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_best_placement, num_nodes * sizeof(coords)));
     CUDA_CHECK(cudaMalloc(&d_best_inv_placement, h_max_width * h_max_height * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_1dto2d_placement, num_nodes * sizeof(coords)));
 
     // copy to device
     CUDA_CHECK(cudaMemcpy(d_hedges, hg.hedgesFlat().data(), hg.hedgesFlat().size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
@@ -204,9 +210,23 @@ int main(int argc, char** argv) {
         );
     }
 
+    // generate a 1D to 2D map for lattice points
+    std::vector<coords> h_1dto2d_placement;
+    if (cfg.space_filling_curve == SpaceFillingCurve::HILB)
+        h_1dto2d_placement = hilbertPlacement(num_nodes, h_max_width, h_max_height);
+    else if (cfg.space_filling_curve == SpaceFillingCurve::SNAK)
+        h_1dto2d_placement = snakePlacement(num_nodes, h_max_width, h_max_height);
+    else if (cfg.space_filling_curve == SpaceFillingCurve::ZORD)
+        h_1dto2d_placement = zorderPlacement(num_nodes, h_max_width, h_max_height);
+    CUDA_CHECK(cudaMemcpy(d_1dto2d_placement, h_1dto2d_placement.data(), num_nodes * sizeof(coords), cudaMemcpyHostToDevice));
+    thrust::device_ptr<const coords> t_1dto2d_placement(d_1dto2d_placement);
+
     // determine multistart count to maximally occupy the GPU
     uint32_t multi_start_count = cfg.multi_start_override;
-    if (multi_start_count == UINT32_MAX) {
+    if (cfg.feedforward_order && multi_start_count > 1) {
+        multi_start_count = 1u;
+        ERR(cfg) std::cout << "WARNING, feedforward ordering doesn't support multi-start, forcing multi-start count to 1 !!\n";
+    } else if (multi_start_count == UINT32_MAX) {
         // HP: every kernel uses at most one warp per node
         //int max_warps_per_SM = prop.maxThreadsPerMultiProcessor / prop.warpSize;
         //int total_warp_capacity = prop.multiProcessorCount * max_warps_per_SM;
@@ -283,6 +303,7 @@ int main(int argc, char** argv) {
                 cfg,
                 num_nodes,
                 num_hedges,
+                hg.hedgesFlat().size(),
                 d_hedges,
                 d_hedges_offsets,
                 d_hedge_weights,
@@ -294,24 +315,16 @@ int main(int argc, char** argv) {
             );
         }
 
-        // generate a 1D to 2D map for lattice points
-        std::vector<coords> init_placement = hilbertPlacement(num_nodes, h_max_width, h_max_height);
-        CUDA_CHECK(cudaMemcpyAsync(d_placement, init_placement.data(), num_nodes * sizeof(coords), cudaMemcpyHostToDevice, stream));
-
         // assign (scatter) to the nodes their respective placement following both 1D orders (from ordered nodes through the lattice points map)
-        coords *d_tmp_placement = nullptr;
-        CUDA_CHECK(cudaMallocAsync(&d_tmp_placement, num_nodes * sizeof(coords), stream));
         thrust::device_ptr<coords> t_placement(d_placement);
-        thrust::device_ptr<coords> t_tmp_placement(d_tmp_placement);
         thrust::device_ptr<uint32_t> t_order_idx(d_order_idx);
-        thrust::scatter(thrust_exec, t_placement, t_placement + num_nodes, t_order_idx, t_tmp_placement);
+        thrust::scatter(thrust_exec, t_1dto2d_placement, t_1dto2d_placement + num_nodes, t_order_idx, t_placement);
         CUDA_CHECK(cudaFreeAsync(d_order_idx, stream));
-        CUDA_CHECK(cudaFreeAsync(d_placement, stream));
-        d_placement = d_tmp_placement;
         
         // =============================
         // print some temporary results
         LOG(cfg) {
+            std::vector<coords> init_placement(num_nodes);
             CUDA_CHECK(cudaMemcpyAsync(init_placement.data(), d_placement, num_nodes * sizeof(coords), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::vector<Coord2D> h_init_placement(num_nodes);

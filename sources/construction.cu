@@ -642,7 +642,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
     CUB(cfg) std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_hedges_size * sizeof(uint32_t)) / (1 << 30)
         << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_hedges_storage_bytes) / (1 << 20)
         << " MB of temporary storage ...\n";
-    cudaMalloc(&c_hedges_storage, c_hedges_storage_bytes);
+    CUDA_CHECK(cudaMalloc(&c_hedges_storage, c_hedges_storage_bytes));
     cub::DeviceSegmentedRadixSort::SortKeysDescending(
         c_hedges_storage, c_hedges_storage_bytes, c_coarse_hedges_double_buffer,
         new_hedges_size, num_hedges, d_coarse_hedges_offsets, d_coarse_hedges_offsets + 1,
@@ -757,7 +757,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
         CUB(cfg) std::cout << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(new_touching_size * sizeof(uint32_t)) / (1 << 30)
             << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_touching_storage_bytes) / (1 << 20)
             << " MB of temporary storage ...\n";
-        cudaMalloc(&c_touching_storage, c_touching_storage_bytes);
+        CUDA_CHECK(cudaMalloc(&c_touching_storage, c_touching_storage_bytes));
         cub::DeviceSegmentedRadixSort::SortKeys(c_touching_storage, c_touching_storage_bytes, c_coarse_touching_double_buffer, new_touching_size, new_num_nodes, d_coarse_touching_offsets, d_coarse_touching_offsets + 1, /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, /*stream*/0);
         if (c_coarse_touching_double_buffer.Current() != d_coarse_touching) {
             uint32_t* tmp = d_coarse_touching_buffer;
