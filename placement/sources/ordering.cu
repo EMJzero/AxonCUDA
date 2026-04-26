@@ -111,10 +111,11 @@ void compute_partitions_cutnet(
     * - for each surviving element create an event containing the tuple (hedge weight, partition id / 2), divide by 2 to get the parent partition's id
     *   - could put in the event the hedge's id, and recover the weight later, but little would changes
     *   - could sort immediately after filtering, but work with a larger buffer...
-    * - sort events by parent partition id, and do a segmented reduce within each parent id, that's each parent partition's cutnet cost
+    * - sort events by parent partition id, and do a segmented reduce within each parent id
+    *   => that yields each parent partition's weighted minority pin-cut across its bisection
     *
     * TODO: switch from the segmented sort to deduplicating part_pins in shared-memory for each hedge, and directly yielding the count of unique partitions per hedge
-    *       from the count and offsets (aka, flags) you then allocate the buffer and repeat the deduplication to write final cuts
+    *       from the count and offsets (aka, flags) you then allocate the buffer and repeat the deduplication to write final split costs
     */
 
     uint32_t* d_part_pins = nullptr; // part_pins[hedges_offsets[hedge idx] + pin idx] -> partition the pin is in
@@ -125,6 +126,9 @@ void compute_partitions_cutnet(
     thrust::device_ptr<const uint32_t> t_partitions(d_partitions);
     thrust::device_ptr<const dim_t> t_hedges_offsets(d_hedges_offsets);
     thrust::device_ptr<float> t_cutnet(d_cutnet);
+
+    // initialize every partition pair as "fully trapped"; pairs that generate events will overwrite their true split cost
+    thrust::fill(thrust_exec, t_cutnet, t_cutnet + num_parts / 2, 0.0f);
 
     // map pins to their partition -> map each entry part_pins[i] to partitions[t_part_pins[i]]
     thrust::gather(thrust_exec, t_part_pins, t_part_pins + hedges_size, t_partitions, t_part_pins);
@@ -222,6 +226,7 @@ void compute_partitions_cutnet(
         thrust::sort_by_key(thrust_exec, t_event_part, t_event_part + events_count, t_event_weight);
 
         // reduce-sum each segment of event_weight with the same event_part value and store the result in cutnet[t_event_part[.]]
+        // => although the buffer is still called "cutnet", it now stores weighted minority pin-cut
         uint32_t* d_unique_event_part = nullptr; // unique_event_part[idx] -> idx-th partition/2 that generated at least one cutnet event
         float* d_unique_event_weight = nullptr; // unique_event_weight[idx] -> reduced cutnet contribution for unique_event_part[idx]
         CUDA_CHECK(cudaMallocAsync(&d_unique_event_part, events_count * sizeof(uint32_t), stream));
@@ -240,8 +245,6 @@ void compute_partitions_cutnet(
         CUDA_CHECK(cudaFreeAsync(d_unique_event_weight, stream));
         CUDA_CHECK(cudaFreeAsync(d_event_weight, stream));
         CUDA_CHECK(cudaFreeAsync(d_event_part, stream));
-    } else {
-        thrust::fill(thrust_exec, t_cutnet, t_cutnet + num_parts / 2, FLT_MAX);
     }
 
     CUDA_CHECK(cudaFreeAsync(d_part_pins, stream));
@@ -328,8 +331,8 @@ uint32_t* locality_ordering(
 
     // IDEA:
     // - initialize this on each level from current partitions
-    // - after label prop, compute the new cutnet (=connectivity) for each pair of partitions
-    // - iff a partitions pair's cutnet improved, copy over here the new partition ids for the nodes of that pair of partitions
+    // - after label prop, compute the new split cost for each pair of partitions
+    // - iff a partitions pair's split cost improved, copy over here the new partition ids for the nodes of that pair of partitions
     // - before going to the next level, make this the actual partitioning
     uint32_t* d_last_best_partitions = nullptr; // last_best_partitions [node idx] -> last best partition (of bypartitions) the node was in
     CUDA_CHECK(cudaMallocAsync(&d_last_best_partitions, num_nodes * sizeof(uint32_t), stream));
@@ -355,14 +358,14 @@ uint32_t* locality_ordering(
         // initialize best partitions
         CUDA_CHECK(cudaMemcpyAsync(d_last_best_partitions, d_partitions, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
 
-        float* d_cutnet = nullptr; // cutnet [part idx / 2 | (part idx + 1) / 2] -> current cutnet for the pair of partitions
-        float* d_last_best_cutnet = nullptr; // last_best_cutnet [part idx / 2 | (part idx + 1) / 2] -> last best cutnet for that pair of partitions
+        float* d_cutnet = nullptr; // cutnet [part idx / 2 | (part idx + 1) / 2] -> current weighted minority pin-cut for the pair of partitions
+        float* d_last_best_cutnet = nullptr; // last_best_cutnet [part idx / 2 | (part idx + 1) / 2] -> last best split cost for that pair of partitions
         CUDA_CHECK(cudaMallocAsync(&d_cutnet, (num_parts / 2) * sizeof(float), stream));
         CUDA_CHECK(cudaMallocAsync(&d_last_best_cutnet, (num_parts / 2) * sizeof(float), stream));
         thrust::device_ptr<float> t_cutnet(d_cutnet);
         thrust::device_ptr<float> t_last_best_cutnet(d_last_best_cutnet);
 
-        // compute initial partitions cutnet
+        // compute initial partitions split cost
         compute_partitions_cutnet(
             cfg,
             d_hedges,
@@ -545,17 +548,45 @@ uint32_t* locality_ordering(
             // => repurpose d_even_event_idx as even_event_idx[idx] -> absolute idx of the last moves-pair to apply for partitions 2*idx and 2*idx+1
             auto event_score_pair = thrust::make_zip_iterator(thrust::make_tuple(t_even_event_score, thrust::counting_iterator<uint32_t>(0)));
             CUDA_CHECK(cudaMemsetAsync(d_even_event_idx, 0xFF, (num_parts / 2) * sizeof(uint32_t), stream));
+            uint32_t* d_argmax_event_part = nullptr;
+            uint32_t* d_argmax_event_idx = nullptr;
+            CUDA_CHECK(cudaMallocAsync(&d_argmax_event_part, (num_parts / 2) * sizeof(uint32_t), stream));
+            CUDA_CHECK(cudaMallocAsync(&d_argmax_event_idx, (num_parts / 2) * sizeof(uint32_t), stream));
+            thrust::device_ptr<uint32_t> t_argmax_event_part(d_argmax_event_part);
+            thrust::device_ptr<uint32_t> t_argmax_event_idx(d_argmax_event_idx);
             auto d_event_argmax = thrust::make_transform_output_iterator(
-                t_even_event_idx, // discard the "max" part of the "argmax" return tuple
+                t_argmax_event_idx, // discard the "max" part of the "argmax" return tuple
                 [] __device__ (auto x) { return (thrust::get<0>(x) <= 0.0f) ? UINT32_MAX : thrust::get<1>(x); }
             );
-            thrust::reduce_by_key(
-                thrust_exec,
-                t_even_event_part, t_even_event_part + even_events_count, event_score_pair,
-                thrust::make_discard_iterator(), d_event_argmax,
-                thrust::equal_to<uint32_t>{},
+            auto argmax_end = thrust::reduce_by_key(
+                thrust_exec, t_even_event_part, t_even_event_part + even_events_count, event_score_pair,
+                t_argmax_event_part, d_event_argmax, thrust::equal_to<uint32_t>{},
                 [] __device__ (auto a, auto b) { return (thrust::get<0>(b) > thrust::get<0>(a)) ? b : a; }
             );
+            const uint32_t argmax_count = thrust::get<0>(argmax_end) - t_argmax_event_part;
+            // reduce_by_key emits compact groups; scatter by partition id to build the apply_up_to map expected by the kernel.
+            thrust::scatter(thrust_exec, t_argmax_event_idx, t_argmax_event_idx + argmax_count, t_argmax_event_part, t_even_event_idx);
+            CUDA_CHECK(cudaFreeAsync(d_argmax_event_part, stream));
+            CUDA_CHECK(cudaFreeAsync(d_argmax_event_idx, stream));
+
+            // check if there are no moves left
+            const uint32_t improving_pairs = thrust::transform_reduce(
+                thrust_exec, t_even_event_idx, t_even_event_idx + num_parts / 2,
+                [] __device__ (uint32_t idx) { return (idx != UINT32_MAX) ? 1u : 0u; },
+                0u, thrust::plus<uint32_t>{}
+            );
+            if (improving_pairs == 0u) {
+                INFO(cfg) std::cout TID(tid) << "Stopping label propagation on level " << level_idx << " repeat " << lp_repeat << " with no strictly improving balanced prefix left\n";
+                CUDA_CHECK(cudaFreeAsync(d_even_event_part, stream));
+                CUDA_CHECK(cudaFreeAsync(d_even_event_score, stream));
+                CUDA_CHECK(cudaFreeAsync(d_even_event_node, stream));
+                CUDA_CHECK(cudaFreeAsync(d_odd_event_part, stream));
+                CUDA_CHECK(cudaFreeAsync(d_odd_event_score, stream));
+                CUDA_CHECK(cudaFreeAsync(d_odd_event_node, stream));
+                CUDA_CHECK(cudaFreeAsync(d_part_even_event_offsets, stream));
+                CUDA_CHECK(cudaFreeAsync(d_part_odd_event_offsets, stream));
+                break;
+            }
 
             // apply pairs of improving moves
             // add together the gain of equi-ranked moves between bisected partitions as the gain of the pair to swap
@@ -580,7 +611,7 @@ uint32_t* locality_ordering(
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }
 
-            // compute the new partitions cutnet
+            // compute the new partitions split cost
             compute_partitions_cutnet(
                 cfg,
                 d_hedges,
@@ -615,7 +646,7 @@ uint32_t* locality_ordering(
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }
 
-            // update the best cutnets per partitions pair found so far at this level
+            // update the best split costs per partitions pair found so far at this level
             thrust::transform(
                 thrust_exec, t_last_best_cutnet, t_last_best_cutnet + num_parts / 2,
                 t_cutnet, t_last_best_cutnet, thrust::minimum<float>{}
@@ -672,7 +703,7 @@ uint32_t* locality_ordering(
     thrust::sort_by_key(thrust_exec, t_ord_part, t_ord_part + num_nodes, t_order); // this also sorts copy(d_partitions) into d_ord_part
 
     // fuse back partitions while internally reversing them as needed to "trap" strong connections locally inside partition pairs
-    while (num_parts > 1) { // go back up the bisection tree
+    while (num_parts > 2) { // go back up the bisection tree
         INFO(cfg) std::cout TID(tid) << "Tree reorientation level " << level_idx << " number of partitions=" << num_parts << "\n";
         level_idx--;
         

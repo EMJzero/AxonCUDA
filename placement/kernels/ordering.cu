@@ -28,9 +28,9 @@ void split_partitions_kernel(
 }
 
 
-// CUTNET EVALUATION
+// SPLIT-COST EVALUATION
 
-// extract into events the even partition-mapped pins of an hedge that are followed (after sorting) by their sibling partition
+// extract into events the even partition-mapped pin-runs of a hedge whose sibling partition is also present
 // SEQUENTIAL COMPLEXITY: e*d
 // PARALLEL OVER: e
 // SHUFFLES OVER: d
@@ -53,17 +53,19 @@ void flag_cutnet_events_kernel(
     dim_t my_offset = my_hedge_offset + lane_id;
 
     // each thread in the warp reads one every WARP_SIZE pins
-    // => always ignore the last pin, since it has no successor
-    for (; my_offset + 1u < not_my_hedge_offset; my_offset += WARP_SIZE) {
+    for (; my_offset < not_my_hedge_offset; my_offset += WARP_SIZE) {
         const uint32_t part_pin = part_pins[my_offset];
         if ((part_pin & 1u) == 1) continue; // odd partition
-        const uint32_t next_part_pin = part_pins[my_offset + 1];
-        if (next_part_pin != part_pin + 1) continue; // no cut, the pin's sibling partition doesn't appear in this hedge
+        if (my_offset > my_hedge_offset && part_pins[my_offset - 1] == part_pin) continue; // not the start of the run
+
+        dim_t run_end = my_offset + 1u;
+        while (run_end < not_my_hedge_offset && part_pins[run_end] == part_pin) run_end++;
+        if (run_end >= not_my_hedge_offset || part_pins[run_end] != part_pin + 1u) continue; // sibling partition absent
         flags[my_offset] = 1u;
     }
 }
 
-// extract into events the even partition-mapped pins of an hedge that are followed (after sorting) by their sibling partition
+// emit one event per sibling partition-pair touched by a hedge, weighted by the hedge's minority pin-count across the split
 // SEQUENTIAL COMPLEXITY: e*d
 // PARALLEL OVER: e
 // SHUFFLES OVER: d
@@ -90,20 +92,40 @@ void cutnet_event_generation_kernel(
     const float my_weight = hedge_weights[warp_id];
 
     // each thread in the warp reads one every WARP_SIZE pins
-    // => always ignore the last pin, since it has no successor
-    for (; my_offset + 1u < not_my_hedge_offset; my_offset += WARP_SIZE) {
+    for (; my_offset < not_my_hedge_offset; my_offset += WARP_SIZE) {
         const uint32_t part_pin = part_pins[my_offset];
         if ((part_pin & 1u) == 1) continue; // odd partition
-        const uint32_t next_part_pin = part_pins[my_offset + 1];
-        if (next_part_pin != part_pin + 1) continue; // no cut, the pin's sibling partition doesn't appear in this hedge
+        if (my_offset > my_hedge_offset && part_pins[my_offset - 1] == part_pin) continue; // not the start of the run
+
+        dim_t even_run_end = my_offset + 1u;
+        while (even_run_end < not_my_hedge_offset && part_pins[even_run_end] == part_pin) even_run_end++;
+        if (even_run_end >= not_my_hedge_offset || part_pins[even_run_end] != part_pin + 1u) continue; // sibling partition absent
+
+        dim_t odd_run_end = even_run_end + 1u;
+        while (odd_run_end < not_my_hedge_offset && part_pins[odd_run_end] == part_pin + 1u) odd_run_end++;
+
         const dim_t event_offset = flags[my_offset];
-        event_weight[event_offset] = my_weight;
+        const dim_t even_count = even_run_end - my_offset;
+        const dim_t odd_count = odd_run_end - even_run_end;
+        event_weight[event_offset] = my_weight * static_cast<float>(min(even_count, odd_count));
         event_part[event_offset] = part_pin / 2;
     }
 }
 
 
 // LABEL PROPAGATION
+
+// gain calculation helper
+__forceinline__ __device__
+float sibling_move_gain(
+    const uint32_t my_count,
+    const uint32_t other_count,
+    const float hedge_weight
+) {
+    const uint32_t curr_cost = min(my_count, other_count);
+    const uint32_t moved_cost = min(my_count - 1u, other_count + 1u);
+    return hedge_weight * static_cast<float>(static_cast<int32_t>(curr_cost) - static_cast<int32_t>(moved_cost));
+}
 
 // find in which partition (between a pair that was just bisected) each node wants to stay in
 // SEQUENTIAL COMPLEXITY: n*h*d
@@ -128,23 +150,20 @@ void label_propagation_kernel(
     // global across blocks - coincides with the node to handle
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
     if (warp_id >= num_nodes) return;
-    
+
     /*
     * Idea:
     * - one node per warp
-    * - each node visits the pins of each of its touching hedge
-    * - for every pin, if it is in the same partition "p" as the node, the hedge's weight goes in favor of staying in "p"
-    * - if it is in partition "p+1", the weight goes in favor of moving to "p+1"
-    * - the higher-total-weight partition is proposed
+    * - each node visits the pins of each touching hedge and counts how many sibling-pair pins lie on its current side vs the other
+    * - the score is the exact improvement in weighted minority pin-cut if the node moves
     */
-    
+
     const uint32_t my_partition = partitions[warp_id];
     const uint32_t other_partition = (my_partition & 1u) == 0 ? my_partition + 1 : my_partition - 1;
-    
+
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
-    float curr_p_score = 0.0f;
-    float other_p_score = 0.0f;
+    float gain = 0.0f;
 
     // scan touching hyperedges
     for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
@@ -153,21 +172,26 @@ void label_propagation_kernel(
         my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
         const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
         const float my_hedge_weight = hedge_weights[actual_hedge_idx];
+        uint32_t my_part_pins = (lane_id == 0); // include yourself before the move
+        uint32_t other_part_pins = 0u;
         for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
             const uint32_t pin = *my_hedge;
             if (pin == warp_id) continue;
             if (partitions[pin] == my_partition) // the pin is on my same side
-                curr_p_score += my_hedge_weight;
+                my_part_pins++;
             else if (partitions[pin] == other_partition) // the pin is on the other side of the bisection
-                other_p_score += my_hedge_weight;
+                other_part_pins++;
+        }
+
+        my_part_pins = warpReduceSumLN0<uint32_t>(my_part_pins);
+        other_part_pins = warpReduceSumLN0<uint32_t>(other_part_pins);
+        if (lane_id == 0) {
+            gain += sibling_move_gain(my_part_pins, other_part_pins, my_hedge_weight);
         }
     }
 
-    curr_p_score = warpReduceSumLN0<float>(curr_p_score);
-    other_p_score = warpReduceSumLN0<float>(other_p_score);
-
     if (lane_id == 0) {
-        if (curr_p_score >= other_p_score) {
+        if (gain <= 0.0f) {
             moves[warp_id] = false;
             even_event_idx[warp_id] = 0u;
             odd_event_idx[warp_id] = 0u;
@@ -176,7 +200,7 @@ void label_propagation_kernel(
             moves[warp_id] = true;
             even_event_idx[warp_id] = (my_partition & 1u) == 0;
             odd_event_idx[warp_id] = (my_partition & 1u);
-            scores[warp_id] = other_p_score - curr_p_score;
+            scores[warp_id] = gain;
         }
     }
 }
@@ -253,7 +277,7 @@ void label_cascade_kernel(
     * - same as label_propagation_kernel, but check first if your neighbor will change partition before you (in-sequence)
     * - moreover, now we need to shuffle between the two lists of even/odd events and their relative ranks
     */
-    
+
     const bool even = warp_id < even_events_count;
     uint32_t event_id;
     // |
@@ -299,8 +323,7 @@ void label_cascade_kernel(
 
     const uint32_t* my_touching = touching + touching_offsets[my_node];
     const uint32_t* not_my_touching = touching + touching_offsets[my_node + 1];
-    float curr_p_score = 0.0f;
-    float other_p_score = 0.0f;
+    float gain = 0.0f;
 
     // scan touching hyperedges
     for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
@@ -309,30 +332,35 @@ void label_cascade_kernel(
         my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
         const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
         const float my_hedge_weight = hedge_weights[actual_hedge_idx];
+        uint32_t my_part_pins = (lane_id == 0); // include yourself before your own move in the sequence
+        uint32_t other_part_pins = 0u;
         for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
             const uint32_t pin = *my_hedge;
             if (pin == my_node) continue;
             if (partitions[pin] == my_partition) {
                 if (my_ranks[pin] == UINT32_MAX || my_ranks[pin] > event_id) // the pin is on my same side and didn't move before me
-                    curr_p_score += my_hedge_weight;
+                    my_part_pins++;
                 else // the pin was on my same side, but move before me
-                    other_p_score += my_hedge_weight;
+                    other_part_pins++;
             } else if (partitions[pin] == other_partition) {
                 if (other_ranks[pin] == UINT32_MAX || other_ranks[pin] - other_part_events_offset > my_part_event_rank) // the pin is on the other side of the bisection and didn't move before me
-                    other_p_score += my_hedge_weight;
+                    other_part_pins++;
                 else // the pin was on the other side of the bisection, but move before me (or -with- me)
-                    curr_p_score += my_hedge_weight;
+                    my_part_pins++;
             }
         }
-    }
 
-    curr_p_score = warpReduceSumLN0<float>(curr_p_score);
-    other_p_score = warpReduceSumLN0<float>(other_p_score);
+        my_part_pins = warpReduceSumLN0<uint32_t>(my_part_pins);
+        other_part_pins = warpReduceSumLN0<uint32_t>(other_part_pins);
+        if (lane_id == 0) {
+            gain += sibling_move_gain(my_part_pins, other_part_pins, my_hedge_weight);
+        }
+    }
 
     if (lane_id == 0) {
         // accumulate everything in the even partition's score
         const uint32_t idx = even ? event_id : part_even_event_offsets[my_partition >> 1] + my_part_event_rank;
-        atomicAdd(&even_event_score[idx], other_p_score - curr_p_score);
+        atomicAdd(&even_event_score[idx], gain);
     }
 }
 
@@ -371,7 +399,7 @@ void apply_move_events_kernel(
     partitions[other_node] = (my_part_half << 1);
 }
 
-// for every node, if its current partition improved in cutnet w.r.t. the best so far, overwrite its best partition with the current one
+// for every node, if its current partition improved in split cost w.r.t. the best so far, overwrite its best partition with the current one
 __global__
 void update_best_partitions_kernel(
     const uint32_t* __restrict__ partitions,
@@ -391,7 +419,7 @@ void update_best_partitions_kernel(
     float my_cutnet = cutnet[parent_part];
     float my_last_best_cutnet = last_best_cutnet[parent_part];
 
-    // if your partition pair's cutnet improved, update your last best partition
+    // if your partition pair's split cost improved, update your last best partition
     if (my_last_best_cutnet > my_cutnet)
         last_best_partitions[tid] = part;
 }

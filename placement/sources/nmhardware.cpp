@@ -22,7 +22,7 @@ namespace hwmodel {
                 inbound_edges.insert(current_inbound.begin(), current_inbound.end());
                 ++current_partition;
                 if (current_partition >= K) {
-                    throw std::runtime_error("Exceeded maximum number of partitions K.");
+                    throw std::runtime_error("Exceeded maximum number of partitions K = " + std::to_string(K) + ".");
                 }
             }
 
@@ -75,7 +75,7 @@ namespace hwmodel {
 
     bool HardwareModel::checkPartitionValidity(const HyperGraph& snn, const std::vector<uint32_t>& partitions, bool verbose) const {
         if (partitions.size() != snn.nodes())
-            throw std::runtime_error("Each neuron must be assigned to a partition.");
+            throw std::runtime_error("Each neuron must be assigned to a partition (" + std::to_string(snn.nodes()) + " neuron != " + std::to_string(partitions.size()) + " part).");
 
         // count neurons per partition and distinct partitions
         std::unordered_map<uint32_t, uint32_t> partitions_counter;
@@ -134,7 +134,7 @@ namespace hwmodel {
 
     bool HardwareModel::checkPlacementValidity(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement, bool verbose) const {
         if (placement.size() != part_snn.nodes())
-            throw std::runtime_error("Each partition must be assigned to a core.");
+            throw std::runtime_error("Each partition must be assigned to a core (" + std::to_string(part_snn.nodes()) + " part != " + std::to_string(placement.size()) + " plac).");
 
         std::unordered_set<hwgeom::Coord2D, hwgeom::Coord2DHash> seen_cores;
         seen_cores.reserve(placement.size());

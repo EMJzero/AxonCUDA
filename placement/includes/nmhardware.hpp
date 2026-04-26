@@ -193,6 +193,14 @@ namespace hwgeom {
         return out;
     }
 
+    /*
+    * Binary format:
+    * [std::size_t count][count * Coord2D raw bytes]
+    *
+    * Details:
+    * - count = number of coordinate entries in the file
+    * - followed by a contiguous dump of 'count' Coord2D data
+    */
     inline void coords_to_file(const std::vector<Coord2D>& v, const std::string& path) {
         std::ofstream out(path, std::ios::binary);
         if (!out) throw std::runtime_error("Failed to save coordinates, cannot open file.");

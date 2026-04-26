@@ -808,3 +808,48 @@ Compute cutnet IDEA:
   - could put in the event the hedge's id, and recover the weight later, but little would changes
   - could sort immediately after filtering, but work with a larger buffer...
 - sort events by parent partition id, and do a segmented reduce within each parent id, that's each parent partition's cutnet cost
+
+----
+
+Found the failure - or better, uselessness - mode of the tree-based ordering once going to 2D placement:
+
+My tree-ordering optimizer is not really producing "a good sequence."
+It is producing a **binary separator hierarchy**.
+Hilbert/Moore/Z-order preserve locality of contiguous intervals reasonably well, but they do not preserve the semantics of "this subtree is the left side of a cut, that subtree is the right side of the same cut."
+A 2D recursive partition should be represented as a binary space partition / slicing tree, where each internal node is explicitly a horizontal or vertical cut and each leaf is a rectangle.
+That is exactly the structure used by k-d trees and slicing floorplans.
+
+Or well, in other terms (thanks GPT):
+
+"""
+Ok, say then that my sequence has this structure, a consequence of the tree optimization:
+- every pair 4*i+1 and 4*i+2 has a mildly connection between them 
+- every pair of groups (8*i+2, 8*i+3) and (8*i+4, 8*i+5) has a bit stronger connection between them
+- every pair of groups (16*i+4 ... 16*i+7) and (16*i+8 ... 16*i+11) has a stronger connection between them
+- and so on ...
+Could there be a way to exploit this to map effectively the sequence from 1D to 2D?
+
+What if the property became circular, as in:
+- every pair 4*i+1 and 4*i+2 has a mildly connection between them, and so does every pair 4*i and 4*i+3
+- every pair of groups (8*i+2, 8*i+3) and (8*i+4, 8*i+5) has a bit stronger connection between them, and so does every pair (8*i, 8*i+1) and (8*i+6, 8*i+7)
+- every pair of groups (16*i+4 ... 16*i+7) and (16*i+8 ... 16*i+11) has a stronger connection between them, and so does every pair (16*i ... 16*i+3) and (16*i+12 ... 16*i+15)
+- and so on ...
+Could this help in the 2D layout efforth?
+"""
+
+The main idea is this:
+- your sequence is not "just a sequence";
+- it carries a **dyadic hierarchy**;
+- so the right 2D map should read the bits of the index as tree decisions, not treat the index as a scalar to be sent through an off-the-shelf curve.
+
+That is exactly the kind of hierarchy that Morton/Z-order encodes: bit prefixes correspond to recursive quadtree cells.
+In Z-order, 2D coordinates are built by bit interleaving, and the order is equivalent to a depth-first traversal of a quadtree.
+
+=> you have a nested "middle seam" structure!
+
+Your first pattern says, roughly:
+- at one scale, the interesting interaction is between the two middle elements of each block of 4;
+- at the next scale, between the two middle groups of each block of 8;
+- then again for 16, 32, ...
+That means the strong relation is not "adjacent in the linear order" in the usual sense.
+It is "adjacent across the recursive split seam".

@@ -59,7 +59,6 @@ std::tuple<uint32_t*, dim_t*> buildTouching(
 ) {
     // HP: hedges already internally deduplicated (acyclic), keeping the dst whenever a duplicate is between srcs and dsts
     uint32_t *d_touching = nullptr;
-    uint32_t *d_touching_buffer = nullptr;
     dim_t *d_touching_offsets = nullptr;
 
     CUDA_CHECK(cudaMalloc(&d_touching_offsets, (num_nodes + 1) * sizeof(dim_t)));
@@ -88,10 +87,10 @@ std::tuple<uint32_t*, dim_t*> buildTouching(
     dim_t touching_size = 0; // last value in the inclusive scan = full reduce = total number of touching hedges among all sets
     CUDA_CHECK(cudaMemcpy(&touching_size, d_touching_offsets + num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMalloc(&d_touching, touching_size * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_touching_buffer, touching_size * sizeof(uint32_t)));
     
     uint32_t *d_inserted_count = nullptr;
     CUDA_CHECK(cudaMalloc(&d_inserted_count, num_nodes * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(d_inserted_count, 0x00, num_nodes * sizeof(uint32_t)));
     {
         // launch configuration - touching build kernel
         int threads_per_block = 128; // 128/32 -> 4 warps per block

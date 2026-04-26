@@ -213,11 +213,13 @@ int main(int argc, char** argv) {
     // generate a 1D to 2D map for lattice points
     std::vector<coords> h_1dto2d_placement;
     if (cfg.space_filling_curve == SpaceFillingCurve::HILB)
-        h_1dto2d_placement = hilbertPlacement(num_nodes, h_max_width, h_max_height);
+        h_1dto2d_placement = hilbertPlacement(num_nodes, h_max_width, h_max_height, cfg.verbose_info);
     else if (cfg.space_filling_curve == SpaceFillingCurve::SNAK)
-        h_1dto2d_placement = snakePlacement(num_nodes, h_max_width, h_max_height);
+        h_1dto2d_placement = snakePlacement(num_nodes, h_max_width, h_max_height, true, cfg.verbose_info);
     else if (cfg.space_filling_curve == SpaceFillingCurve::ZORD)
-        h_1dto2d_placement = zorderPlacement(num_nodes, h_max_width, h_max_height);
+        h_1dto2d_placement = zorderPlacement(num_nodes, h_max_width, h_max_height, cfg.verbose_info);
+    else if (cfg.space_filling_curve == SpaceFillingCurve::QUAD)
+        h_1dto2d_placement = quadPlacement(num_nodes, h_max_width, h_max_height, cfg.verbose_info);
     CUDA_CHECK(cudaMemcpy(d_1dto2d_placement, h_1dto2d_placement.data(), num_nodes * sizeof(coords), cudaMemcpyHostToDevice));
     thrust::device_ptr<const coords> t_1dto2d_placement(d_1dto2d_placement);
 
@@ -315,10 +317,10 @@ int main(int argc, char** argv) {
             );
         }
 
-        // assign (scatter) to the nodes their respective placement following both 1D orders (from ordered nodes through the lattice points map)
+        // assign to each node its respective placement following both 1D orders (from ordered nodes to the lattice points map)
         thrust::device_ptr<coords> t_placement(d_placement);
         thrust::device_ptr<uint32_t> t_order_idx(d_order_idx);
-        thrust::scatter(thrust_exec, t_1dto2d_placement, t_1dto2d_placement + num_nodes, t_order_idx, t_placement);
+        thrust::gather(thrust_exec, t_order_idx, t_order_idx + num_nodes, t_1dto2d_placement, t_placement);
         CUDA_CHECK(cudaFreeAsync(d_order_idx, stream));
         
         // =============================

@@ -136,7 +136,7 @@ namespace hgraph {
             verbose_(verbose)
         {
             if (hedges.size() != weights.size())
-                throw std::runtime_error("Number of hyperedges != number of weights");
+                throw std::runtime_error("Number of hyperedges (" + std::to_string(hedges.size()) + ") != number of weights (" + std::to_string(weights.size()) + ")");
 
             // compute total nodes needed
             size_t total_pins = 0;
@@ -241,7 +241,7 @@ namespace hgraph {
 
         // => lambda - 1 metric (computed for a given permutation)
         float connectivityFromPart(const std::vector<uint32_t>& part) const {
-            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch");
+            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch (" + std::to_string(part.size()) + " != " + std::to_string(node_count_) + ")");
             float total = 0.0f;
             for (auto& he : hedges_) {
                 std::set<uint32_t> parts;
@@ -254,7 +254,7 @@ namespace hgraph {
 
         // => cut-net metric (computed for a given permutation)
         float cutnetFromPart(const std::vector<uint32_t>& part) const {
-            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch");
+            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch (" + std::to_string(part.size()) + " != " + std::to_string(node_count_) + ")");
             float total = 0.0f;
             for (auto& he : hedges_) {
                 std::set<uint32_t> parts;
@@ -268,7 +268,7 @@ namespace hgraph {
 
         // => sum of external degrees (computed from a given permutation)
         float soedFromPart(const std::vector<uint32_t>& part) const {
-            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch");
+            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch (" + std::to_string(part.size()) + " != " + std::to_string(node_count_) + ")");
             float total = 0.0f;
             for (auto& he : hedges_) {
                 std::set<uint32_t> parts;
@@ -284,7 +284,7 @@ namespace hgraph {
         // 1 : remove the source of the cycle
         // 2 : remove the destination of the cycle
         HyperGraph getPartitionsHypergraph(const std::vector<uint32_t>& part, uint8_t remove_self_cycles, bool squish_hyperedges) const {
-            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch");
+            if (part.size() != node_count_) throw std::runtime_error("Partition size mismatch (" + std::to_string(part.size()) + " != " + std::to_string(node_count_) + ")");
 
             uint32_t new_nodes = 0;
             for (uint32_t p : part) new_nodes = std::max(new_nodes, p + 1);
@@ -388,12 +388,12 @@ namespace hgraph {
                 auto& he = hedges_[idx];
 
                 for (uint32_t src : he.sources()) {
-                    if (src >= node_count_) throw std::runtime_error("Invalid source node");
+                    if (src >= node_count_) throw std::runtime_error("Invalid source node (" + std::to_string(src) + " src >= " + std::to_string(node_count_) + ")");
                     outbound_[src].insert(idx);
                 }
 
                 for (uint32_t dst : he.destinations()) {
-                    if (dst >= node_count_) throw std::runtime_error("Invalid destination node");
+                    if (dst >= node_count_) throw std::runtime_error("Invalid destination node (" + std::to_string(dst) + " dst >= " + std::to_string(node_count_) + ")");
                     inbound_[dst].insert(idx);
                 }
             }
@@ -487,7 +487,7 @@ namespace hgraph {
 
         // renames nodes according to a new id give for each of them
         HyperGraph renameNodes(std::vector<uint32_t> new_id) const {
-            if (new_id.size() != node_count_) throw std::runtime_error("The number of new ids did not match the number of existing nodes");
+            if (new_id.size() != node_count_) throw std::runtime_error("The number of new ids did not match the number of existing nodes (" + std::to_string(new_id.size()) + " ids != " + std::to_string(node_count_) + ")");
 
             std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> new_hedges;
             std::vector<float> new_weights;
@@ -656,7 +656,7 @@ namespace hgraph {
             if (!neighborhoods_built_)
                 throw std::runtime_error("Call to getNeighborhood(Node n). Neighborhoods not built. Call buildNeighborhoods() first.");
             if (n >= node_count_)
-                throw std::runtime_error("Invalid node");
+                throw std::runtime_error("Invalid node (" + std::to_string(n) + " node >= " + std::to_string(node_count_) + ")");
 
             uint32_t begin = neighborhood_offsets_[n];
             uint32_t end   = neighborhood_offsets_[n + 1];

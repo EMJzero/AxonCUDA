@@ -36,7 +36,7 @@ namespace constraints {
                 inbound_edges.insert(current_inbound.begin(), current_inbound.end());
                 ++current_partition;
                 if (current_partition >= K) {
-                    throw std::runtime_error("Exceeded maximum number of partitions K.");
+                    throw std::runtime_error("Exceeded maximum number of partitions K = " + std::to_string(K) + ".");
                 }
             }
 
@@ -89,7 +89,7 @@ namespace constraints {
 
     bool Constraints::checkPartitionValidity(const hgraph::HyperGraph& snn, const std::vector<uint32_t>& partitions, bool verbose) const {
         if (partitions.size() != snn.nodes())
-            throw std::runtime_error("Each node must be assigned to a partition.");
+            throw std::runtime_error("Each node must be assigned to a partition (" + std::to_string(snn.nodes()) + " node != " + std::to_string(partitions.size()) + " part).");
 
         // count nodes per partition and distinct partitions
         std::unordered_map<uint32_t, uint32_t> partitions_counter;

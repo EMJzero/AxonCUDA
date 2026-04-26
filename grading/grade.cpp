@@ -44,6 +44,7 @@ void printHelp() {
         "  -m-prt <> <> <> Partitioning constraints set to use, in order: max part. size, max part. distinct inbound hedges, max num. of part.s (overrides '-c-prt')\n"
         "  -k-prt <k> <ε>  K-way balanced constraints set to use (overrides '-c-prt' and '-m-prt')\n"
         "  -c-plc <name>   Placement constraints set to use (valid ones: truenorth, loihi, loihi64, loihi84, loihi1024)\n"
+        "  -ff         Reorder the partitioned hypergraph's nodes with the greedy feedforward algorithm (use if '-ff' was used for placement)\n"
         "  -h          Show this help\n";
 }
 
@@ -172,6 +173,7 @@ int main(int argc, char** argv) {
     float epsi = 0.0f;
     // |
     std::string plac_constraints_name;
+    bool feedforward_order = false;
 
     // CLI handling
     for (int i = 1; i < argc; ++i) {
@@ -208,6 +210,8 @@ int main(int argc, char** argv) {
         } else if (arg == "-c-plc") {
             if (i + 1 >= argc) { std::cerr << "Error: -c-plc requires a config name\n"; std::exit(1); }
             plac_constraints_name = argv[++i];
+        }  else if (arg == "-ff") {
+            feedforward_order = true;
         } else { std::cerr << "Unknown option: " << arg << "\n"; std::exit(1); }
     }
 
@@ -323,8 +327,19 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        HyperGraph& placement_hg = partitioned_hg.has_value() ? *partitioned_hg : hg;
+
+        if (feedforward_order) {
+            placement_hg.buildIncidenceSets();
+            std::vector<uint32_t> nodes_order_idx = placement_hg.feedForwardOrder();
+            std::vector<Coord2D> placement_ord(placement_hg.nodes());
+            for (uint32_t i = 0; i < placement_ord.size(); i++) {
+                placement_ord[i] = placement[nodes_order_idx[i]];
+            }
+            placement = placement_ord;
+        }
+        
         // apply and grade placement
-        const HyperGraph& placement_hg = partitioned_hg.has_value() ? *partitioned_hg : hg;
         if (plac_constr->checkPlacementValidity(placement_hg, placement, true)) {
             auto metrics = plac_constr->getAllMetrics(placement_hg, placement);
             std::cout << "Placement metrics:\n";

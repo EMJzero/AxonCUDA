@@ -17,8 +17,8 @@ SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
 DATA_DIR="$(cd -P "$SCRIPT_DIR/part_snns" && pwd)"
 TARGET_BIN="$(cd -P "$SCRIPT_DIR/.." && pwd)/hplace_gpu.exe"
-TARGET_ARGS=(-lpr 16 -fdi 32 -dtc -v 0 -mso 64 -thr 1) # can be later overriden per-run
-RESULTS_DIR="$DATA_DIR/results_lpr16_fdi32_mso64"
+TARGET_ARGS=(-lpr 16 -fdi 256 -dtc -v 0 -mso 64 -thr 1 -sfc hilb) # can be later overriden per-run
+RESULTS_DIR="$DATA_DIR/results_lpr16_fdi256_mso64"
 
 PROFILING=0
 NSIGHT=0

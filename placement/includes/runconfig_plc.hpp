@@ -22,13 +22,15 @@ namespace config_plc {
     enum class SpaceFillingCurve {
         HILB, // Hilbert curve
         SNAK, // S-like snake curve
-        ZORD // Z-order curve
+        ZORD, // Z-order curve
+        QUAD // quadtree-style layout
     };
 
     static constexpr std::pair<SpaceFillingCurve, const char*> SPACE_FILLING_CURVE_NAMES[] = {
         { SpaceFillingCurve::HILB, "hilb" },
         { SpaceFillingCurve::SNAK, "snak" },
-        { SpaceFillingCurve::ZORD, "zord" }
+        { SpaceFillingCurve::ZORD, "zord" },
+        { SpaceFillingCurve::QUAD, "quad" }
     };
 
     struct runconfig {
