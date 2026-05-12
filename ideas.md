@@ -853,3 +853,11 @@ Your first pattern says, roughly:
 - then again for 16, 32, ...
 That means the strong relation is not "adjacent in the linear order" in the usual sense.
 It is "adjacent across the recursive split seam".
+
+----
+
+Big neighbors iterations upgrade idea:
+- the block dispatches hedges to warps to handle
+- the block as a whole picks up a few nodes, and goes over their incidence sets
+- for each hedge, it checks how long it is, and gives it to a warp to handle
+- if a warp was given an hedge with <32 pins, anotherone can be given to it at the same time

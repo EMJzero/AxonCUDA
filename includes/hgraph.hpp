@@ -659,7 +659,7 @@ namespace hgraph {
                 throw std::runtime_error("Invalid node (" + std::to_string(n) + " node >= " + std::to_string(node_count_) + ")");
 
             uint32_t begin = neighborhood_offsets_[n];
-            uint32_t end   = neighborhood_offsets_[n + 1];
+            uint32_t end = neighborhood_offsets_[n + 1];
             return { neighborhoods_.data() + begin, static_cast<size_t>(end - begin) };
         }
 

@@ -44,7 +44,7 @@ namespace config_plc {
             "  -ff         Replaces the 1D ordering heuristic with host-side sequential feedforward ordering\n"
             "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
             "  -seed <num> Set the algorithm's seed to <num> (default: " << SEED << ") (ignored when '-ff' is passed)\n"
-            "  -v <lvl>    Set the verbosity level: 0 metrics only, 1 steps and phases, 2 kernel launches, 3  \n"
+            "  -v <lvl>    Set the verbosity level: 0 results only, 1 steps and phases, 2 kernel launches, 3 algorithm outputs, 4 debug \n"
             "  -h          Show this help\n";
     }
 
@@ -66,6 +66,7 @@ namespace config_plc {
         bool verbose_info = VERBOSE_INFO;
         bool verbose_errs_and_warns = VERBOSE_ERRS;
         bool verbose_kernel_launches = VERBOSE_LAUNCHES;
+        bool debug = DEBUG_ON;
 
         // CLI handling
         for (int i = 1; i < argc; ++i) {
@@ -110,14 +111,15 @@ namespace config_plc {
                 if (i + 1 >= argc) { std::cerr << "Error: -seed requires a positive integer value\n"; std::exit(1); }
                 seed = std::stoull(argv[++i]);
             } else if (arg == "-v") {
-                if (i + 1 >= argc) { std::cerr << "Error: -v requires a positive value between 0 and 3\n"; std::exit(1); }
+                if (i + 1 >= argc) { std::cerr << "Error: -v requires a positive value between 0 and 4\n"; std::exit(1); }
                 int verbosity = std::stoul(argv[++i]);
-                if (verbosity < 0 || verbosity > 3) { std::cerr << "Error: -v must be between 0 and 3 (extremes included) \n"; std::exit(1); }
+                if (verbosity < 0 || verbosity > 4) { std::cerr << "Error: -v must be between 0 and 4 (extremes included) \n"; std::exit(1); }
                 verbose_logs = verbosity > 2;
                 verbose_info = verbosity > 0;
                 verbose_errs_and_warns = verbosity > 0;
                 verbose_kernel_launches = verbosity > 1;
-                if (verbose_logs) std::cerr << "WARNING, verbosity 3 can hinder performance, especially on the host side !!\n";
+                debug = verbosity > 3;
+                if (verbosity > 2) std::cerr << "WARNING: verbosity 3 and 4 can hinder performance, especially on the host side !!\n";
             } else { std::cerr << "Unknown option: " << arg << "\n"; std::exit(1); }
         }
 
@@ -137,7 +139,8 @@ namespace config_plc {
             verbose_logs,
             verbose_info,
             verbose_errs_and_warns,
-            verbose_kernel_launches
+            verbose_kernel_launches,
+            debug
         };
     }
 

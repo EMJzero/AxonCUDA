@@ -78,8 +78,8 @@ std::tuple<uint32_t*, dim_t*> buildTouching(
             num_hedges,
             d_touching_offsets
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     }
     
     thrust::device_ptr<dim_t> t_touching_offsets(d_touching_offsets);
@@ -107,8 +107,8 @@ std::tuple<uint32_t*, dim_t*> buildTouching(
             d_touching,
             d_inserted_count
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     }
     CUDA_CHECK(cudaFree(d_inserted_count));
 

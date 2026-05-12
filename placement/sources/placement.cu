@@ -90,8 +90,8 @@ void forceDirectedRefinement(
                 num_nodes,
                 d_forces
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         // =============================
@@ -121,8 +121,8 @@ void forceDirectedRefinement(
                 d_pairs,
                 d_scores
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         // =============================
@@ -173,8 +173,8 @@ void forceDirectedRefinement(
                 (void*)&d_swap_flags
             };
             cudaLaunchCooperativeKernel((void*)exclusive_swaps_kernel, blocks, threads_per_block, kernel_args, shared_bytes, stream);
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         // =============================
@@ -192,7 +192,7 @@ void forceDirectedRefinement(
         thrust::exclusive_scan(thrust_exec, t_swap_flags, t_swap_flags + (num_nodes + 1), t_swap_flags);
         uint32_t num_events;
         CUDA_CHECK(cudaMemcpyAsync(&num_events, d_swap_flags + num_nodes, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         INFO(cfg) std::cout TID(tid) << "Number of events produced: " << num_events << " ...\n";
         if (num_events > (num_nodes + 1) / 2)
             ERR(cfg) std::cerr TID(tid) << "WARNING, there are more events (" << num_events << ") than half the node (" << (num_nodes + 1) / 2 << "), this >may< an undesirable situation ...\n";
@@ -226,8 +226,8 @@ void forceDirectedRefinement(
                 d_ev_swaps,
                 d_ev_scores
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         // sort (ascending) events by score while carrying swapped nodes along
@@ -258,8 +258,8 @@ void forceDirectedRefinement(
                 num_events,
                 d_nodes_rank
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         {
@@ -282,8 +282,8 @@ void forceDirectedRefinement(
                 num_events,
                 d_ev_scores
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         // =============================
@@ -305,7 +305,7 @@ void forceDirectedRefinement(
         const uint32_t num_good_swaps = best_ev + 1;
         float gain;
         CUDA_CHECK(cudaMemcpyAsync(&gain, d_ev_scores + best_ev, sizeof(float), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // stop if the sequence has length 0 or the gain is too low
         if (num_good_swaps == 0 || gain < 0.001f) {
@@ -332,8 +332,8 @@ void forceDirectedRefinement(
                 d_placement,
                 d_inv_placement
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
     }
 
@@ -345,7 +345,7 @@ void forceDirectedRefinement(
     CUDA_CHECK(cudaFreeAsync(d_ev_swaps, stream));
     CUDA_CHECK(cudaFreeAsync(d_ev_scores, stream));
     CUDA_CHECK(cudaFreeAsync(d_nodes_rank, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 // return the weighted average hedge max src-dst manhattan distance and weighted average hedge Steiner tree span (<2x upper bound)
@@ -404,8 +404,8 @@ std::tuple<float, float> getLocalityMetrics(
             num_hedges,
             d_result // <- alredy multiply by hedge weight
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
     float total_src_dst_distance = thrust::reduce(thrust::device, t_result, t_result + num_hedges, 0.0f, thrust::plus<float>());
@@ -427,8 +427,8 @@ std::tuple<float, float> getLocalityMetrics(
             num_hedges,
             d_result // <- alredy multiply by hedge weight
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
     float total_steiner_span = thrust::reduce(thrust::device, t_result, t_result + num_hedges, 0.0f, thrust::plus<float>());

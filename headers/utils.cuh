@@ -59,6 +59,10 @@ inline cudaError_t cudaFreeLogged(T* ptr, const char* varname, const char* file,
 #define CUB(cfg) \
     if (!cfg.verbose_kernel_launches) {} else
 
+// extra debug code
+#define DBG(cfg) \
+    if (!cfg.debug) {} else
+
 // additional common logging text
 
 #define RUN \

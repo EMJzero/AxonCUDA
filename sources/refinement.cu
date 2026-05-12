@@ -112,8 +112,8 @@ void refinementRepeats(
                 d_pins_per_partitions,
                 d_partitions_inbound_sizes // as of here, this will be incorrect (also including outbounds)
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         
         // zero-out fm-ref gains kernel's outputs
@@ -147,8 +147,8 @@ void refinementRepeats(
                 d_pairs, // -> moves: pairs[node] -> partition the node wants to join
                 d_f_scores
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // =============================
@@ -224,8 +224,8 @@ void refinementRepeats(
                 encourage,
                 d_f_scores
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // not re-sorting the scores array means you have the array ordered as per the initial scores,
@@ -264,8 +264,8 @@ void refinementRepeats(
                 d_size_events_index,
                 d_size_events_delta
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // sort events by (partition, rank) [in lexicographical order for the tuple] and carry size_events_delta along
@@ -295,8 +295,8 @@ void refinementRepeats(
                 num_size_events,
                 d_valid_moves
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(d_size_events_partition));
         CUDA_CHECK(cudaFree(d_size_events_index));
@@ -325,8 +325,8 @@ void refinementRepeats(
                 d_pins_per_partitions, // from now it represents inbound sets only
                 d_partitions_inbound_sizes
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         // ======================================
         // extra step: compute moves validity by inbound set cardinality (same HP as the kernel above: all previous higher-gain moves will be applied)
@@ -369,8 +369,8 @@ void refinementRepeats(
                 d_inbound_count_events_hedge,
                 d_inbound_count_events_delta
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         
         // sort events by (partition, hedge, rank) [in lexicographical order for the tuple] and carry events_delta along
@@ -405,8 +405,8 @@ void refinementRepeats(
                 num_partitions,
                 d_inbound_size_events_offsets
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // transform the counts in offsets with a scan and find the total count of new size events
@@ -444,8 +444,8 @@ void refinementRepeats(
                 d_inbound_size_events_index,
                 d_inbound_size_events_delta
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(d_inbound_count_events_partition));
         CUDA_CHECK(cudaFree(d_inbound_count_events_index));
@@ -480,8 +480,8 @@ void refinementRepeats(
                 num_inbound_size_events,
                 d_inbound_valid_moves
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(d_inbound_size_events_partition));
         CUDA_CHECK(cudaFree(d_inbound_size_events_index));
@@ -527,8 +527,8 @@ void refinementRepeats(
                 d_partitions_sizes
                 //d_pins_per_partitions
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         } else {
             INFO(cfg) {
                 std::cout << "No valid refinement move found on level " << level_idx << " - reason: "
@@ -572,8 +572,8 @@ void refinementRepeats(
                 pp_map,
                 d_partitions_inbound_sizes
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(pp_map));
     }
@@ -673,8 +673,8 @@ void refinementSparseRepeats(
                 ppp_per_hedge,
                 d_ppp_offsets
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // exclusive scan of each bitmap counter
@@ -730,8 +730,8 @@ void refinementSparseRepeats(
                 d_ppp,
                 d_partitions_inbound_sizes // NOTE: here filled with outbounds too
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         
         // zero-out fm-ref gains kernel's outputs
@@ -767,8 +767,8 @@ void refinementSparseRepeats(
                 d_pairs, // -> moves: pairs[node] -> partition the node wants to join
                 d_f_scores
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // =============================
@@ -879,8 +879,8 @@ void refinementSparseRepeats(
                 d_size_events_offsets,
                 d_inbound_events_offsets
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // not re-sorting the scores array means you have the array ordered as per the initial scores,
@@ -933,8 +933,8 @@ void refinementSparseRepeats(
                 d_size_events_index,
                 d_size_events_delta
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(d_size_events_offsets));
 
@@ -965,8 +965,8 @@ void refinementSparseRepeats(
                 num_size_events,
                 d_valid_moves
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(d_size_events_partition));
         CUDA_CHECK(cudaFree(d_size_events_index));
@@ -997,8 +997,8 @@ void refinementSparseRepeats(
                 d_ppp, // from now it represents inbound sets only
                 d_partitions_inbound_sizes
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // ======================================
@@ -1061,8 +1061,8 @@ void refinementSparseRepeats(
                 d_inbound_count_events_hedge,
                 d_inbound_count_events_delta
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(d_inbound_events_offsets));
         
@@ -1197,8 +1197,8 @@ void refinementSparseRepeats(
                 ppp_per_hedge,
                 d_inbound_size_events_offsets
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // transform the counts in offsets with a scan and find the total count of new size events
@@ -1238,8 +1238,8 @@ void refinementSparseRepeats(
                 d_inbound_size_events_index,
                 d_inbound_size_events_delta
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(d_inbound_count_events_partition));
         CUDA_CHECK(cudaFree(d_inbound_count_events_index));
@@ -1274,8 +1274,8 @@ void refinementSparseRepeats(
                 num_inbound_size_events,
                 d_inbound_valid_moves
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(d_inbound_size_events_partition));
         CUDA_CHECK(cudaFree(d_inbound_size_events_index));
@@ -1322,8 +1322,8 @@ void refinementSparseRepeats(
                 d_partitions_sizes
                 //d_pins_per_partitions
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         } else {
             INFO(cfg) {
                 std::cout << "No valid refinement move found on level " << level_idx << " - reason: "
@@ -1370,8 +1370,8 @@ void refinementSparseRepeats(
                 pp_map,
                 d_partitions_inbound_sizes
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(pp_map));
     }

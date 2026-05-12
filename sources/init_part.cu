@@ -294,7 +294,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
         thrust::device_ptr<int32_t> t_size_events_delta(d_size_events_delta);
         thrust::device_ptr<int32_t> t_valid_moves(d_valid_moves);
 
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
 
         std::set<uint64_t> seen_partitionings;
 
@@ -321,9 +321,9 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     d_partitions_sizes,
                     d_fail
                 );
-                CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
                 CUDA_CHECK(cudaMemcpyAsync(&h_fail, d_fail, sizeof(bool), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
                 // random initialization failed, try again
                 if (h_fail) consecutive_failures++;*/
 
@@ -374,7 +374,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 max_parts,
                 d_pins_per_partitions
             );
-            CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
 
             // repeated application of any in-isolation improving valid move
             bool h_continue_flag = true;
@@ -406,7 +406,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     d_moves,
                     d_gains
                 );
-                CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
 
                 // sort moves by (dst-part, gain) lexicographically and carry node sizes and proposing nodes along
                 CUDA_CHECK(cudaMemcpyAsync(d_nodes_sizes_aux, d_nodes_sizes, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
@@ -453,10 +453,10 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     d_continue_flag,
                     d_partitions_hash
                 );
-                CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
                 CUDA_CHECK(cudaMemcpyAsync(&h_continue_flag, d_continue_flag, sizeof(bool), cudaMemcpyDeviceToHost, stream));
                 CUDA_CHECK(cudaMemcpyAsync(&h_partitions_hash, d_partitions_hash, sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
 
                 if (!h_continue_flag && jacobi < 4) ERR(cfg) std::cerr << "WARNING: no valid jacobi moves just after " << jacobi << " iterations (thread=" << tid << ") !!\n";
                 if (seen_partitionings.contains(h_partitions_hash)) {
@@ -515,7 +515,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     d_moves,
                     d_gains
                 );
-                CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
 
                 // sort gains and build an array of ranks by carrying indices along (node id -> his move's idx in sorted gains) (use node ids as a tie-breaker when sorting)
                 thrust::sequence(thrust_exec, t_fm_indices, t_fm_indices + num_nodes);
@@ -558,7 +558,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     false,
                     d_gains
                 );
-                CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
                 // not re-sorting the scores array means you have the array ordered as per the in-isolation gains, but now, this scan updates the scores "as if all previous moves were applied"!
                 thrust::inclusive_scan(thrust_exec, t_gains, t_gains + num_nodes, t_gains); // in-place (we don't need scores anymore anyway)
 
@@ -579,7 +579,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     d_size_events_index,
                     d_size_events_delta
                 );
-                CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
                 // sort events by (partition, rank) [in lexicographical order for the tuple] and carry size_events_delta along
                 auto size_events_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_size_events_partition, t_size_events_index));
                 auto size_events_key_end = size_events_key_begin + num_size_events;
@@ -602,7 +602,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     num_size_events,
                     d_valid_moves
                 );
-                CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
                 // compute, as of each event, the cumulative number of partitions that are invalid by summing the count of those made/unmade invalid at each event
                 thrust::inclusive_scan(thrust_exec, t_valid_moves, t_valid_moves + num_nodes, t_valid_moves);
 
@@ -620,7 +620,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 // validity double-check (if there were no valid moves...)
                 int32_t size_validity;
                 CUDA_CHECK(cudaMemcpyAsync(&size_validity, d_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
                 if (size_validity == 0) {
                     CUDA_CHECK(cudaMemsetAsync(d_partitions_hash, 0x00, sizeof(uint64_t), stream));
                     // launch configuration - fm-ref apply kernel
@@ -644,9 +644,9 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                         d_pins_per_partitions,
                         d_partitions_hash
                     );
-                    CUDA_CHECK(cudaGetLastError());
+                    DBG(cfg) CUDA_CHECK(cudaGetLastError());
                     CUDA_CHECK(cudaMemcpyAsync(&h_partitions_hash, d_partitions_hash, sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
                     if (seen_partitionings.contains(h_partitions_hash)) {
                         INFO(cfg) std::cout << "Stopping FM in iteration " << fm << " for reaching a repeated state (thread=" << tid << ") !\n";
                         break;
@@ -686,7 +686,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     best_conn = conn;
                     CUDA_CHECK(cudaMemcpyAsync(d_best_partitions, d_partitions, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
                     CUDA_CHECK(cudaMemcpyAsync(d_best_partitions_sizes, d_partitions_sizes, max_parts * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
                     INFO(cfg) std::cout << "Updated initial partitioning, connectivity=" << std::fixed << std::setprecision(3) << best_conn << " (thread=" << tid << ")\n";
                 } else {
                     INFO(cfg) std::cout << "Post-fm connectivity (worse than best): " << std::fixed << std::setprecision(3) << conn << " (thread=" << tid << ")\n";
@@ -694,7 +694,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
             }
         }
         
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
 
         CUDA_CHECK(cudaFreeAsync(d_partitions, stream));
         CUDA_CHECK(cudaFreeAsync(d_partitions_sizes, stream));
@@ -767,8 +767,8 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
         num_hedges,
         d_hedge_ratio
     );
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    DBG(cfg) CUDA_CHECK(cudaGetLastError());
+    DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     
     // find the total score
     thrust::device_ptr<float> t_hedge_ratio(d_hedge_ratio);
@@ -796,8 +796,8 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning_kahypar(
         d_hedge_scaled_weights,
         d_keep
     );
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    DBG(cfg) CUDA_CHECK(cudaGetLastError());
+    DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaFree(d_hedge_ratio));
 
     // TODO: apply the hedge filter (keep) on the DEVICE with a copy-if!
@@ -1014,7 +1014,7 @@ float compute_connectivity(
         max_parts,
         d_connectivity // connectivity[idx] -> total cut cost paid by the idx-th partition
     );
-    CUDA_CHECK(cudaGetLastError());
+    DBG(cfg) CUDA_CHECK(cudaGetLastError());
     thrust::device_ptr<float> t_connectivity(d_connectivity);
     float conn = thrust::reduce(thrust::cuda::par.on(stream), t_connectivity, t_connectivity + blocks);
     CUDA_CHECK(cudaFreeAsync(d_connectivity, stream));

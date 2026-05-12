@@ -69,8 +69,8 @@ void split_partitions_rand(
             num_nodes,
             d_partitions_cpy
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
     // undo the sort - scatter back to updated partitions to their original idxs
@@ -153,7 +153,7 @@ void compute_partitions_cutnet(
         hedges_size, num_hedges, d_hedges_offsets, d_hedges_offsets + 1,
         /*begin_bit=*/0, /*end_bit=*/sizeof(uint32_t) * 8, stream
     );
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
     if (c_part_pins_double_buffer.Current() != d_part_pins) {
         uint32_t* tmp = d_part_pins_buffer;
         d_part_pins_buffer = d_part_pins;
@@ -180,15 +180,15 @@ void compute_partitions_cutnet(
             num_hedges,
             d_flags
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
     // exclusive prefix sum of flags, then extract the last value (total sum) as the events count
     thrust::exclusive_scan(thrust_exec, t_flags, t_flags + hedges_size + 1, t_flags);
     dim_t events_count = 0;
     CUDA_CHECK(cudaMemcpyAsync(&events_count, d_flags + hedges_size, sizeof(dim_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
     float* d_event_weight = nullptr; // event_weight[idx] -> weight of the hedge being cut in event idx
     uint32_t* d_event_part = nullptr; // event_part[idx] -> partition/2 affected by event idx
 
@@ -218,8 +218,8 @@ void compute_partitions_cutnet(
                 d_event_weight,
                 d_event_part
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         // sort event_weight and event_part both according to event_part
@@ -404,8 +404,8 @@ uint32_t* locality_ordering(
                     d_odd_event_idx,
                     d_scores
                 );
-                CUDA_CHECK(cudaGetLastError());
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
             }
             
             // build move events (partition, score, node)
@@ -417,7 +417,7 @@ uint32_t* locality_ordering(
             uint32_t odd_events_count;
             CUDA_CHECK(cudaMemcpyAsync(&even_events_count, d_even_event_idx + num_nodes, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaMemcpyAsync(&odd_events_count, d_odd_event_idx + num_nodes, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
             if (even_events_count == 0 || odd_events_count == 0) {
                 INFO(cfg) std::cout TID(tid) << "No valid label propagation move found on level " << level_idx << " repeat " << lp_repeat << " (even events count=" << even_events_count << " odd events count=" << odd_events_count << ") !!\n";
                 break;
@@ -464,8 +464,8 @@ uint32_t* locality_ordering(
                     d_odd_event_score,
                     d_odd_event_node
                 );
-                CUDA_CHECK(cudaGetLastError());
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
             }
 
             // sort events by (partition, score, node)
@@ -538,8 +538,8 @@ uint32_t* locality_ordering(
                     odd_events_count,
                     d_even_event_score
                 );
-                CUDA_CHECK(cudaGetLastError());
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
             }
 
             // inclusive scan inside each key (= partition) on the even event scores => for each event we get the cumulative gain up to that point in the partition's move sequence
@@ -607,8 +607,8 @@ uint32_t* locality_ordering(
                     even_events_count,
                     d_partitions
                 );
-                CUDA_CHECK(cudaGetLastError());
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
             }
 
             // compute the new partitions split cost
@@ -642,8 +642,8 @@ uint32_t* locality_ordering(
                     d_last_best_partitions
 
                 );
-                CUDA_CHECK(cudaGetLastError());
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
             }
 
             // update the best split costs per partitions pair found so far at this level
@@ -732,8 +732,8 @@ uint32_t* locality_ordering(
                 num_nodes,
                 d_sibling_score
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         // refold p*2 and p*2+1 back into p
@@ -763,8 +763,8 @@ uint32_t* locality_ordering(
                 num_parts,
                 d_reverse
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         // build offset indices over ord_part
@@ -796,8 +796,8 @@ uint32_t* locality_ordering(
                 num_nodes,
                 d_order
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         CUDA_CHECK(cudaFreeAsync(d_sibling_score, stream));
@@ -815,7 +815,7 @@ uint32_t* locality_ordering(
     CUDA_CHECK(cudaFreeAsync(d_order, stream));
     CUDA_CHECK(cudaFreeAsync(d_ord_part, stream));
     CUDA_CHECK(cudaFreeAsync(d_partitions, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
 
     CURAND_CHECK(curandDestroyGenerator(gen));
 
@@ -840,8 +840,8 @@ uint32_t* locality_ordering(
                 num_hedges,
                 d_hedge_span
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
         thrust::device_ptr<float> t_hedge_span(d_hedge_span);
         float tot_span = thrust::reduce(thrust_exec, t_hedge_span, t_hedge_span + num_hedges);

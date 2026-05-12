@@ -50,6 +50,7 @@ namespace config_plc {
         bool verbose_info; // whether to log the step/phase where the program is at
         bool verbose_errs_and_warns; // whether to log errs and warnings
         bool verbose_kernel_launches; // whether to log every kernel launch or not
+        bool debug; // whether to run extra debug synchronization/checks
     };
 
     void printHelp();

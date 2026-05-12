@@ -1,6 +1,7 @@
 #include <tuple>
-#include <string>
 #include <chrono>
+#include <string>
+#include <vector>
 #include <cstdint>
 #include <numeric>
 #include <iomanip>
@@ -222,8 +223,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpyToSymbol(max_inbound_per_part, &h_max_inbound_per_part, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
 
     // wrap up memory duties with a sync
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    DBG(cfg) CUDA_CHECK(cudaGetLastError());
+    DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
 
     // prepare touching sets
     dim_t touching_hedges_size;
@@ -724,8 +725,8 @@ int main(int argc, char** argv) {
                 curr_num_nodes,
                 d_partitions
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // cleanup groups

@@ -16,7 +16,7 @@ using namespace config;
 
 std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouchingHost(
     const runconfig &cfg,
-    const HyperGraph& hg
+    const HyperGraph &hg
 ) {
     ERR(cfg) std::cerr << "WARNING: moving inbound and outbound sets host -> device will take a while...\n";
 
@@ -96,8 +96,8 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouching(
             d_touching_offsets,
             d_inbound_count
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     }
     
     thrust::device_ptr<dim_t> t_touching_offsets(d_touching_offsets);
@@ -131,8 +131,8 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouching(
             d_inserted_inbound,
             d_inserted_outbound
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     }
     CUDA_CHECK(cudaFree(d_inserted_inbound));
     CUDA_CHECK(cudaFree(d_inserted_outbound));
@@ -226,8 +226,8 @@ dim_t sampleMaxNeighborhoodSize(
                 d_flags_bits,
                 d_neighbors_count
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
     }
     CUDA_CHECK(cudaFree(d_flags_bits));
@@ -289,8 +289,8 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
             d_oversized_neighbors,
             d_neighbors_offsets
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     }
     if (!direct_scatter_neighbors) CUDA_CHECK(cudaFree(d_oversized_neighbors)); // no pack? free oversized immediately
 
@@ -332,8 +332,8 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
             d_neighbors
         );
     }
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    DBG(cfg) CUDA_CHECK(cudaGetLastError());
+    DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     if (direct_scatter_neighbors) CUDA_CHECK(cudaFree(d_oversized_neighbors)); // pack? free oversized afterwards
 
     return std::make_tuple(total_neighbors, d_neighbors, d_neighbors_offsets);
@@ -383,8 +383,8 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
             new_num_nodes,
             d_coarse_oversized_neighbors_offsets
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     }
     thrust::inclusive_scan(t_coarse_oversized_neighbors_offsets, t_coarse_oversized_neighbors_offsets + (new_num_nodes + 1), t_coarse_oversized_neighbors_offsets); // in-place exclusive scan (de-facto inclusive, but we wrote the array with a "+1" on indices)
     dim_t coarse_oversized_neighbors_size = 0u;
@@ -423,8 +423,8 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
                 d_coarse_oversized_neighbors,
                 d_coarse_neighbors_offsets
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(d_neighbors));
         CUDA_CHECK(cudaFree(d_neighbors_offsets));
@@ -452,8 +452,8 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
                 1ull,
                 d_coarse_neighbors
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(d_coarse_oversized_neighbors));
     } else {
@@ -488,8 +488,8 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
                 d_coarse_oversized_neighbors,
                 d_coarse_neighbors_offsets
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
         // compute final offsets
@@ -523,8 +523,8 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
                     1ull,
                     d_coarse_neighbors
                 );
-                CUDA_CHECK(cudaGetLastError());
-                CUDA_CHECK(cudaDeviceSynchronize());
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
             }
             CUDA_CHECK(cudaFree(d_coarse_oversized_neighbors));
         } else {
@@ -550,8 +550,8 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
                     new_num_nodes,
                     d_coarse_neighbors
                 );
-                CUDA_CHECK(cudaGetLastError());
-                CUDA_CHECK(cudaDeviceSynchronize());
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
             }
         }
     }
@@ -605,8 +605,8 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
         d_coarse_hedges_offsets,
         d_coarse_srcs_count
     );
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    DBG(cfg) CUDA_CHECK(cudaGetLastError());
+    DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaFree(d_coarse_oversized_hedges));
 
     // NOTE: the scan wants the last index EXCLUDED, while the memcopy wants the last index exactly! That's why we use here the +1, and not later!
@@ -627,8 +627,8 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
         d_coarse_hedges_offsets,
         d_coarse_hedges
     );
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    DBG(cfg) CUDA_CHECK(cudaGetLastError());
+    DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
 
     // sort destinations (descending)
     cub::DoubleBuffer<uint32_t> c_coarse_hedges_double_buffer(d_coarse_hedges, d_coarse_hedges_buffer);
@@ -667,8 +667,8 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenHedges(
         d_coarse_srcs_count,
         d_coarse_hedges
     );
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    DBG(cfg) CUDA_CHECK(cudaGetLastError());
+    DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaFree(d_coarse_hedges_buffer));
     CUDA_CHECK(cudaFree(c_hedges_storage));
 
@@ -709,8 +709,8 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
             num_hedges,
             d_coarse_touching_offsets
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     thrust::device_ptr<dim_t> t_coarse_touching_offsets(d_coarse_touching_offsets);
@@ -742,8 +742,8 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
             d_coarse_touching,
             d_coarse_inbound_count
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
 
         // sort each inbound touching set
         cub::DoubleBuffer<uint32_t> c_coarse_touching_double_buffer(d_coarse_touching, d_coarse_touching_buffer);
@@ -781,8 +781,8 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> coarsenTouching(
             d_coarse_inbound_count,
             d_coarse_touching
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     return std::make_tuple(new_touching_size, d_coarse_touching, d_coarse_touching_offsets, d_coarse_inbound_count);

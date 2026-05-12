@@ -1,6 +1,7 @@
 #include <tuple>
-#include <string>
 #include <chrono>
+#include <string>
+#include <vector>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
@@ -191,8 +192,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpyToSymbol(max_height, &h_max_height, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
 
     // wrap up memory duties with a sync
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    DBG(cfg) CUDA_CHECK(cudaGetLastError());
+    DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
 
     // prepare touching sets
     if (cfg.device_touching_construction) {
@@ -378,8 +379,8 @@ int main(int argc, char** argv) {
                 num_nodes,
                 d_inv_placement
             );
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         // =============================
@@ -434,7 +435,7 @@ int main(int argc, char** argv) {
                 best_whops = curr_whops;
                 CUDA_CHECK(cudaMemcpyAsync(d_best_placement, d_placement, num_nodes * sizeof(coords), cudaMemcpyDeviceToDevice, stream));
                 CUDA_CHECK(cudaMemcpyAsync(d_best_inv_placement, d_inv_placement, h_max_width * h_max_height * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
                 INFO(cfg) std::cout TID(tid) << "Updated best placement: whops=" << std::fixed << std::setprecision(3) << curr_whops << "\n";
             } else {
                 INFO(cfg) std::cout TID(tid) << "Discarded placement: whops=" << std::fixed << std::setprecision(3) << curr_whops << " < " << best_whops << "\n";
@@ -443,7 +444,7 @@ int main(int argc, char** argv) {
 
         CUDA_CHECK(cudaFreeAsync(d_placement, stream));
         CUDA_CHECK(cudaFreeAsync(d_inv_placement, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
 
         CUDA_CHECK(cudaEventRecord(d_time_attempt_stop, stream));
         CUDA_CHECK(cudaEventSynchronize(d_time_attempt_stop));

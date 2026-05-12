@@ -321,8 +321,8 @@ void build_orphan_pairs(
         d_groups
     );
 
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    DBG(cfg) CUDA_CHECK(cudaGetLastError());
+    DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
 
     CUDA_CHECK(cudaFree(d_free_keys));
     CUDA_CHECK(cudaFree(d_free_indices));

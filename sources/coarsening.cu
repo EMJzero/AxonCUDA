@@ -62,8 +62,8 @@ void candidatesProposal(
             d_pairs,
             d_u_scores
         );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     }
 }
 
@@ -129,8 +129,8 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
             (void*)&d_extra_paths
         };
         cudaLaunchCooperativeKernel((void*)grouping_kernel, blocks, threads_per_block, kernel_args, shared_bytes);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     }
     CUDA_CHECK(cudaFree(d_extra_paths));
 

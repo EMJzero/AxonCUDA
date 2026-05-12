@@ -15,6 +15,7 @@
 #define VERBOSE_INFO true
 #define VERBOSE_LOGS false
 #define VERBOSE_ERRS true
+#define DEBUG_ON false
 
 
 // USED BY: everyone
