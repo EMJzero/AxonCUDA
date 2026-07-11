@@ -197,7 +197,7 @@ void fm_refinement_gains_kernel(
         }
 
         // reduce max between threads
-        bin<float> max = warpReduceMax<float>(best_gain, best_move);
+        bin<float> max = warpReduceArgMax<float>(best_gain, best_move);
         best_gain = max.val;
         best_move = max.payload; // yeah, "node" should be called "partition" here, but this way we repurpose the struct...
     }
@@ -894,7 +894,7 @@ void fm_refinement_gains_sparse_ppp_kernel(
         }
 
         // reduce max between threads
-        bin<float> max = warpReduceMax<float>(best_gain, best_move);
+        bin<float> max = warpReduceArgMax<float>(best_gain, best_move);
         best_gain = max.val;
         best_move = max.payload; // yeah, "node" should be called "partition" here, but this way we repurpose the struct...
     }

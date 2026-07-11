@@ -435,7 +435,7 @@ int main(int argc, char** argv) {
                 best_whops = curr_whops;
                 CUDA_CHECK(cudaMemcpyAsync(d_best_placement, d_placement, num_nodes * sizeof(coords), cudaMemcpyDeviceToDevice, stream));
                 CUDA_CHECK(cudaMemcpyAsync(d_best_inv_placement, d_inv_placement, h_max_width * h_max_height * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
                 INFO(cfg) std::cout TID(tid) << "Updated best placement: whops=" << std::fixed << std::setprecision(3) << curr_whops << "\n";
             } else {
                 INFO(cfg) std::cout TID(tid) << "Discarded placement: whops=" << std::fixed << std::setprecision(3) << curr_whops << " < " << best_whops << "\n";

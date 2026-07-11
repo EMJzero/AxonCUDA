@@ -176,7 +176,7 @@ void candidates_kernel(
                     best_hist_idx = nb;
                 }
             }
-            bin<uint32_t> max_neighbor = warpReduceMax<uint32_t>(curr_score, curr_neighbor); // this also tie-breaks
+            bin<uint32_t> max_neighbor = warpReduceArgMax<uint32_t>(curr_score, curr_neighbor); // this also tie-breaks
             if (max_neighbor.payload == curr_neighbor) {
                 histogram_node[best_hist_idx] = UINT32_MAX;
                 histogram_score[best_hist_idx] = 0u;

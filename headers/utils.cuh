@@ -9,8 +9,6 @@
 #include "defines.cuh"
 #include "data_types.cuh"
 
-// REMEMBER: "const" means the data pointed to is not modified, not the pointer itself!
-
 // USED BY: everyone
 
 #define CUDA_CHECK(ans) { gpuAssert((ans), #ans, __FILE__, __LINE__); }
@@ -119,6 +117,24 @@ __forceinline__ __device__ T warpReduceSumLN0(T val) {
     return val;
 }
 
+// every warp lane sees the max
+template <typename T>
+__forceinline__ __device__ T warpReduceMax(T val) {
+    #pragma unroll
+    for (int offset = 1; offset < WARP_SIZE; offset <<= 1)
+        val = max(val, __shfl_xor_sync(0xFFFFFFFFu, val, offset));
+    return val;
+}
+
+// only lane == 0 sees the max
+template <typename T>
+__forceinline__ __device__ T warpReduceMaxLN0(T val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
+        val = max(val, __shfl_down_sync(0xFFFFFFFFu, val, offset));
+    return val;
+}
+
 // lane i gets "sum_{k=0..i} in[k]"
 template <typename T>
 __forceinline__ __device__ T warpInclusiveScan(T val) {
@@ -145,13 +161,28 @@ __forceinline__ __device__ T warpExclusiveScan(T val) {
 // USED BY: candidates kernel
 
 template <typename T>
-__forceinline__ __device__ bin<T> warpReduceMax(T val, uint32_t payload) {
+__forceinline__ __device__ bin<T> warpReduceArgMax(T val, uint32_t payload) {
     static_assert(sizeof(T) == 4, "T (val) must be 32-bit");
     #pragma unroll
     for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
         T other_val = __shfl_xor_sync(0xffffffff, val, offset);
         uint32_t other_payload = __shfl_xor_sync(0xffffffff, payload, offset);
         if (other_val > val || other_val == val && other_payload > payload) {
+            val = other_val;
+            payload = other_payload;
+        }
+    }
+    return {.payload = payload, .val = val};
+}
+
+template <typename T>
+__forceinline__ __device__ bin<T> warpReduceArgMin(T val, uint32_t payload) {
+    static_assert(sizeof(T) == 4, "T (val) must be 32-bit");
+    #pragma unroll
+    for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+        T other_val = __shfl_xor_sync(0xffffffff, val, offset);
+        uint32_t other_payload = __shfl_xor_sync(0xffffffff, payload, offset);
+        if (other_val < val || other_val == val && other_payload > payload) {
             val = other_val;
             payload = other_payload;
         }

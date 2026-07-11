@@ -381,34 +381,38 @@ std::tuple<float, float> getLocalityMetrics(
     *     - a pin already part of the minimum spanning tree must not be reconsidered by subsequent nodes...
     *     => Prim-style algoritm, expanding sequentially the connected spanning tree inside each hedge's graph
     */
-    
+
+    auto thrust_exec = thrust::cuda::par.on(stream);
+
     float *d_result = nullptr; // result[hedge idx] -> temporary result for the hedge
     CUDA_CHECK(cudaMallocAsync(&d_result, 4 * num_hedges * sizeof(float), stream));
     thrust::device_ptr<float> t_result(d_result);
     
-    // compute the max src-dst manhattan distance per hedge
+    // compute the max (or tot) src-dst manhattan distance per hedge
     {
-        // launch configuration - max src-dst distance kernel
+        // launch configuration - max (or tot) src-dst distance kernel
         int threads_per_block = 128; // 128/32 -> 4 warps per block
         int warps_per_block = threads_per_block / WARP_SIZE;
         int num_warps_needed = num_hedges ; // 1 warp per hedge
         int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-        // launch - max src-dst distance kernel
-        LAUNCH(cfg) TID(tid) RUN << "max src-dst distance kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        max_src_dst_distance_kernel<<<blocks, threads_per_block, 0, stream>>>(
+        // launch - max (or tot) src-dst distance kernel
+        //LAUNCH(cfg) TID(tid) RUN << "max src-dst distance kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) TID(tid) RUN << "tot src-dst distance kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        //max_src_dst_distance_kernel<<<blocks, threads_per_block, 0, stream>>>(
+        tot_src_dst_distance_kernel<<<blocks, threads_per_block, 0, stream>>>(
             d_placement,
             d_hedges,
             d_hedges_offsets,
             d_srcs_count,
             d_hedge_weights,
             num_hedges,
-            d_result // <- alredy multiply by hedge weight
+            d_result // <- alredy multiplied by hedge weight
         );
         DBG(cfg) CUDA_CHECK(cudaGetLastError());
         DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
-    float total_src_dst_distance = thrust::reduce(thrust::device, t_result, t_result + num_hedges, 0.0f, thrust::plus<float>());
+    float total_src_dst_distance = thrust::reduce(thrust_exec, t_result, t_result + num_hedges, 0.0f, thrust::plus<float>());
 
     // compute the Steiner tree span upper bound per hedge, given by the weighted spanning tree overs its pins' complete graph
     {
@@ -431,7 +435,9 @@ std::tuple<float, float> getLocalityMetrics(
         DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
-    float total_steiner_span = thrust::reduce(thrust::device, t_result, t_result + num_hedges, 0.0f, thrust::plus<float>());
+    float total_steiner_span = thrust::reduce(thrust_exec, t_result, t_result + num_hedges, 0.0f, thrust::plus<float>());
+
+    CUDA_CHECK(cudaFreeAsync(d_result, stream));
 
     return std::make_tuple(total_src_dst_distance, total_steiner_span);
 }

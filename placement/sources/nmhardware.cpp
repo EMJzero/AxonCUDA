@@ -280,7 +280,8 @@ namespace hwmodel {
                 const auto& src_core = placement[src];
 
                 double w = static_cast<double>(he.weight());
-                tot_spike_frequency += w * static_cast<double>(he.connections());
+                const uint32_t destinations_count = he.length() - he.src_count();
+                tot_spike_frequency += w * static_cast<double>(destinations_count);
 
                 for (auto dst : he.destinations()) {
                     const auto& dst_core = placement[dst];
@@ -323,14 +324,14 @@ namespace hwmodel {
 
         std::vector<std::vector<double>> matrix(width, std::vector<double>(height, 0.0));
 
-        matrix[0][0] = 1.0;
+        const int x_base = std::min(x_src, x_dst);
+        const int y_base = std::min(y_src, y_dst);
+        x_src -= x_base;
+        x_dst -= x_base;
+        y_src -= y_base;
+        y_dst -= y_base;
 
-        int m = std::min(x_src, x_dst);
-        x_src -= m;
-        x_dst -= m;
-        m = std::min(y_src, y_dst);
-        y_src -= m;
-        y_dst -= m;
+        matrix[x_src][y_src] = 1.0;
 
         int x_sign = (x_src == 0) ? 1 : -1;
         int y_sign = (y_src == 0) ? 1 : -1;
@@ -402,8 +403,8 @@ namespace hwmodel {
                     int x_base = std::min(dst_core.x, src_core.x);
                     int y_base = std::min(dst_core.y, src_core.y);
 
-                    for (int x = 0; x < dx; ++x) {
-                        for (int y = 0; y < dy; ++y) {
+                    for (int x = 0; x <= dx; ++x) {
+                        for (int y = 0; y <= dy; ++y) {
                             congestion_matrix[static_cast<uint32_t>(x_base + x)][static_cast<uint32_t>(y_base + y)] += static_cast<double>(he.weight()) * transit_prob_matrix[x][y];
                         }
                     }

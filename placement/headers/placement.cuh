@@ -189,6 +189,17 @@ void max_src_dst_distance_kernel(
 );
 
 __global__
+void tot_src_dst_distance_kernel(
+    const coords* __restrict__ placement,
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const float* __restrict__ hedge_weights,
+    const uint32_t num_hedges,
+    float* __restrict__ result
+);
+
+__global__
 void min_spanning_tree_weight_kernel(
     const coords* __restrict__ placement,
     const uint32_t* __restrict__ hedges,

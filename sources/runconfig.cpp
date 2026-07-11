@@ -99,6 +99,8 @@ namespace config {
                 kway = std::stoul(argv[++i]);
                 epsi = std::stof(argv[++i]);
                 mode = Mode::KWAY;
+                if (kway == 0) { std::cerr << "Error: 'k' must be strictly greater than 0\n"; std::exit(1); }
+                if (epsi < 0) { std::cerr << "Error: 'ε' must be positive\n"; std::exit(1); }
             } else if (arg == "-om") {
                 if (i + 1 >= argc) { std::cerr << "Error: -om requires a float value\n"; std::exit(1); }
                 oversized_multiplier = std::stof(argv[++i]);

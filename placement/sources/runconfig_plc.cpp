@@ -98,7 +98,7 @@ namespace config_plc {
             } else if (arg == "-cnc") {
                 if (i + 1 >= argc) { std::cerr << "Error: -cnc requires a positive integer value\n"; std::exit(1); }
                 candidates_count = std::stoul(argv[++i]);
-                if (candidates_count > MAX_CANDIDATE_MOVES) { std::cerr << "Error: -cnc must be less or equal to " << MAX_CANDIDATE_MOVES << "\n"; std::exit(1); }
+                if (candidates_count == 0 || candidates_count > MAX_CANDIDATE_MOVES) { std::cerr << "Error: -cnc must be greater than 0 and less or equal to " << MAX_CANDIDATE_MOVES << "\n"; std::exit(1); }
             } else if (arg == "-sfc") {
                 if (i + 1 >= argc) { std::cerr << "Error: -sfc requires a curve name\n"; std::exit(1); }
                 std::string curve_name = argv[++i];

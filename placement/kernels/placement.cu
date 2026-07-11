@@ -699,10 +699,45 @@ void max_src_dst_distance_kernel(
             const coords dst_plc = placement[*dst_ptr];
             max_distance = max(max_distance, manhattan(src_plc, dst_plc));
         }
-        tot_distance += max_distance;
+        tot_distance += warpReduceMaxLN0(max_distance);
     }
 
-    tot_distance = warpReduceSumLN0<uint32_t>(tot_distance);
+    if (lane_id == 0)
+        result[warp_id] = tot_distance * hedge_weights[warp_id];
+}
+
+// same as 'max_src_dst_distance_kernel', but accumulates the manhattan distance over all src-dst per hedge
+__global__
+void tot_src_dst_distance_kernel(
+    const coords* __restrict__ placement,
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const uint32_t* __restrict__ srcs_count,
+    const float* __restrict__ hedge_weights,
+    const uint32_t num_hedges,
+    float* __restrict__ result
+) {
+    // STYLE: one hedge per warp!
+    const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // global across blocks - coincides with the node to handle
+    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    if (warp_id >= num_hedges) return;
+
+    const uint32_t* srcs_start = hedges + hedges_offsets[warp_id];
+    const uint32_t* dsts_start = srcs_start + srcs_count[warp_id];
+    const uint32_t* dsts_end = hedges + hedges_offsets[warp_id + 1];
+
+    uint32_t tot_distance = 0u;
+
+    for (const uint32_t* src_ptr = srcs_start; src_ptr < dsts_start; src_ptr++) {
+        const coords src_plc = placement[*src_ptr];
+        for (const uint32_t* dst_ptr = dsts_start + lane_id; dst_ptr < dsts_end; dst_ptr += WARP_SIZE) {
+            const coords dst_plc = placement[*dst_ptr];
+            tot_distance += manhattan(src_plc, dst_plc);
+        }
+    }
+
+    tot_distance = warpReduceSumLN0(tot_distance);
 
     if (lane_id == 0)
         result[warp_id] = tot_distance * hedge_weights[warp_id];
@@ -771,7 +806,7 @@ void min_spanning_tree_weight_kernel(
                 min_pin = pin_idx * WARP_SIZE + lane_id;
             }
         }
-        const bin max_bin = warpReduceMax<uint32_t>(min_dst, min_pin);
+        const bin max_bin = warpReduceArgMin<uint32_t>(min_dst, min_pin);
         if (max_bin.payload == UINT32_MAX) break; // MST completed
         if (max_bin.payload == min_pin) { // flag winning pin
             const uint32_t pin_idx = min_pin / WARP_SIZE;

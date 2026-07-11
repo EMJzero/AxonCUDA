@@ -861,3 +861,8 @@ Big neighbors iterations upgrade idea:
 - the block as a whole picks up a few nodes, and goes over their incidence sets
 - for each hedge, it checks how long it is, and gives it to a warp to handle
 - if a warp was given an hedge with <32 pins, anotherone can be given to it at the same time
+
+----
+
+Hilbert or snake curve? It’s a trade-off depending on how well the tree reordering works.
+If the tree reordering is very strong, snake exploits it the most, otherwise Hilbert still exploits it up to 50%!
