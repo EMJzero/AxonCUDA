@@ -45,6 +45,8 @@ void printHelp() {
         "  -k-prt <k> <ε>  K-way balanced constraints set to use (overrides '-c-prt' and '-m-prt')\n"
         "  -c-plc <name>   Placement constraints set to use (valid ones: truenorth, loihi, loihi64, loihi84, loihi1024)\n"
         "  -ff         Reorder the partitioned hypergraph's nodes with the greedy feedforward algorithm (use if '-ff' was used for placement)\n"
+        "  -noum       Disables the evaluation and logging of unicast-based placement quality metrics\n"
+        "  -nomm       Disables the evaluation and logging of multicast-based placement quality metrics (which can be very slow)\n"
         "  -h          Show this help\n";
 }
 
@@ -174,6 +176,8 @@ int main(int argc, char** argv) {
     // |
     std::string plac_constraints_name;
     bool feedforward_order = false;
+    bool unicast_metrics = true;
+    bool multicast_metrics = true;
 
     // CLI handling
     for (int i = 1; i < argc; ++i) {
@@ -212,6 +216,10 @@ int main(int argc, char** argv) {
             plac_constraints_name = argv[++i];
         }  else if (arg == "-ff") {
             feedforward_order = true;
+        } else if (arg == "-noum") {
+            unicast_metrics = false;
+        } else if (arg == "-nomm") {
+            multicast_metrics = false;
         } else { std::cerr << "Unknown option: " << arg << "\n"; std::exit(1); }
     }
 
@@ -341,16 +349,26 @@ int main(int argc, char** argv) {
         
         // apply and grade placement
         if (plac_constr->checkPlacementValidity(placement_hg, placement, true)) {
-            auto metrics = plac_constr->getAllMetrics(placement_hg, placement);
-            std::cout << "Placement metrics:\n";
-            std::cout << "  Energy:        " << std::fixed << std::setprecision(3) << metrics.energy.value() << "\n";
-            std::cout << "  Avg. latency:  " << std::fixed << std::setprecision(3) << metrics.avg_latency.value() << "\n";
-            std::cout << "  Max. latency:  " << std::fixed << std::setprecision(3) << metrics.max_latency.value() << "\n";
-            std::cout << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << metrics.avg_congestion.value() << "\n";
-            std::cout << "  Max. congestion:  " << std::fixed << std::setprecision(3) << metrics.max_congestion.value() << "\n";
-            std::cout << "  Connections locality:\n";
-            std::cout << "    Flat:     " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean << " ar. mean, " << metrics.connections_locality.value().geo_mean << " geo. mean\n";
-            std::cout << "    Weighted: " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
+            if (unicast_metrics) {
+                auto uc_metrics = plac_constr->getAllUnicastMetrics(placement_hg, placement);
+                std::cout << "Placement unicast metrics:\n";
+                std::cout << "  Energy:        " << std::fixed << std::setprecision(3) << uc_metrics.energy.value() << "\n";
+                std::cout << "  Avg. latency:  " << std::fixed << std::setprecision(3) << uc_metrics.avg_latency.value() << "\n";
+                std::cout << "  Max. latency:  " << std::fixed << std::setprecision(3) << uc_metrics.max_latency.value() << "\n";
+                std::cout << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << uc_metrics.avg_congestion.value() << "\n";
+                std::cout << "  Max. congestion:  " << std::fixed << std::setprecision(3) << uc_metrics.max_congestion.value() << "\n";
+                std::cout << "  Connections locality:\n";
+                std::cout << "    Flat:     " << std::fixed << std::setprecision(3) << uc_metrics.connections_locality.value().ar_mean << " ar. mean, " << uc_metrics.connections_locality.value().geo_mean << " geo. mean\n";
+                std::cout << "    Weighted: " << std::fixed << std::setprecision(3) << uc_metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << uc_metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
+            }
+
+            if (multicast_metrics) {
+                auto mc_metrics = plac_constr->getAllMulticastMetrics(placement_hg, placement);
+                std::cout << "Placement multicast metrics:\n";
+                std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << mc_metrics.energy.value() << "\n";
+                std::cout << "  Avg. latency:    " << std::fixed << std::setprecision(3) << mc_metrics.avg_latency.value() << "\n";
+                std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.max_congestion.value() << "\n";
+            }
         } else {
             std::cerr << "WARNING, invalid placement !!\n";
         }

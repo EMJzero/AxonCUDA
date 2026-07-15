@@ -44,6 +44,8 @@ namespace config_plc {
         uint32_t num_host_threads; // imposes the number of host threads and GPU streams to spawn to handle the multi-start attempts
         SpaceFillingCurve space_filling_curve; // space filling curve to use for the 1D-to-2D locality-preserving mapping
         bool feedforward_order; // if true, use the greedy sequential feedforward initial partitioning (runs on the host !!)
+        bool unicast_metrics; // if true, compute and log the unicast-based placement quality metrics
+        bool multicast_metrics; // if true, compute and log the multicast-based (Steiner tree involved!!) placement quality metrics
         bool device_touching_construction; // whether to construct touching/incidence sets on the device or the host
         uint64_t seed; // seed for the multi-start and recursive bisection methods
         bool verbose_logs; // whether to log what is happening inside the algorithms

@@ -37,6 +37,15 @@ inline cudaError_t cudaFreeLogged(T* ptr, const char* varname, const char* file,
 #define cudaFree(ptr) cudaFreeLogged(ptr, #ptr, __FILE__, __LINE__)
 #endif
 
+//     verbosity level vs config flags
+// v | info | err | launch/cub | log | dbg |
+// --|------|-----|------------|-----|-----|
+// 0 |      |     |            |     |     |
+// 1 |   x  |  x  |            |     |     |
+// 2 |   x  |  x  |      x     |     |     |
+// 3 |   x  |  x  |      x     |  x  |     |
+// 4 |   x  |  x  |      x     |  x  |  x  |
+
 // insight in algorithms' logic and decisions
 #define LOG(cfg) \
     if (!cfg.verbose_logs) {} else

@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
     else std::cout << cfg.num_host_threads << "\n";
     std::cout << "  Label propagation repeats:       " << cfg.labelprop_repeats << "\n";
     std::cout << "  Space-filling curve:             " << SFCtoString(cfg.space_filling_curve) << "\n";
-    std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc " : "") << (cfg.feedforward_order ? "ff " : "") << "\n";
+    std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc " : "") << (cfg.feedforward_order ? "ff " : "") << (cfg.unicast_metrics ? "noum " : "") << (cfg.multicast_metrics ? "nomm " : "") << "\n";
 
     if (hg.nodes() > hw.coresAlongX() * hw.coresAlongY()) {
         ERR(cfg) std::cerr << "ERROR, the hypergraph has more nodes (" << hg.nodes() << ") than the 2D lattice has points (" << hw.coresAlongX() * hw.coresAlongY() << "), placement would fail !!\n";
@@ -255,7 +255,6 @@ int main(int argc, char** argv) {
     // => nah, rather, add "(tid = X)" in each log!
 
     // setup a stream per thread
-    omp_set_num_threads(num_threads);
     INFO(cfg) std::cout << "Spawning " << num_threads << " OpenMP threads and matching CUDA streams ...\n";
     std::vector<cudaStream_t> streams(num_threads);
     for (uint32_t i = 0; i < num_threads; ++i) {
@@ -270,7 +269,7 @@ int main(int argc, char** argv) {
 
     float avg_attempt_time = 0.0f;
 
-    #pragma omp parallel for default(shared) reduction(+:avg_attempt_time)
+    #pragma omp parallel for default(shared) reduction(+:avg_attempt_time) num_threads(num_threads)
     for (uint32_t start = 0; start < multi_start_count; start++) {
         // recover your stream
         int tid = omp_get_thread_num();
@@ -339,16 +338,19 @@ int main(int argc, char** argv) {
             }
             
             if (hw.checkPlacementValidity(hg, h_init_placement, true)) {
-                auto metrics = hw.getAllMetrics(hg, h_init_placement);
-                std::cout TID(tid) << "Initial placement metrics:\n";
-                std::cout TID(tid) << "  Energy:        " << std::fixed << std::setprecision(3) << metrics.energy.value() << "\n";
-                std::cout TID(tid) << "  Avg. latency:  " << std::fixed << std::setprecision(3) << metrics.avg_latency.value() << "\n";
-                std::cout TID(tid) << "  Max. latency:  " << std::fixed << std::setprecision(3) << metrics.max_latency.value() << "\n";
-                std::cout TID(tid) << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << metrics.avg_congestion.value() << "\n";
-                std::cout TID(tid) << "  Max. congestion:  " << std::fixed << std::setprecision(3) << metrics.max_congestion.value() << "\n";
-                std::cout TID(tid) << "  Connections locality:\n";
-                std::cout TID(tid) << "    Flat:     " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean << " ar. mean, " << metrics.connections_locality.value().geo_mean << " geo. mean\n";
-                std::cout TID(tid) << "    Weighted: " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
+                if (cfg.unicast_metrics) {
+                    DBG(cfg) std::cout TID(tid) << "Computing initial placement unicast metrics...\n";
+                    auto metrics = hw.getAllUnicastMetrics(hg, h_init_placement);
+                    std::cout TID(tid) << "Initial placement unicast metrics:\n";
+                    std::cout TID(tid) << "  Energy:        " << std::fixed << std::setprecision(3) << metrics.energy.value() << "\n";
+                    std::cout TID(tid) << "  Avg. latency:  " << std::fixed << std::setprecision(3) << metrics.avg_latency.value() << "\n";
+                    std::cout TID(tid) << "  Max. latency:  " << std::fixed << std::setprecision(3) << metrics.max_latency.value() << "\n";
+                    std::cout TID(tid) << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << metrics.avg_congestion.value() << "\n";
+                    std::cout TID(tid) << "  Max. congestion:  " << std::fixed << std::setprecision(3) << metrics.max_congestion.value() << "\n";
+                    std::cout TID(tid) << "  Connections locality:\n";
+                    std::cout TID(tid) << "    Flat:     " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean << " ar. mean, " << metrics.connections_locality.value().geo_mean << " geo. mean\n";
+                    std::cout TID(tid) << "    Weighted: " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
+                }
             } else {
                 std::cerr TID(tid) << "ERROR, invalid initial placement !!\n";
                 abort(); // should never happen
@@ -533,16 +535,28 @@ int main(int argc, char** argv) {
     }
 
     if (hw.checkPlacementValidity(hg, h_placement, cfg.verbose_errs_and_warns)) {
-        auto metrics = hw.getAllMetrics(hg, h_placement);
-        std::cout << "Placement metrics:\n";
-        std::cout << "  Energy:        " << std::fixed << std::setprecision(3) << metrics.energy.value() << "\n";
-        std::cout << "  Avg. latency:  " << std::fixed << std::setprecision(3) << metrics.avg_latency.value() << "\n";
-        std::cout << "  Max. latency:  " << std::fixed << std::setprecision(3) << metrics.max_latency.value() << "\n";
-        std::cout << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << metrics.avg_congestion.value() << "\n";
-        std::cout << "  Max. congestion:  " << std::fixed << std::setprecision(3) << metrics.max_congestion.value() << "\n";
-        std::cout << "  Connections locality:\n";
-        std::cout << "    Flat:     " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean << " ar. mean, " << metrics.connections_locality.value().geo_mean << " geo. mean\n";
-        std::cout << "    Weighted: " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
+        if (cfg.unicast_metrics) {
+            DBG(cfg) std::cout << "Computing placement unicast metrics...\n";
+            auto uc_metrics = hw.getAllUnicastMetrics(hg, h_placement);
+            std::cout << "Placement unicast metrics:\n";
+            std::cout << "  Energy:        " << std::fixed << std::setprecision(3) << uc_metrics.energy.value() << "\n";
+            std::cout << "  Avg. latency:  " << std::fixed << std::setprecision(3) << uc_metrics.avg_latency.value() << "\n";
+            std::cout << "  Max. latency:  " << std::fixed << std::setprecision(3) << uc_metrics.max_latency.value() << "\n";
+            std::cout << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << uc_metrics.avg_congestion.value() << "\n";
+            std::cout << "  Max. congestion:  " << std::fixed << std::setprecision(3) << uc_metrics.max_congestion.value() << "\n";
+            std::cout << "  Connections locality:\n";
+            std::cout << "    Flat:     " << std::fixed << std::setprecision(3) << uc_metrics.connections_locality.value().ar_mean << " ar. mean, " << uc_metrics.connections_locality.value().geo_mean << " geo. mean\n";
+            std::cout << "    Weighted: " << std::fixed << std::setprecision(3) << uc_metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << uc_metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
+        }
+
+        if (cfg.multicast_metrics) {
+            DBG(cfg) std::cout << "Computing placement multicast metrics...\n";
+            auto mc_metrics = hw.getAllMulticastMetrics(hg, h_placement);
+            std::cout << "Placement multicast metrics:\n";
+            std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << mc_metrics.energy.value() << "\n";
+            std::cout << "  Avg. latency:    " << std::fixed << std::setprecision(3) << mc_metrics.avg_latency.value() << "\n";
+            std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.max_congestion.value() << "\n";
+        }
 
         // save hypergraph
         saveResult(cfg, h_placement);

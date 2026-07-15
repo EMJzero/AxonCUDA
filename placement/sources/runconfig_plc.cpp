@@ -42,6 +42,8 @@ namespace config_plc {
             "      - hilb: Hilbert space-filling curve (default)    - snak: square-ish serpentine sweep\n"
             "      - zord: Z-order curve                            - quad: cyclic quadtree pattern \n"
             "  -ff         Replaces the 1D ordering heuristic with host-side sequential feedforward ordering\n"
+            "  -noum       Disables the evaluation and logging of unicast-based placement quality metrics\n"
+            "  -nomm       Disables the evaluation and logging of multicast-based placement quality metrics (which can be very slow)\n"
             "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
             "  -seed <num> Set the algorithm's seed to <num> (default: " << SEED << ") (ignored when '-ff' is passed)\n"
             "  -v <lvl>    Set the verbosity level: 0 results only, 1 steps and phases, 2 kernel launches, 3 algorithm outputs, 4 debug \n"
@@ -60,6 +62,8 @@ namespace config_plc {
         uint32_t num_host_threads = NUM_HOST_THREADS;
         SpaceFillingCurve space_filling_curve = SpaceFillingCurve::HILB;
         bool feedforward_order = false; // NB: runs sequentially on the HOST!
+        bool unicast_metrics = true;
+        bool multicast_metrics = true;
         bool device_touching_construction = false;
         uint64_t seed = SEED;
         bool verbose_logs = VERBOSE_LOGS;
@@ -105,6 +109,12 @@ namespace config_plc {
                 if (!parseSFC(curve_name, space_filling_curve)) { std::cerr << "Error: -sfc requested an invalid curve name \n"; std::exit(1); }
             } else if (arg == "-ff") {
                 feedforward_order = true;
+            } else if (arg == "-noum") {
+                unicast_metrics = false;
+            } else if (arg == "-nomm") {
+                multicast_metrics = false;
+            } else if (arg == "-ff") {
+                feedforward_order = true;
             } else if (arg == "-dtc") {
                 device_touching_construction = true;
             } else if (arg == "-seed") {
@@ -134,6 +144,8 @@ namespace config_plc {
             num_host_threads,
             space_filling_curve,
             feedforward_order,
+            unicast_metrics,
+            multicast_metrics,
             device_touching_construction,
             seed,
             verbose_logs,

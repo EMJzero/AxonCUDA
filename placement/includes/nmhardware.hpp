@@ -1,9 +1,12 @@
 #pragma once
 #include <cmath>
+#include <queue>
+#include <limits>
 #include <vector>
 #include <cstdint>
 #include <fstream>
 #include <numeric>
+#include <utility>
 #include <iostream>
 #include <optional>
 #include <algorithm>
@@ -248,6 +251,13 @@ namespace hwmodel {
         std::optional<double> max_congestion;
         std::optional<ConnectionsLocalityMetrics> connections_locality;
     };
+
+    struct MulticastPlacementMetrics {
+        bool valid{false};
+        std::optional<double> energy;
+        std::optional<double> avg_latency;
+        std::optional<double> max_congestion;
+    };
     
     struct HardwareModelConfig {
         std::string name;
@@ -379,7 +389,28 @@ namespace hwmodel {
         std::vector<std::vector<double>> expectedSpikeTransitProbability(
             int x_src, int y_src, int x_dst, int y_dst) const;
 
-        PlacementMetrics getAllMetrics(
+        PlacementMetrics getAllUnicastMetrics(
+            const HyperGraph& part_snn,
+            const std::vector<hwgeom::Coord2D>& placement) const;
+
+        double multicastEnergyConsumption(
+            const HyperGraph& part_snn,
+            const std::vector<hwgeom::Coord2D>& placement) const;
+
+        double multicastAverageLatency(
+            const HyperGraph& part_snn,
+            const std::vector<hwgeom::Coord2D>& placement) const;
+
+        // returns congestion indexed as x * coresAlongY() + y
+        std::vector<double> multicastCongestion(
+            const HyperGraph& part_snn,
+            const std::vector<hwgeom::Coord2D>& placement) const;
+
+        double multicastMaximumCongestion(
+            const HyperGraph& part_snn,
+            const std::vector<hwgeom::Coord2D>& placement) const;
+
+        MulticastPlacementMetrics getAllMulticastMetrics(
             const HyperGraph& part_snn,
             const std::vector<hwgeom::Coord2D>& placement) const;
 

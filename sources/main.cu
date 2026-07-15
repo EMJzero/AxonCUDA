@@ -917,6 +917,7 @@ int main(int argc, char** argv) {
 
     if (constr.checkPartitionValidity(hg, partitions, cfg.verbose_errs_and_warns)) {
         // log metrics
+        DBG(cfg) std::cout << "Preparing partitioned hypergraph and computing quality metrics...\n";
         auto partitioned_hg = hg.getPartitionsHypergraph(partitions, 2, true); // remove the destination if self-cycles happen
         auto hedge_overlap = constr.hedgeOverlap(hg, partitions);
         std::cout << "Partitioned hypergraph:\n";
