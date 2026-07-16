@@ -67,31 +67,70 @@ To prepare the input hypergraphs, go under [`hgraphs`](./hgraphs) and run:
 
 # Placement Quality Metrics
 
-<!--Let the input hypergraph be $G = (N, E, \eta)$, with $N$ nodes, $E$ edges, $src(e)$, $dst(e)$ denoting the source (hp: one only) and destinations within each $e \in E$, and $\eta : E \rightarrow \mathbb{R}$ being the weight of each hyperedge.-->
 Let the input hypergraph be $G = (N, E, \eta)$, with $N$ nodes, $E$ edges, $src(e)$ and $dst(e)$ denoting the sources and destinations within each $e \in E$, and $\eta : E \rightarrow \mathbb{R}$ being the weight of each hyperedge.
 Let the target lattice be $H = \{(h_x, h_y) \in \mathbb{N}^2 : 0 \leq h_x < width, 0 \leq h_y < height\}$ and $\gamma : N \rightarrow H$ be the placement function assigning nodes to lattice points.
 
-The costs we consider here are defined as:
-<!--```math
-\begin{align*}
-    &\text{Energy} = \sum_{e \in E} \: \sum_{d \in dst(e)} \eta(e) (\lVert \gamma(src(e)) - \gamma(d) \rVert (E_R + E_T) + E_R) \\
-    &\text{Avg. Latency} = \frac{1}{\sum_{e \in E} \eta(e) \cdot |dst(e)|} \cdot \sum_{e \in E} \: \sum_{d \in dst(e)} \eta(e) (\lVert \gamma(src(e)) - \gamma(d) \rVert(L_R + L_T) + L_R) \\
-    &\text{Avg. congestion} = \frac{1}{|H|} \sum_{e \in E} \: \sum_{d \in dst(e)} \: \eta(e) \sum_{h \in Rect(\gamma(src(e)), \gamma(d))} \tau(h, \gamma(src(e)), \gamma(d))
-\end{align*}
-```-->
+The costs we consider here are presented through two communication models between lattice nodes (aka "compute nodes").
+> Refer to options `-noum` and `-nomm` to disable metrics evaluation for the unicast and multicast models respectively. The multicast model in particular requires solving several minimum Steiner trees and could require several hours to complete.
+
+In both cases, $E_R$, $E_T$, $L_R$, $L_T$ represent the energy and latency, respectively, for routing and transmitting information (e.g. spikes) between lattice points when these model a distributed system.
+
+### Unicast Model Metrics
+
+In the unicast model, every source is assumed to dispatch a unique message towards every destination, and they all propagate independenlty.
+This can be interpreted as an **upper bound** on the traffic volume and congestion.
+
 ```math
 \begin{align*}
-    &\text{Energy} = \sum_{e \in E} \: \sum_{s \in src(e)} \sum_{d \in dst(e)} \eta(e) (\lVert \gamma(s) - \gamma(d) \rVert (E_R + E_T) + E_R) \\
-    &\text{Avg. Latency} = \frac{1}{\sum_{e \in E} \eta(e) \cdot |src(e)| \cdot |dst(e)|} \cdot \sum_{e \in E} \: \sum_{s \in src(e)} \: \sum_{d \in dst(e)} \eta(e) (\lVert \gamma(s) - \gamma(d) \rVert(L_R + L_T) + L_R) \\
-    &\text{Max. Latency} = \max_{e \in E} \: \max_{s \in src(e)} \: \max_{d \in dst(e)} (\lVert \gamma(s) - \gamma(d) \rVert(L_R + L_T) + L_R) \\
+    &\text{Energy} = \sum_{e \in E} \: \sum_{s \in src(e)} \sum_{d \in dst(e)} \eta(e) \cdot \left( dist(\gamma(s), \gamma(d)) \cdot (E_R + E_T) + E_R \right) \\
+    &\text{Avg. Latency} = \frac{1}{\sum_{e \in E} \eta(e) \cdot |src(e)| \cdot |dst(e)|} \cdot \sum_{e \in E} \: \sum_{s \in src(e)} \: \sum_{d \in dst(e)} \eta(e) \cdot \left( dist(\gamma(s), \gamma(d)) \cdot (L_R + L_T) + L_R \right) \\
+    &\text{Max. Latency} = \max_{e \in E} \: \max_{s \in src(e)} \: \max_{d \in dst(e)} \left( dist(\gamma(s), \gamma(d)) \cdot (L_R + L_T) + L_R \right) \\
     &\text{Avg. congestion} = \frac{1}{|H|} \sum_{e \in E} \: \sum_{s \in src(e)} \: \sum_{d \in dst(e)} \: \eta(e) \sum_{h \in Rect(\gamma(s), \gamma(d))} \tau(h, \gamma(s), \gamma(d)) \\
     &\text{Max. congestion} = \max_{h \in H} \sum_{e \in E} \: \sum_{s \in src(e)} \: \sum_{d \in dst(e)} \eta(e) \cdot \tau(h, \gamma(s), \gamma(d))
 \end{align*}
 ```
 
-Where $E_R$, $E_T$, $L_R$, $L_T$ are the energy and latency, respectively, for routing and transmitting information (e.g. spikes) between lattice points when these model a distributed system.
-Meanwhile, $\tau(h, h_s, h_d)$ is the probability of a spike being routed through core $h$ when going from core $h_s$ to $h_d$ (see [this function](./sources/nmhardware.cpp#L322) for details), $Rect(h_1, h_2)$ is the set of lattice points contained in the closed coordinate rectangle defined by the opposite corners $h_1$ and $h_2$, and $\lVert \cdot \rVert$ indicates the Manhattan distance on the lattice.
+Meanwhile, $\tau(h, h_s, h_d)$ is the probability of a spike being routed through core $h$ when going from core $h_s$ to $h_d$ (see [this function](./sources/nmhardware.cpp#L322) for details), $Rect(h_1, h_2)$ is the set of lattice points contained in the closed coordinate rectangle defined by the opposite corners $h_1$ and $h_2$, and $dist(\cdot, \cdot)$ indicates the Manhattan distance on the lattice.
 
+### Multicast Model Metrics
+
+In the ideal multicast model, every source is assumed to emit a single copy of any message, with it prograssively being multicasted, forking along the way to reach all destinations.
+In particular, we assume an ideal multicast fanout tree that thus follows any minimum-span Steiner tree connecting all hyperedge terminals.
+This provides us with an optimistic **lower bound** on the volume of traffic and congestion.
+It follows that this is better than what an actual multicast implementation typically achieves, but any improvement on this lower bound leaves less actually irreducible traffic for any real system to deal with.
+
+Local costs on every hyperedge $e \in E$ or core $h \in H$ are threefold:
+```math
+\begin{align*}
+    & \text{energy}(e) \;= hops(\gamma(e)) \cdot (E_R + E_T) + E_R \\
+    & \text{latency}(e) \;= \!\! \max_{d \in dst(e)} \!\! dist(\gamma(src(e)), \gamma(d)) \cdot (L_R + L_T) + L_R\\
+    & \text{congestion}(h) \;= \textstyle\sum_{e \in E} \: \eta(e) \cdot p\text{-}transit(h, \gamma(e))
+\end{align*}
+```
+Where $dist : H \times H \rightarrow \mathbb{N}$ is the shortest path length on $H$, becoming the the Manhattan distance for a 2D lattice; $hops : \mathcal{P}(H) \rightarrow \mathbb{N}$ counts the lattice edges traversed by a hyperedge to reach all destinations from its source; $p\text{-}transit : H \times \mathcal{P}(H) \rightarrow [0, 1]$ is the probability of a message traversing core $h$ while it propagates between an hyperedge's terminals.
+
+By aggregating these local costs, we define a global communication performance model:
+```math
+\begin{align*}
+    & \text{Tot. Energy} \;=\, \textstyle\sum_{e \in E} \: \eta(e) \cdot \text{energy}(e) \\
+    & \text{Avg. Latency} \;=\, \frac{1}{\sum_{e \in E}\eta(e)} \cdot \textstyle\sum_{e \in E} \eta(e) \cdot \text{latency}(e) \\
+    & \text{Max. Congestion} \;=\, \textstyle\max_{h \in H} \: \text{congestion}(h)
+\end{align*}
+```
+
+The definition of $hops$ and $p\text{-}transit$ depends on routing policies, and are thereby subject to the optimal multicast Steiner tree model, formally:
+```math
+\begin{align*}
+    & T_H(hs) = \{ t \subseteq H : hs \subseteq t \text{ and } t \text{ spans a tree in } H \} \\
+    & T_H^\star(hs) = \arg\min_{t \in T_H(hs)} |t| \\
+    & hops(hs) = |t^\star| - 1 \text{\; for any \;} t^\star \!\in T_H^\star(hs) \\
+    & p\text{-}transit(h, hs) = \frac{|\{t \in T_H^\star(hs) : h \in t\}|}{|T_H^\star(hs)|}
+\end{align*}
+```
+Where $T_H(hs)$ is the set of core sets that support a tree spanning terminals $hs$ over $H$.
+Thus, any $t^\star \!\in T_H^\star(hs)$ encodes a minimum-size Steiner tree containing $|t^\star|-1$ links.
+Terminal roles as sources or destinations do not alter the $T_H^\star(hs)$ set.
+Trees are represented by their core sets; edge variations that induce identical traversals are disregarded, as congestion is modeled lattice point.
 
 # Reference
 

@@ -1,14 +1,17 @@
 #pragma once
 #include <cmath>
 #include <queue>
+#include <tuple>
 #include <limits>
 #include <vector>
 #include <cstdint>
+#include <iomanip>
 #include <fstream>
 #include <numeric>
 #include <utility>
 #include <iostream>
 #include <optional>
+#include <exception>
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_set>
@@ -257,6 +260,8 @@ namespace hwmodel {
         std::optional<double> energy;
         std::optional<double> avg_latency;
         std::optional<double> max_congestion;
+        // fraction of sourced-hyperedge weight for which every source's Steiner tree was solved
+        float evaluation_fraction{0.0f};
     };
     
     struct HardwareModelConfig {

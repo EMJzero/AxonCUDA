@@ -113,8 +113,6 @@ namespace config_plc {
                 unicast_metrics = false;
             } else if (arg == "-nomm") {
                 multicast_metrics = false;
-            } else if (arg == "-ff") {
-                feedforward_order = true;
             } else if (arg == "-dtc") {
                 device_touching_construction = true;
             } else if (arg == "-seed") {

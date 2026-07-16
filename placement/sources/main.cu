@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
     else std::cout << cfg.num_host_threads << "\n";
     std::cout << "  Label propagation repeats:       " << cfg.labelprop_repeats << "\n";
     std::cout << "  Space-filling curve:             " << SFCtoString(cfg.space_filling_curve) << "\n";
-    std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc " : "") << (cfg.feedforward_order ? "ff " : "") << (cfg.unicast_metrics ? "noum " : "") << (cfg.multicast_metrics ? "nomm " : "") << "\n";
+    std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc " : "") << (cfg.feedforward_order ? "ff " : "") << (!cfg.unicast_metrics ? "noum " : "") << (!cfg.multicast_metrics ? "nomm " : "") << "\n";
 
     if (hg.nodes() > hw.coresAlongX() * hw.coresAlongY()) {
         ERR(cfg) std::cerr << "ERROR, the hypergraph has more nodes (" << hg.nodes() << ") than the 2D lattice has points (" << hw.coresAlongX() * hw.coresAlongY() << "), placement would fail !!\n";
@@ -491,10 +491,14 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_hedge_weights));
     CUDA_CHECK(cudaFree(d_best_placement));
     CUDA_CHECK(cudaFree(d_best_inv_placement));
+    CUDA_CHECK(cudaFree(d_1dto2d_placement));
 
     // final sync
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    for (uint32_t i = 0; i < num_threads; ++i)
+        CUDA_CHECK(cudaStreamDestroy(streams[i]));
 
     CUDA_CHECK(cudaEventRecord(d_time_stop));
     CUDA_CHECK(cudaEventSynchronize(d_time_stop));
@@ -556,6 +560,7 @@ int main(int argc, char** argv) {
             std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << mc_metrics.energy.value() << "\n";
             std::cout << "  Avg. latency:    " << std::fixed << std::setprecision(3) << mc_metrics.avg_latency.value() << "\n";
             std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.max_congestion.value() << "\n";
+            std::cout << "  Evaluation fraction: " << std::fixed << std::setprecision(3) << mc_metrics.evaluation_fraction << "\n";
         }
 
         // save hypergraph

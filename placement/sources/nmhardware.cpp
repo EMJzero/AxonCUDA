@@ -1,6 +1,20 @@
 #include "nmhardware.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <semaphore>
 #include <omp.h>
+
+// maximum number of nodes per hyperedge for Steiner tree evaluation
+#define MULTICAST_STEINER_NODE_LIMIT 256u
+
+// maximum wall-time allowed to complete a multicast metrics evaluation
+#define MULTICAST_STEINER_TIME_LIMIT_HOURS 2
+
+// maximum number of memory-intensive frontier solvers allowed to run concurrently
+#define MULTICAST_STEINER_MAX_PARALLEL_SOLVERS 8
+
+static_assert(MULTICAST_STEINER_MAX_PARALLEL_SOLVERS > 0);
 
 namespace hwmodel {
     std::vector<uint32_t> partitionSequential(const HyperGraph& hg, uint32_t N, uint32_t M, uint32_t K) {
@@ -216,15 +230,16 @@ namespace hwmodel {
         double weights_sum = 0.0;
 
         const auto& hedges = part_snn.hedges();
+        const auto& hedges_flat = part_snn.hedgesFlat();
         if (hedges.empty())
             return {};
 
+        std::vector<hwgeom::Coord2D> pts;
         for (const auto& he : hedges) {
-            std::vector<hwgeom::Coord2D> pts;
-            auto nodes = he.nodes();
-            pts.reserve(nodes.size());
-            for (auto n : nodes)
-                pts.push_back(placement[n]);
+            pts.clear();
+            pts.reserve(he.length());
+            for (uint32_t pin = he.offset(); pin < he.offset() + he.length(); ++pin)
+                pts.push_back(placement[hedges_flat[pin]]);
 
             int traversed_cores = hwgeom::intersectionWithConvexHull(pts, static_cast<int>(coresAlongX()), static_cast<int>(coresAlongY()));
 
@@ -446,15 +461,33 @@ namespace hwmodel {
         constexpr uint32_t MAX_STEINER_STATES = 2000000;
         constexpr long double LOG_ZERO = -std::numeric_limits<long double>::infinity();
 
-        struct SteinerStatistics {
-            uint32_t hops{0};
-            std::vector<std::pair<uint32_t, double>> transit_probability;
+        struct SteinerStateLimit {};
+        struct SteinerTimeout {};
+
+        std::counting_semaphore<MULTICAST_STEINER_MAX_PARALLEL_SOLVERS> steiner_solver_slots{
+            MULTICAST_STEINER_MAX_PARALLEL_SOLVERS
+        };
+
+        class SteinerSolverPermit {
+            public:
+            explicit SteinerSolverPermit(const std::chrono::steady_clock::time_point* deadline) {
+                if (deadline != nullptr) {
+                    if (!steiner_solver_slots.try_acquire_until(*deadline))
+                        throw SteinerTimeout{};
+                } else {
+                    steiner_solver_slots.acquire();
+                }
+            }
+
+            ~SteinerSolverPermit() { steiner_solver_slots.release(); }
+
+            SteinerSolverPermit(const SteinerSolverPermit&) = delete;
+            SteinerSolverPermit& operator=(const SteinerSolverPermit&) = delete;
         };
 
         struct FrontierState {
             std::vector<uint16_t> labels;
             bool complete{false};
-
             bool operator==(const FrontierState&) const = default;
         };
 
@@ -478,16 +511,23 @@ namespace hwmodel {
             std::vector<DecisionArc> incoming;
         };
 
-        struct MulticastEvaluation {
+        struct alignas(64) MulticastEvaluation {
             double energy{0.0};
             double weighted_latency{0.0};
             double weight{0.0};
             std::vector<double> congestion;
+            float evaluation_fraction{1.0f};
         };
 
         struct MulticastTask {
             uint32_t hedge;
             uint32_t source;
+        };
+
+        enum class MulticastTaskStatus : uint8_t {
+            pending,
+            completed,
+            state_limited
         };
 
         // numerically stable addition of two values represented in the logarithmic domain
@@ -498,12 +538,18 @@ namespace hwmodel {
             return a + std::log1p(std::exp(b - a));
         }
 
-        // logarithm of the binomial coefficient, used to count minimum two-terminal paths without overflowing
+        // logarithm of the binomial coefficient, backed by a thread-local cache to avoid repeated gamma evaluations
         long double logBinomial(uint32_t n, uint32_t k) {
             if (k > n) return LOG_ZERO;
-            return std::lgamma(static_cast<long double>(n) + 1.0L)
-                 - std::lgamma(static_cast<long double>(k) + 1.0L)
-                 - std::lgamma(static_cast<long double>(n - k) + 1.0L);
+
+            thread_local std::vector<long double> log_factorials{0.0L};
+            if (log_factorials.size() <= n) {
+                size_t old_size = log_factorials.size();
+                log_factorials.resize(static_cast<size_t>(n) + 1u);
+                for (size_t i = old_size; i <= n; ++i)
+                    log_factorials[i] = log_factorials[i - 1u] + std::log(static_cast<long double>(i));
+            }
+            return log_factorials[n] - log_factorials[k] - log_factorials[n - k];
         }
 
         // rename frontier components by first occurrence so equivalent connectivity states compare equal
@@ -519,18 +565,20 @@ namespace hwmodel {
         }
 
         // exact minimum-tree statistics for a set of terminals on a rectangular lattice
-        SteinerStatistics exactSteinerStatistics(
-            std::vector<hwgeom::Coord2D> terminals,
-            uint32_t cores_y
+        uint32_t exactSteinerHops(
+            std::vector<hwgeom::Coord2D>& terminals,
+            uint32_t cores_y,
+            std::vector<double>* congestion,
+            double weight,
+            const std::chrono::steady_clock::time_point* deadline
         ) {
             std::sort(terminals.begin(), terminals.end(), [](const auto& a, const auto& b) {
                 return a.x < b.x || (a.x == b.x && a.y < b.y);
             });
             terminals.erase(std::unique(terminals.begin(), terminals.end()), terminals.end());
 
-            SteinerStatistics result;
             if (terminals.empty())
-                return result;
+                return 0u;
 
             int min_x = terminals.front().x;
             int max_x = terminals.front().x;
@@ -548,14 +596,15 @@ namespace hwmodel {
 
             // a single terminal and collinear terminal sets have one minimum core set
             if (span_x == 1u || span_y == 1u) {
-                result.hops = span_x + span_y - 2u;
-                for (int x = min_x; x <= max_x; ++x) {
-                    for (int y = min_y; y <= max_y; ++y) {
-                        uint32_t core = static_cast<uint32_t>(x) * cores_y + static_cast<uint32_t>(y);
-                        result.transit_probability.emplace_back(core, 1.0);
+                if (congestion != nullptr) {
+                    for (int x = min_x; x <= max_x; ++x) {
+                        for (int y = min_y; y <= max_y; ++y) {
+                            uint32_t core = static_cast<uint32_t>(x) * cores_y + static_cast<uint32_t>(y);
+                            (*congestion)[core] += weight;
+                        }
                     }
                 }
-                return result;
+                return span_x + span_y - 2u;
             }
 
             // every minimum two-terminal tree is a monotone path; binomial products give its core marginals
@@ -567,11 +616,11 @@ namespace hwmodel {
                 const uint32_t distance = total_dx + total_dy;
                 const long double log_paths = logBinomial(distance, total_dx);
 
-                result.hops = distance;
-                result.transit_probability.reserve(static_cast<size_t>(span_x) * span_y);
+                if (congestion == nullptr)
+                    return distance;
+
                 for (int x = min_x; x <= max_x; ++x) {
                     for (int y = min_y; y <= max_y; ++y) {
-                        hwgeom::Coord2D core_coord{x, y};
                         const uint32_t first_dx = static_cast<uint32_t>(std::abs(x - source.x));
                         const uint32_t first_dy = static_cast<uint32_t>(std::abs(y - source.y));
                         const uint32_t second_dx = static_cast<uint32_t>(std::abs(destination.x - x));
@@ -579,12 +628,15 @@ namespace hwmodel {
                         long double log_containing = logBinomial(first_dx + first_dy, first_dx)
                                                    + logBinomial(second_dx + second_dy, second_dx);
                         double probability = static_cast<double>(std::exp(log_containing - log_paths));
-                        uint32_t core = static_cast<uint32_t>(core_coord.x) * cores_y + static_cast<uint32_t>(core_coord.y);
-                        result.transit_probability.emplace_back(core, probability);
+                        uint32_t core = static_cast<uint32_t>(x) * cores_y + static_cast<uint32_t>(y);
+                        (*congestion)[core] += weight * probability;
                     }
                 }
-                return result;
+                return distance;
             }
+
+            // bound concurrent frontier solvers because each can consume hundreds of MB near its state limit
+            SteinerSolverPermit solver_permit(deadline);
 
             // scan along the longest dimension to keep the connectivity frontier as narrow as possible
             const bool transpose = span_y < span_x;
@@ -626,25 +678,35 @@ namespace hwmodel {
                 auto [it, inserted] = next.emplace(std::move(state), static_cast<uint32_t>(nodes.size()));
                 if (inserted) {
                     if (nodes.size() >= MAX_STEINER_STATES)
-                        throw std::runtime_error("Exact Steiner solver exceeded its frontier-state limit.");
-                    nodes.push_back(DecisionNode{cost, {{predecessor, position, included}}});
+                        throw SteinerStateLimit{};
+                    nodes.push_back(DecisionNode{cost, {}});
+                    if (congestion != nullptr)
+                        nodes.back().incoming.push_back({predecessor, position, included});
                 } else {
                     DecisionNode& node = nodes[it->second];
                     if (cost < node.cost) {
                         node.cost = cost;
                         node.incoming.clear();
-                        node.incoming.push_back({predecessor, position, included});
-                    } else if (cost == node.cost) {
+                        if (congestion != nullptr)
+                            node.incoming.push_back({predecessor, position, included});
+                    } else if (cost == node.cost && congestion != nullptr) {
                         node.incoming.push_back({predecessor, position, included});
                     }
                 }
             };
 
             for (uint32_t position = 0; position < area; ++position) {
+                if (deadline != nullptr && std::chrono::steady_clock::now() >= *deadline)
+                    throw SteinerTimeout{};
+
                 const uint32_t column = position % frontier_width;
                 next.clear();
 
+                uint32_t checked_states = 0u;
                 for (const auto& [state, predecessor] : current) {
+                    if (deadline != nullptr && (++checked_states & 1023u) == 0u && std::chrono::steady_clock::now() >= *deadline)
+                        throw SteinerTimeout{};
+
                     // exclude the current core; a closed component can never reconnect later
                     if (!required[position]) {
                         FrontierState excluded = state;
@@ -722,6 +784,10 @@ namespace hwmodel {
             if (accepting.empty())
                 throw std::runtime_error("Exact Steiner solver found no minimum tree.");
 
+            uint32_t hops = optimum - 1u;
+            if (congestion == nullptr)
+                return hops;
+
             std::vector<long double> forward(nodes.size(), LOG_ZERO);
             forward[0] = 0.0L;
             for (uint32_t node_id = 1u; node_id < nodes.size(); ++node_id) {
@@ -748,16 +814,14 @@ namespace hwmodel {
                 }
             }
 
-            result.hops = optimum - 1u;
-            result.transit_probability.reserve(area);
             for (uint32_t position = 0; position < area; ++position) {
                 if (containing_log_count[position] == LOG_ZERO) continue;
                 hwgeom::Coord2D coord = coordAt(position);
                 uint32_t core = static_cast<uint32_t>(coord.x) * cores_y + static_cast<uint32_t>(coord.y);
                 double probability = static_cast<double>(std::exp(containing_log_count[position] - total_log_count));
-                result.transit_probability.emplace_back(core, probability);
+                (*congestion)[core] += weight * probability;
             }
-            return result;
+            return hops;
         }
 
         // evaluate every source-multicast once, optionally accumulating the expensive Steiner-derived metrics
@@ -774,17 +838,42 @@ namespace hwmodel {
             bool need_latency,
             bool need_congestion
         ) {
-            std::vector<MulticastTask> tasks;
-            for (uint32_t hedge = 0; hedge < part_snn.hedges().size(); ++hedge) {
-                const auto& he = part_snn.hedges()[hedge];
+            const auto& hedges = part_snn.hedges();
+            const auto& hedges_flat = part_snn.hedgesFlat();
+            const size_t hedges_count = hedges.size();
+
+            size_t tasks_count = 0u;
+            for (const auto& he : hedges) {
                 if (!std::isfinite(he.weight()))
                     throw std::invalid_argument("Multicast metrics require finite hyperedge weights.");
-                for (uint32_t source : he.sources())
-                    tasks.push_back({hedge, source});
+                tasks_count += he.src_count();
             }
 
+            std::vector<MulticastTask> tasks;
+            tasks.reserve(tasks_count);
+            for (uint32_t hedge = 0; hedge < hedges_count; ++hedge) {
+                const auto& he = hedges[hedge];
+                for (uint32_t source_idx = 0; source_idx < he.src_count(); ++source_idx)
+                    tasks.push_back({hedge, hedges_flat[he.offset() + source_idx]});
+            }
+
+            const bool need_steiner = need_energy || need_congestion;
+            const bool limit_steiner_time = need_steiner && part_snn.nodes() >= MULTICAST_STEINER_NODE_LIMIT;
+            if (limit_steiner_time) {
+                std::stable_sort(tasks.begin(), tasks.end(), [&](const auto& a, const auto& b) {
+                    return hedges[a.hedge].weight() > hedges[b.hedge].weight();
+                });
+            }
+
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::hours(MULTICAST_STEINER_TIME_LIMIT_HOURS);
             const int thread_count = std::max<int>(1, std::min<size_t>(static_cast<size_t>(omp_get_max_threads()), tasks.size()));
             std::vector<MulticastEvaluation> locals(static_cast<size_t>(thread_count));
+            std::vector<MulticastTaskStatus> task_status(
+                need_steiner ? tasks.size() : 0u,
+                MulticastTaskStatus::pending
+            );
+            std::atomic<bool> timed_out{false};
+            std::atomic<bool> stop_requested{false};
             std::exception_ptr failure;
 
             #pragma omp parallel num_threads(thread_count)
@@ -793,47 +882,73 @@ namespace hwmodel {
                 auto& local = locals[static_cast<size_t>(tid)];
                 if (need_congestion)
                     local.congestion.assign(cores_count, 0.0);
+                std::vector<hwgeom::Coord2D> terminals;
 
-                #pragma omp for schedule(dynamic)
+                #pragma omp for schedule(dynamic, 1)
                 for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
+                    if (stop_requested.load(std::memory_order_relaxed))
+                        continue;
+                    if (limit_steiner_time && std::chrono::steady_clock::now() >= deadline) {
+                        timed_out.store(true, std::memory_order_relaxed);
+                        stop_requested.store(true, std::memory_order_relaxed);
+                        continue;
+                    }
+
                     try {
                         const auto& task = tasks[task_idx];
-                        const auto& he = part_snn.hedges()[task.hedge];
+                        const auto& he = hedges[task.hedge];
                         const double weight = static_cast<double>(he.weight());
-                        std::vector<uint32_t> destinations = he.destinations();
+                        const uint32_t destinations_begin = he.offset() + he.src_count();
+                        const uint32_t destinations_end = he.offset() + he.length();
+
+                        double weighted_latency = 0.0;
 
                         if (need_latency) {
                             int max_distance = 0;
-                            for (uint32_t destination : destinations)
+                            for (uint32_t pin = destinations_begin; pin < destinations_end; ++pin) {
+                                uint32_t destination = hedges_flat[pin];
                                 max_distance = std::max(max_distance, hwgeom::manhattan(placement[task.source], placement[destination]));
+                            }
                             double latency = static_cast<double>(max_distance) * (latency_per_routing + latency_per_wire) + latency_per_routing;
-                            local.weight += weight;
-                            local.weighted_latency += weight * latency;
+                            weighted_latency = weight * latency;
                         }
 
-                        if (need_energy || need_congestion) {
-                            std::vector<hwgeom::Coord2D> terminals;
-                            terminals.reserve(destinations.size() + 1u);
+                        double energy = 0.0;
+                        if (need_steiner) {
+                            terminals.clear();
+                            terminals.reserve(static_cast<size_t>(destinations_end - destinations_begin) + 1u);
                             terminals.push_back(placement[task.source]);
-                            for (uint32_t destination : destinations)
-                                terminals.push_back(placement[destination]);
+                            for (uint32_t pin = destinations_begin; pin < destinations_end; ++pin)
+                                terminals.push_back(placement[hedges_flat[pin]]);
 
-                            SteinerStatistics stats = exactSteinerStatistics(std::move(terminals), cores_y);
-                            if (need_energy) {
-                                double energy = static_cast<double>(stats.hops) * (energy_per_routing + energy_per_wire) + energy_per_routing;
-                                local.energy += weight * energy;
-                            }
-                            if (need_congestion) {
-                                for (const auto& [core, probability] : stats.transit_probability)
-                                    local.congestion[core] += weight * probability;
-                            }
+                            uint32_t hops = exactSteinerHops(
+                                terminals, cores_y,
+                                need_congestion ? &local.congestion : nullptr,
+                                weight,
+                                limit_steiner_time ? &deadline : nullptr
+                            );
+                            if (need_energy)
+                                energy = weight * (static_cast<double>(hops) * (energy_per_routing + energy_per_wire) + energy_per_routing);
                         }
+
+                        local.energy += energy;
+                        local.weighted_latency += weighted_latency;
+                        if (need_latency)
+                            local.weight += weight;
+                        if (need_steiner)
+                            task_status[task_idx] = MulticastTaskStatus::completed;
+                    } catch (const SteinerStateLimit&) {
+                        task_status[task_idx] = MulticastTaskStatus::state_limited;
+                    } catch (const SteinerTimeout&) {
+                        timed_out.store(true, std::memory_order_relaxed);
+                        stop_requested.store(true, std::memory_order_relaxed);
                     } catch (...) {
                         #pragma omp critical(multicast_metrics_failure)
                         {
                             if (!failure)
                                 failure = std::current_exception();
                         }
+                        stop_requested.store(true, std::memory_order_relaxed);
                     }
                 }
             }
@@ -841,16 +956,79 @@ namespace hwmodel {
             if (failure)
                 std::rethrow_exception(failure);
 
+            auto summarize_incomplete = [&](const auto& is_incomplete) {
+                std::vector<uint8_t> incomplete_hedges(hedges_count, 0u);
+                for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
+                    if (is_incomplete(task_idx))
+                        incomplete_hedges[tasks[task_idx].hedge] = 1u;
+                }
+
+                size_t incomplete_count = 0u;
+                double incomplete_weight = 0.0;
+                double total_weight = 0.0;
+                for (size_t hedge = 0; hedge < hedges_count; ++hedge) {
+                    if (hedges[hedge].src_count() == 0u)
+                        continue;
+                    total_weight += static_cast<double>(hedges[hedge].weight());
+                    if (incomplete_hedges[hedge]) {
+                        ++incomplete_count;
+                        incomplete_weight += static_cast<double>(hedges[hedge].weight());
+                    }
+                }
+                return std::tuple{incomplete_count, incomplete_weight, total_weight};
+            };
+
+            if (std::find(task_status.begin(), task_status.end(), MulticastTaskStatus::state_limited) != task_status.end()) {
+                auto [incomplete_count, incomplete_weight, total_weight] = summarize_incomplete([&](size_t task_idx) {
+                    return task_status[task_idx] == MulticastTaskStatus::state_limited;
+                });
+                double incomplete_percentage = total_weight != 0.0 ? 100.0 * incomplete_weight / total_weight : 0.0;
+                std::cerr << "WARNING: " << incomplete_count << " hyperedges exceeded the "
+                          << MAX_STEINER_STATES << "-state Steiner limit with cumulative weight "
+                          << std::fixed << std::setprecision(3) << incomplete_weight << " / " << total_weight << " ("
+                          << incomplete_percentage << "% of the total). Excluding them from the reported metrics.\n";
+            }
+
+            if (timed_out.load(std::memory_order_relaxed)) {
+                auto [incomplete_count, incomplete_weight, total_weight] = summarize_incomplete([&](size_t task_idx) {
+                    return task_status[task_idx] != MulticastTaskStatus::completed;
+                });
+                double incomplete_percentage = total_weight != 0.0 ? 100.0 * incomplete_weight / total_weight : 0.0;
+                std::cerr << "WARNING: multicast Steiner evaluation reached its "
+                          << MULTICAST_STEINER_TIME_LIMIT_HOURS << "h time limit; "
+                          << incomplete_count << " hyperedges left with cumulative weight "
+                          << std::fixed << std::setprecision(3) << incomplete_weight << " / " << total_weight << " ("
+                          << incomplete_percentage << "% of the total). Reporting metrics from completed hyperedges.\n";
+            }
+
+            float evaluation_fraction = 1.0f;
+            if (need_steiner) {
+                auto [incomplete_count, incomplete_weight, total_weight] = summarize_incomplete([&](size_t task_idx) {
+                    return task_status[task_idx] != MulticastTaskStatus::completed;
+                });
+                (void)incomplete_count;
+                if (total_weight != 0.0)
+                    evaluation_fraction = static_cast<float>((total_weight - incomplete_weight) / total_weight);
+            }
+
             MulticastEvaluation result;
+            result.evaluation_fraction = evaluation_fraction;
             if (need_congestion)
                 result.congestion.assign(cores_count, 0.0);
             for (const auto& local : locals) {
                 result.energy += local.energy;
                 result.weighted_latency += local.weighted_latency;
                 result.weight += local.weight;
-                if (need_congestion && !local.congestion.empty()) {
-                    for (uint32_t core = 0; core < cores_count; ++core)
-                        result.congestion[core] += local.congestion[core];
+            }
+            if (need_congestion) {
+                #pragma omp parallel for if(cores_count >= 65536u)
+                for (uint32_t core = 0; core < cores_count; ++core) {
+                    double congestion = 0.0;
+                    for (const auto& local : locals) {
+                        if (!local.congestion.empty())
+                            congestion += local.congestion[core];
+                    }
+                    result.congestion[core] = congestion;
                 }
             }
             return result;
@@ -906,6 +1084,7 @@ namespace hwmodel {
         metrics.energy = result.energy;
         metrics.avg_latency = result.weight > 0.0 ? result.weighted_latency / result.weight : 0.0;
         metrics.max_congestion = result.congestion.empty() ? 0.0 : *std::max_element(result.congestion.begin(), result.congestion.end());
+        metrics.evaluation_fraction = result.evaluation_fraction;
         return metrics;
     }
 }
