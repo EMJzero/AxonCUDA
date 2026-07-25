@@ -1,23 +1,33 @@
 #pragma once
 #include <string>
+#include <utility>
 #include <vector>
 #include <cstdint>
 
+#include "topology.hpp"
 #include "nmhardware.hpp"
 
 namespace hgraph {
     class HyperGraph;
 }
 
-namespace hwgeom {
-    struct Coord2D;
-}
-
-namespace hwmodel {
-    class HardwareModel;
-}
-
 namespace config_plc {
+
+    // TODO: change from fixed-dimensionality topologies to topology+N in the CLI arguments
+
+    enum class TargetTopology {
+        LATTICE2D, // 2D lattice -> intrinsic dim. = 2, distance func. = Manhattan
+        TORUS6D, // 6D torus -> intrinsic dim. = 6, distance func. = wrapping Manhattan
+        HYPERCUBE, // N-D hypercube -> intrinsic dim. = 1, distance func. = Hamming
+        HYPERX3D // 3D HyperX -> intrinsic dim. = 3, distance func. = # not-equal dim. (any-radix Hamming)
+    };
+
+    static constexpr std::pair<TargetTopology, const char*> TOPOLOGY_NAMES[] = {
+        { TargetTopology::LATTICE2D, "lat2d" },
+        { TargetTopology::TORUS6D, "tor6d" },
+        { TargetTopology::HYPERCUBE, "hcube" },
+        { TargetTopology::HYPERX3D, "hx3d" }
+    };
 
     enum class SpaceFillingCurve {
         HILB, // Hilbert curve
@@ -33,6 +43,19 @@ namespace config_plc {
         { SpaceFillingCurve::QUAD, "quad" }
     };
 
+    using TopologySupport = uint32_t; // flag bits -> the i-th bit is set if the i-th topology in TargetTopology's order is supported
+
+    static constexpr TopologySupport topologySupport(TargetTopology topology) noexcept {
+        return TopologySupport{1} << static_cast<uint32_t>(topology);
+    }
+
+    static constexpr std::pair<SpaceFillingCurve, TopologySupport> CURVE_TOPOLOGY_SUPPORT[] = {
+        { SpaceFillingCurve::HILB, topologySupport(TargetTopology::LATTICE2D) | topologySupport(TargetTopology::TORUS6D) },
+        { SpaceFillingCurve::SNAK, topologySupport(TargetTopology::LATTICE2D) | topologySupport(TargetTopology::TORUS6D) },
+        { SpaceFillingCurve::ZORD, topologySupport(TargetTopology::LATTICE2D) | topologySupport(TargetTopology::TORUS6D) },
+        { SpaceFillingCurve::QUAD, topologySupport(TargetTopology::LATTICE2D) | topologySupport(TargetTopology::TORUS6D) }
+    };
+
     struct runconfig {
         std::string load_path; // path to the hgraph to load 'n' partition
         std::string save_path; // path where to save the placement data
@@ -42,7 +65,8 @@ namespace config_plc {
         uint32_t candidates_count; // number of candidate swaps proposed per node during force-directed refinement
         uint32_t multi_start_override; // imposes the number of multi-start attempts at placement
         uint32_t num_host_threads; // imposes the number of host threads and GPU streams to spawn to handle the multi-start attempts
-        SpaceFillingCurve space_filling_curve; // space filling curve to use for the 1D-to-2D locality-preserving mapping
+        TargetTopology topology; // target graph topology, how places are interconnected
+        SpaceFillingCurve space_filling_curve; // space filling curve to use for the 1D-to-(N)D locality-preserving mapping
         bool feedforward_order; // if true, use the greedy sequential feedforward initial partitioning (runs on the host !!)
         bool unicast_metrics; // if true, compute and log the unicast-based placement quality metrics
         bool multicast_metrics; // if true, compute and log the multicast-based (Steiner tree involved!!) placement quality metrics
@@ -61,11 +85,19 @@ namespace config_plc {
 
     hgraph::HyperGraph loadHgraph(runconfig &cfg);
 
-    hwmodel::HardwareModel setupNMH(runconfig &cfg);
+    template<topology::Topology T>
+    hwmodel::HardwareModel<T> setupNMH(runconfig &cfg);
 
-    void saveResult(runconfig &cfg, std::vector<hwgeom::Coord2D> h_placement);
+    template<topology::Topology T>
+    void saveResult(runconfig &cfg, std::vector<topology::Coord_t<T>> h_placement);
+
+    const char* topologyToString(TargetTopology topology);
+
+    bool parseTopology(const std::string& name, TargetTopology& topology);
 
     const char* SFCtoString(SpaceFillingCurve curve);
 
     bool parseSFC(const std::string& name, SpaceFillingCurve& curve);
+
+    bool validateTopologySFC(TargetTopology topology, SpaceFillingCurve curve);
 }

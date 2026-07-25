@@ -782,7 +782,7 @@ int main(int argc, char** argv) {
         );
 
         return std::make_tuple(num_partitions, d_partitions);
-    };
+    }; // coarsen_refine_uncoarsen end
 
 
     // START: the multi-level recursive refinement routine, down we go!

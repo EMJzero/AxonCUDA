@@ -4,16 +4,7 @@
 #include <stdint.h>
 
 // USED BY: everyone
-
-typedef struct __align__(8) {
-    int32_t x;
-    int32_t y;
-} coords;
-
-typedef struct __align__(8) {
-    uint32_t w;
-    uint32_t h;
-} dimensions;
+// nothing for now :)
 
 
 // USED BY: event kernels

@@ -1,12 +1,13 @@
 #include <tuple>
 #include <vector>
-#include <iostream>
 #include <iomanip>
+#include <iostream>
 #include <algorithm>
 #include <unordered_map>
 
 #include "thruster.cuh"
 
+#include "topology.hpp"
 #include "runconfig_plc.hpp"
 
 #include "utils.cuh"
@@ -14,6 +15,7 @@
 #include "defines_plc.cuh"
 #include "placement.cuh"
 
+template<Topology T>
 void forceDirectedRefinement(
     const runconfig &cfg,
     const cudaDeviceProp props,
@@ -23,7 +25,7 @@ void forceDirectedRefinement(
     const dim_t* d_touching_offsets,
     const float* d_hedge_weights,
     const uint32_t num_nodes,
-    coords* d_placement,
+    Coord_t<T>* d_placement,
     uint32_t* d_inv_placement,
     const cudaStream_t stream,
     const int tid
@@ -80,7 +82,7 @@ void forceDirectedRefinement(
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - forces kernel
             LAUNCH(cfg) TID(tid) RUN << "forces kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            forces_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            forces_kernel<T><<<blocks, threads_per_block, 0, stream>>>(
                 d_hedges,
                 d_hedges_offsets,
                 d_touching,
@@ -96,7 +98,7 @@ void forceDirectedRefinement(
 
         // =============================
         // print some temporary results
-        LOG(cfg) logForces(
+        LOG(cfg) logForces<T>(
             d_forces,
             num_nodes,
             stream,
@@ -112,7 +114,7 @@ void forceDirectedRefinement(
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - tensions kernel
             LAUNCH(cfg) TID(tid) RUN << "tensions kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            tensions_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            tensions_kernel<T><<<blocks, threads_per_block, 0, stream>>>(
                 d_placement,
                 d_inv_placement,
                 d_forces,
@@ -127,7 +129,7 @@ void forceDirectedRefinement(
 
         // =============================
         // print some temporary results
-        LOG(cfg) logTensions(
+        LOG(cfg) logTensions<T>(
             cfg,
             d_pairs,
             d_scores,
@@ -151,7 +153,7 @@ void forceDirectedRefinement(
             size_t shared_bytes = threads_per_block * bytes_per_thread;
             // additional checks for the cooperative kernel mode
             int blocks_per_SM = 0;
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_SM, exclusive_swaps_kernel, threads_per_block, shared_bytes);
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_SM, exclusive_swaps_kernel<T>, threads_per_block, shared_bytes);
             int max_blocks = blocks_per_SM * props.multiProcessorCount;
             if (blocks > max_blocks) {
                 const uint32_t num_repeats = (blocks + max_blocks - 1) / max_blocks;
@@ -172,14 +174,14 @@ void forceDirectedRefinement(
                 (void*)&d_swap_slots,
                 (void*)&d_swap_flags
             };
-            cudaLaunchCooperativeKernel((void*)exclusive_swaps_kernel, blocks, threads_per_block, kernel_args, shared_bytes, stream);
+            cudaLaunchCooperativeKernel((void*)exclusive_swaps_kernel<T>, blocks, threads_per_block, kernel_args, shared_bytes, stream);
             DBG(cfg) CUDA_CHECK(cudaGetLastError());
             DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         // =============================
         // print some temporary results
-        LOG(cfg) logSwapPairs(
+        LOG(cfg) logSwapPairs<T>(
             d_swap_slots,
             d_swap_flags,
             num_nodes,
@@ -219,7 +221,7 @@ void forceDirectedRefinement(
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - events kernel
             LAUNCH(cfg) TID(tid) RUN << "events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            swap_events_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            swap_events_kernel<T><<<blocks, threads_per_block, 0, stream>>>(
                 d_swap_slots,
                 d_swap_flags,
                 num_nodes,
@@ -253,7 +255,7 @@ void forceDirectedRefinement(
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - scatter ranks kernel
             LAUNCH(cfg) TID(tid) RUN << "scatter ranks kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            scatter_ranks_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            scatter_ranks_kernel<T><<<blocks, threads_per_block, 0, stream>>>(
                 d_ev_swaps,
                 num_events,
                 d_nodes_rank
@@ -270,7 +272,7 @@ void forceDirectedRefinement(
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
             // launch - cascade kernel
             LAUNCH(cfg) TID(tid) RUN << "cascade kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            cascade_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            cascade_kernel<T><<<blocks, threads_per_block, 0, stream>>>(
                 d_hedges,
                 d_hedges_offsets,
                 d_touching,
@@ -326,7 +328,7 @@ void forceDirectedRefinement(
             int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             // launch - apply swaps kernel
             LAUNCH(cfg) TID(tid) RUN << "apply swaps kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            apply_swaps_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            apply_swaps_kernel<T><<<blocks, threads_per_block, 0, stream>>>(
                 d_ev_swaps,
                 num_good_swaps,
                 d_placement,
@@ -349,9 +351,10 @@ void forceDirectedRefinement(
 }
 
 // return the weighted average hedge max src-dst manhattan distance and weighted average hedge Steiner tree span (<2x upper bound)
+template<Topology T>
 std::tuple<float, float> getLocalityMetrics(
     const runconfig &cfg,
-    const coords* d_placement,
+    const Coord_t<T>* d_placement,
     const uint32_t* d_hedges,
     const dim_t* d_hedges_offsets,
     const uint32_t* d_srcs_count,
@@ -399,7 +402,7 @@ std::tuple<float, float> getLocalityMetrics(
         //LAUNCH(cfg) TID(tid) RUN << "max src-dst distance kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         LAUNCH(cfg) TID(tid) RUN << "tot src-dst distance kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         //max_src_dst_distance_kernel<<<blocks, threads_per_block, 0, stream>>>(
-        tot_src_dst_distance_kernel<<<blocks, threads_per_block, 0, stream>>>(
+        tot_src_dst_distance_kernel<T><<<blocks, threads_per_block, 0, stream>>>(
             d_placement,
             d_hedges,
             d_hedges_offsets,
@@ -423,7 +426,7 @@ std::tuple<float, float> getLocalityMetrics(
         int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
         // launch - min spanning tree weight kernel
         LAUNCH(cfg) TID(tid) RUN << "min spanning tree weight kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        min_spanning_tree_weight_kernel<<<blocks, threads_per_block, 0, stream>>>(
+        min_spanning_tree_weight_kernel<T><<<blocks, threads_per_block, 0, stream>>>(
             d_placement,
             d_hedges,
             d_hedges_offsets,
@@ -445,6 +448,7 @@ std::tuple<float, float> getLocalityMetrics(
 
 // LOGGING
 
+template<Topology T>
 void logForces(
     const float *d_forces,
     const uint32_t num_nodes,
@@ -457,15 +461,15 @@ void logForces(
     std::cout TID(tid) << "Forces:\n";
     for (uint32_t i = 0; i < num_nodes; ++i) {
         if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
-            std::cout TID(tid) << "  node " << i << " ->";
-            std::cout << " (" << forces_tmp[4 * i + LEFT] << " LEFT)";
-            std::cout << " (" << forces_tmp[4 * i + RIGHT] << " RIGHT)";
-            std::cout << " (" << forces_tmp[4 * i + UP] << " UP)";
-            std::cout << " (" << forces_tmp[4 * i + DOWN] << " DOWN)\n";
+            std::cout TID(tid) << "  node " << i << " -> " << forces_tmp[T::neighborsCount() * i];
+            for (uint32_t neigh_idx = 1; neigh_idx < T::neighborsCount(); neigh_idx++)
+                std::cout << ", " << forces_tmp[T::neighborsCount() * i + neigh_idx];
+            std::cout << "\n";
         }
     }
 }
 
+template<Topology T>
 void logTensions(
     const runconfig &cfg,
     const uint32_t *d_pairs,
@@ -488,10 +492,7 @@ void logTensions(
                 uint32_t target = pairs_tmp[i * cfg.candidates_count + j];
                 uint32_t score = scores_tmp[i * cfg.candidates_count + j];
                 if (target == UINT32_MAX) std::cout << " (" << j << " target=none score=" << score << ")";
-                else if (target == UINT32_MAX - LEFT) std::cout << " (" << j << " target=LEFT score=" << score << ")";
-                else if (target == UINT32_MAX - RIGHT) std::cout << " (" << j << " target=RIGHT score=" << score << ")";
-                else if (target == UINT32_MAX - UP) std::cout << " (" << j << " target=UP score=" << score << ")";
-                else if (target == UINT32_MAX - DOWN) std::cout << " (" << j << " target=DOWN score=" << score << ")";
+                else if (target >= UINT32_MAX - T::neighborsCount()) std::cout << " (" << j << " target=NEIGH(" << UINT32_MAX - target - 1 << ") score=" << score << ")";
                 else std::cout << " (" << j << " target=" << target << " score=" << score << ")";
             }
             std::cout << "\n";
@@ -499,6 +500,7 @@ void logTensions(
     }
 }
 
+template<Topology T>
 void logSwapPairs(
     const slot *d_swap_slots,
     const uint32_t *d_swap_flags,
@@ -516,10 +518,7 @@ void logSwapPairs(
         if (i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH)) {
             slot node_slot = slots_tmp[i];
             if (node_slot.id == UINT32_MAX) std::cout TID(tid) << "  node " << i << " -> target=none score=" << node_slot.score << " flag=" << flags_tmp[i] << "\n";
-            else if (node_slot.id == UINT32_MAX - LEFT) std::cout TID(tid) << "  node " << i << " -> target=LEFT score=" << node_slot.score << " flag=" << flags_tmp[i] << "\n";
-            else if (node_slot.id == UINT32_MAX - RIGHT) std::cout TID(tid) << "  node " << i << " -> target=RIGHT score=" << node_slot.score << " flag=" << flags_tmp[i] << "\n";
-            else if (node_slot.id == UINT32_MAX - UP) std::cout TID(tid) << "  node " << i << " -> target=UP score=" << node_slot.score << " flag=" << flags_tmp[i] << "\n";
-            else if (node_slot.id == UINT32_MAX - DOWN) std::cout TID(tid) << "  node " << i << " -> target=DOWN score=" << node_slot.score << " flag=" << flags_tmp[i] << "\n";
+            else if (node_slot.id >= UINT32_MAX - T::neighborsCount()) std::cout TID(tid) << "  node " << i << " -> target=NEIGH(" << UINT32_MAX - node_slot.id - 1 << ") score=" << node_slot.score << " flag=" << flags_tmp[i] << "\n";
             else std::cout TID(tid) << "  node " << i << " -> target=" << node_slot.id << " score=" << node_slot.score << " flag=" << flags_tmp[i] << "\n";
         }
     }
@@ -529,7 +528,7 @@ void logEvents(
     const swap *d_ev_swaps,
     const float *d_ev_scores,
     const uint32_t num_nodes,
-    const  std::string flare,
+    const std::string flare,
     const cudaStream_t stream,
     const int tid
 ) {
@@ -547,3 +546,25 @@ void logEvents(
         }
     }
 }
+
+// TEMPLATE INSTANTIATIONS
+
+#define INSTANTIATE_PLACEMENT_FUNCTIONS(T) \
+    template void forceDirectedRefinement<T>( \
+        const runconfig&, cudaDeviceProp, \
+        const uint32_t*, const dim_t*, \
+        const uint32_t*, const dim_t*, \
+        const float*, uint32_t, \
+        Coord_t<T>*, uint32_t*, \
+        cudaStream_t, int); \
+ \
+    template std::tuple<float, float> getLocalityMetrics<T>( \
+        const runconfig&, const Coord_t<T>*, \
+        const uint32_t*, const dim_t*, \
+        const uint32_t*, const float*, \
+        uint32_t, cudaStream_t, int);
+
+INSTANTIATE_PLACEMENT_FUNCTIONS(Lattice2D)
+INSTANTIATE_PLACEMENT_FUNCTIONS(Torus6D)
+
+#undef INSTANTIATE_PLACEMENT_FUNCTIONS

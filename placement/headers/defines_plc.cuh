@@ -19,10 +19,6 @@
 
 #define SEED 86u
 
-#define LEFT 0
-#define RIGHT 1
-#define UP 2
-#define DOWN 3
 
 // TODO: infer this at runtime, make it a device-side constant
 //       => infer it especially from the hardware width/height, that determine the manhattan distance range

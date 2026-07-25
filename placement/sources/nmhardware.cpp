@@ -1,8 +1,18 @@
+#include <tuple>
+#include <cmath>
+#include <chrono>
+#include <atomic>
+#include <limits>
+#include <iomanip>
+#include <iostream>
+#include <exception>
+#include <algorithm>
+#include <semaphore>
+#include <unordered_map>
+#include <unordered_set>
+
 #include "nmhardware.hpp"
 
-#include <atomic>
-#include <chrono>
-#include <semaphore>
 #include <omp.h>
 
 // maximum number of nodes per hyperedge for Steiner tree evaluation
@@ -17,6 +27,7 @@
 static_assert(MULTICAST_STEINER_MAX_PARALLEL_SOLVERS > 0);
 
 namespace hwmodel {
+
     std::vector<uint32_t> partitionSequential(const HyperGraph& hg, uint32_t N, uint32_t M, uint32_t K) {
         std::vector<uint32_t> partitioning;
         partitioning.reserve(hg.nodes());
@@ -48,50 +59,47 @@ namespace hwmodel {
         return partitioning;
     }
 
-    bool HardwareModel::checkSnnFit(const HyperGraph& snn, bool already_partitioned, bool verbose) const {
+    template<Topology T>
+    bool HardwareModel<T>::checkHgraphFit(const HyperGraph& hgraph, bool already_partitioned, bool verbose) const {
         if (already_partitioned) {
-            if (snn.nodes() > coresCount()) {
-                if (verbose)
-                    std::cout << "SNN CAN'T FIT ON THE HW: more neuron clusters than the HW cores\n";
+            if (hgraph.nodes() > coresCount()) {
+                if (verbose) std::cout << "HYPERGRAPH CAN'T FIT ON THE HW: more partitions than the HW cores\n";
                 return false;
             }
-            for (std::uint32_t n = 0; n < snn.nodes(); ++n) {
-                if (snn.inboundIds(n).size() > synapses_per_core_) {
-                    if (verbose)
-                        std::cout << "SNN CAN'T FIT ON THE HW: more inbound synapses on a neuron cluster than the HW can handle\n";
+            for (std::uint32_t n = 0; n < hgraph.nodes(); ++n) {
+                if (hgraph.inboundIds(n).size() > synapses_per_core_) {
+                    if (verbose) std::cout << "HYPERGRAPH CAN'T FIT ON THE HW: more inbound hyperedges on a partition than the HW can handle\n";
                     return false;
                 }
             }
             return true;
         }
 
-        if (snn.nodes() > coresCount() * neurons_per_core_) {
-            if (verbose)
-                std::cout << "SNN CAN'T FIT ON THE HW: more neurons than the HW can house\n";
+        if (hgraph.nodes() > coresCount() * nodes_per_core_) {
+            if (verbose) std::cout << "HYPERGRAPH CAN'T FIT ON THE HW: more nodes than the HW can collectively handle\n";
             return false;
         }
 
-        for (std::uint32_t n = 0; n < snn.nodes(); ++n) {
-            if (snn.inboundIds(n).size() > synapses_per_core_) {
-                if (verbose)
-                    std::cout << "SNN CAN'T FIT ON THE HW: more inbound synapses on a single neuron than the HW can handle\n";
+        for (std::uint32_t n = 0; n < hgraph.nodes(); ++n) {
+            if (hgraph.inboundIds(n).size() > synapses_per_core_) {
+                if (verbose) std::cout << "HYPERGRAPH CAN'T FIT ON THE HW: more inbound hyperedges on a single node than the HW can handle\n";
                 return false;
             }
         }
 
         try {
-            (void)partitionSequential(snn, neurons_per_core_, synapses_per_core_, coresCount());
+            (void)partitionSequential(hgraph, nodes_per_core_, synapses_per_core_, coresCount());
         } catch (...) {
-            if (verbose)
-                std::cout << "SNN WON'T LIKELY FIT ON THE HW: no valid way to split neurons (and their synapses) among cores\n";
+            if (verbose) std::cout << "HYPERGRAPH WON'T LIKELY FIT ON THE HW: the greedy split of nodes (and their pins) among cores failed\n";
             return false;
         }
         return true;
     }
 
-    bool HardwareModel::checkPartitionValidity(const HyperGraph& snn, const std::vector<uint32_t>& partitions, bool verbose) const {
-        if (partitions.size() != snn.nodes())
-            throw std::runtime_error("Each neuron must be assigned to a partition (" + std::to_string(snn.nodes()) + " neuron != " + std::to_string(partitions.size()) + " part).");
+    template<Topology T>
+    bool HardwareModel<T>::checkPartitionValidity(const HyperGraph& hgraph, const std::vector<uint32_t>& partitions, bool verbose) const {
+        if (partitions.size() != hgraph.nodes())
+            throw std::runtime_error("Each node must be assigned to a partition (" + std::to_string(hgraph.nodes()) + " node != " + std::to_string(partitions.size()) + " part).");
 
         // count neurons per partition and distinct partitions
         std::unordered_map<uint32_t, uint32_t> partitions_counter;
@@ -102,16 +110,14 @@ namespace hwmodel {
 
         const uint32_t partitions_count = partitions_counter.size();
         if (partitions_count > coresCount()) {
-            if (verbose)
-                std::cout << "INVALID PARTITIONING: more partitions (" << partitions_count << ") than cores (" << coresCount() << ")\n";
+            if (verbose) std::cout << "INVALID PARTITIONING: more partitions (" << partitions_count << ") than cores (" << coresCount() << ")\n";
             return false;
         }
 
         // neurons per partition constraint
         for (const auto& kv : partitions_counter) {
-            if (kv.second > neurons_per_core_) {
-                if (verbose)
-                    std::cout << "INVALID PARTITIONING: more neurons per partition (" << kv.second << ") than a core can store (" << neurons_per_core_ << ")\n";
+            if (kv.second > nodes_per_core_) {
+                if (verbose) std::cout << "INVALID PARTITIONING: more node per partition (" << kv.second << ") than a core can store (" << nodes_per_core_ << ")\n";
                 return false;
             }
         }
@@ -125,7 +131,7 @@ namespace hwmodel {
         std::vector<uint32_t> synapses_per_partition(partitions_count, 0);
 
         // for each hyperedge, count distinct inbound synapses per partition
-        for (const auto& he : snn.hedges()) {
+        for (const auto& he : hgraph.hedges()) {
             std::unordered_set<uint32_t> already_seen;
             already_seen.reserve(he.length());
 
@@ -140,43 +146,37 @@ namespace hwmodel {
 
         for (uint32_t i = 0; i < partitions_count; ++i) {
             if (synapses_per_partition[i] > synapses_per_core_) {
-                if (verbose)
-                    std::cout << "INVALID PARTITIONING: more inbound synapses per partition (" << synapses_per_partition[i] << ") than a core can handle (" << synapses_per_core_ << ")\n";
+                if (verbose) std::cout << "INVALID PARTITIONING: more inbound hyperedges per partition (" << synapses_per_partition[i] << ") than a core can handle (" << synapses_per_core_ << ")\n";
                 return false;
             }
         }
         return true;
     }
 
-    bool HardwareModel::checkPlacementValidity(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement, bool verbose) const {
-        if (placement.size() != part_snn.nodes())
-            throw std::runtime_error("Each partition must be assigned to a core (" + std::to_string(part_snn.nodes()) + " part != " + std::to_string(placement.size()) + " plac).");
+    template<Topology T>
+    bool HardwareModel<T>::checkPlacementValidity(const HyperGraph& part_hgraph, const std::vector<Coord>& placement, bool verbose) const {
+        if (placement.size() != part_hgraph.nodes())
+            throw std::runtime_error("Each partition must be assigned to a core (" + std::to_string(part_hgraph.nodes()) + " part != " + std::to_string(placement.size()) + " plac).");
 
-        std::unordered_set<hwgeom::Coord2D, hwgeom::Coord2DHash> seen_cores;
+        std::unordered_set<Coord> seen_cores;
         seen_cores.reserve(placement.size());
 
-        const uint32_t max_x = coresAlongX();
-        const uint32_t max_y = coresAlongY();
-
         for (const auto& core : placement) {
-            if (core.x < 0 || core.y < 0 ||
-                static_cast<uint32_t>(core.x) >= max_x ||
-                static_cast<uint32_t>(core.y) >= max_y) {
-                if (verbose)
-                    std::cout << "INVALID PLACEMENT: a core's coordinates are out of the hardware's range\n";
+            if (!topology_.contains(core)) {
+                if (verbose) std::cout << "INVALID PLACEMENT: a core's coordinates are outside the hardware topology\n";
                 return false;
             }
             auto [it, inserted] = seen_cores.insert(core);
             if (!inserted) {
-                if (verbose)
-                    std::cout << "INVALID PLACEMENT: a core is used more than once\n";
+                if (verbose) std::cout << "INVALID PLACEMENT: a core is used more than once\n";
                 return false;
             }
         }
         return true;
     }
 
-    SynapticReuseMetrics HardwareModel::synapticReuse(const HyperGraph& snn, const std::vector<uint32_t>& partitions) const {
+    template<Topology T>
+    SynapticReuseMetrics HardwareModel<T>::synapticReuse(const HyperGraph& hgraph, const std::vector<uint32_t>& partitions) const {
         if (partitions.empty())
             return {};
 
@@ -186,7 +186,7 @@ namespace hwmodel {
         std::vector<uint64_t> synapses_count(partitions_count, 0);
         std::vector<uint64_t> axons_count(partitions_count, 0);
 
-        for (const auto& he : snn.hedges()) {
+        for (const auto& he : hgraph.hedges()) {
             std::unordered_set<uint32_t> already_seen;
             already_seen.reserve(he.length());
 
@@ -222,64 +222,82 @@ namespace hwmodel {
         return SynapticReuseMetrics{ar_mean, geo_mean};
     }
 
-    ConnectionsLocalityMetrics HardwareModel::connectionsLocality(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
+    template<Topology T>
+    ConnectionsLocalityMetrics HardwareModel<T>::connectionsLocality(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
         double ar_mean = 0.0;
         double geo_mean = 0.0;
         double ar_mean_weighted = 0.0;
         double geo_mean_weighted = 0.0;
         double weights_sum = 0.0;
 
-        const auto& hedges = part_snn.hedges();
-        const auto& hedges_flat = part_snn.hedgesFlat();
+        const auto& hedges = part_hgraph.hedges();
+        const auto& hedges_flat = part_hgraph.hedgesFlat();
         if (hedges.empty())
             return {};
 
-        std::vector<hwgeom::Coord2D> pts;
-        for (const auto& he : hedges) {
-            pts.clear();
-            pts.reserve(he.length());
-            for (uint32_t pin = he.offset(); pin < he.offset() + he.length(); ++pin)
-                pts.push_back(placement[hedges_flat[pin]]);
+        Coord min, max;
+        min.setAll(std::numeric_limits<int>::max());
+        max.setAll(0);
+        for (const auto& hyperedge : hedges) {
+            for (uint32_t pin = hyperedge.offset(); pin < hyperedge.offset() + hyperedge.length(); ++pin) {
+                Coord plc = placement[hedges_flat[pin]];
+                min = min.componentWiseMin(plc);
+                max = max.componentWiseMax(plc);
+            }
 
-            int traversed_cores = hwgeom::intersectionWithConvexHull(pts, static_cast<int>(coresAlongX()), static_cast<int>(coresAlongY()));
-
-            // should not happen for a valid placement, but ...
-            if (traversed_cores <= 0)
-                continue;
-
-            double t = static_cast<double>(traversed_cores);
-            double w = static_cast<double>(he.weight());
-
-            ar_mean += t;
-            geo_mean += std::log(t);
-            ar_mean_weighted += t * w;
-            geo_mean_weighted += std::log(t) * w;
-            weights_sum += w;
+            const double volume = static_cast<double>((max - min).volume());
+            const double weight = static_cast<double>(hyperedge.weight());
+            ar_mean += volume;
+            geo_mean += std::log(volume);
+            ar_mean_weighted += volume * weight;
+            geo_mean_weighted += std::log(volume) * weight;
+            weights_sum += weight;
         }
 
-        uint32_t hedge_count = hedges.size();
-        ar_mean /= static_cast<double>(hedge_count);
-        geo_mean = std::exp(geo_mean / static_cast<double>(hedge_count));
-
+        const double hedge_count = static_cast<double>(hedges.size());
+        ar_mean /= hedge_count;
+        geo_mean = std::exp(geo_mean / hedge_count);
         if (weights_sum > 0.0) {
             ar_mean_weighted /= weights_sum;
             geo_mean_weighted = std::exp(geo_mean_weighted / weights_sum);
         }
 
-        return ConnectionsLocalityMetrics{ar_mean, geo_mean, ar_mean_weighted, geo_mean_weighted};
+        return {ar_mean, geo_mean, ar_mean_weighted, geo_mean_weighted};
     }
 
-    double HardwareModel::placementEnergyConsumption(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
+    template<Topology T>
+    std::unordered_map<typename HardwareModel<T>::Coord, double> HardwareModel<T>::expectedSpikeTransitProbability(const Coord& src, const Coord& dst) const {
+        // NOTE: updated formulation, now differing from Jin et al.
+        // => every minimum-distance path between source and destination is considered equally likely
+        // =>=> the probability of a core being traversed equates the number of minimum paths including it vs the total number of minimum paths
+
+        const auto paths = topology_.iterMinimumPaths(src, dst);
+        if (paths.empty())
+            throw std::runtime_error("Topology returned no minimum path between two placement coordinates.");
+
+        std::unordered_map<Coord, double> probabilities;
+        for (const auto& path : paths) {
+            for (const Coord& coordinate : path)
+                ++probabilities[coordinate];
+        }
+
+        const double path_count = static_cast<double>(paths.size());
+        for (auto& entry : probabilities)
+            entry.second /= path_count;
+
+        return probabilities;
+    }
+
+    template<Topology T>
+    double HardwareModel<T>::placementEnergyConsumption(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
         double result = 0.0;
 
-        for (const auto& he : part_snn.hedges()) {
+        for (const auto& he : part_hgraph.hedges()) {
             for (const auto src : he.sources()) {
                 const auto& src_core = placement[src];
-
                 for (auto dst : he.destinations()) {
                     const auto& dst_core = placement[dst];
-                    int manhattan_distance = hwgeom::manhattan(src_core, dst_core);
-                    double md = static_cast<double>(manhattan_distance);
+                    double md = static_cast<double>(topology_.distance(src_core, dst_core));
                     result += static_cast<double>(he.weight()) * ((md + 1.0) * energy_per_routing_ + md * energy_per_wire_);
                 }
             }
@@ -288,11 +306,12 @@ namespace hwmodel {
         return result;
     }
 
-    double HardwareModel::placementAverageLatency(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
+    template<Topology T>
+    double HardwareModel<T>::placementAverageLatency(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
         double result = 0.0;
         double tot_spike_frequency = 0.0;
 
-        for (const auto& he : part_snn.hedges()) {
+        for (const auto& he : part_hgraph.hedges()) {
             for (const auto src : he.sources()) {
                 const auto& src_core = placement[src];
 
@@ -302,8 +321,7 @@ namespace hwmodel {
 
                 for (auto dst : he.destinations()) {
                     const auto& dst_core = placement[dst];
-                    int manhattan_distance = hwgeom::manhattan(src_core, dst_core);
-                    double md = static_cast<double>(manhattan_distance);
+                    double md = static_cast<double>(topology_.distance(src_core, dst_core));
                     result += w * ((md + 1.0) * latency_per_routing_ + md * latency_per_wire_);
                 }
             }
@@ -314,17 +332,17 @@ namespace hwmodel {
         return 0.0;
     }
 
-    double HardwareModel::placementMaximumLatency(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
+    template<Topology T>
+    double HardwareModel<T>::placementMaximumLatency(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
         double result = 0.0;
 
-        for (const auto& he : part_snn.hedges()) {
+        for (const auto& he : part_hgraph.hedges()) {
             for (const auto src : he.sources()) {
                 const auto& src_core = placement[src];
 
                 for (auto dst : he.destinations()) {
                     const auto& dst_core = placement[dst];
-                    int manhattan_distance = hwgeom::manhattan(src_core, dst_core);
-                    double md = static_cast<double>(manhattan_distance);
+                    double md = static_cast<double>(topology_.distance(src_core, dst_core));
                     double latency = (md + 1.0) * latency_per_routing_ + md * latency_per_wire_;
                     if (latency > result)
                         result = latency;
@@ -335,62 +353,18 @@ namespace hwmodel {
         return result;
     }
 
-    std::vector<std::vector<double>> HardwareModel::expectedSpikeTransitProbability(int x_src, int y_src, int x_dst, int y_dst) const {
-        int width  = std::abs(x_dst - x_src) + 1;
-        int height = std::abs(y_dst - y_src) + 1;
-
-        std::vector<std::vector<double>> matrix(width, std::vector<double>(height, 0.0));
-
-        const int x_base = std::min(x_src, x_dst);
-        const int y_base = std::min(y_src, y_dst);
-        x_src -= x_base;
-        x_dst -= x_base;
-        y_src -= y_base;
-        y_dst -= y_base;
-
-        matrix[x_src][y_src] = 1.0;
-
-        int x_sign = (x_src == 0) ? 1 : -1;
-        int y_sign = (y_src == 0) ? 1 : -1;
-
-        auto diag_points = hwgeom::iterMajorDiagonals(x_src, y_src, x_dst, y_dst, true);
-
-        for (const auto& p : diag_points) {
-            int x = p.x;
-            int y = p.y;
-
-            if (x == x_dst && y != y_dst) {
-                matrix[x][y + y_sign] += matrix[x][y];
-            } else if (x != x_dst && y == y_dst) {
-                matrix[x + x_sign][y] += matrix[x][y];
-            } else if (x != x_dst && y != y_dst) {
-                matrix[x + x_sign][y] += matrix[x][y] * 0.5;
-                matrix[x][y + y_sign] += matrix[x][y] * 0.5;
-            }
-        }
-
-        return matrix;
-    }
-
-    double HardwareModel::placementAverageCongestion(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
+    template<Topology T>
+    double HardwareModel<T>::placementAverageCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
         double result = 0.0;
 
-        for (const auto& he : part_snn.hedges()) {
+        for (const auto& he : part_hgraph.hedges()) {
             for (const auto src : he.sources()) {
                 const auto& src_core = placement[src];
 
                 for (auto dst : he.destinations()) {
                     const auto& dst_core = placement[dst];
-                    auto transit_prob_matrix = expectedSpikeTransitProbability(src_core.x, src_core.y, dst_core.x, dst_core.y);
-
-                    double sum_probs = 0.0;
-                    for (const auto& row : transit_prob_matrix) {
-                        for (double v : row) {
-                            sum_probs += v;
-                        }
-                    }
-
-                    result += static_cast<double>(he.weight()) * sum_probs;
+                    const double path_length = static_cast<double>(topology_.distance(src_core, dst_core)) + 1.0;
+                    result += static_cast<double>(he.weight()) * path_length;
                 }
             }
         }
@@ -400,29 +374,24 @@ namespace hwmodel {
         return 0.0;
     }
 
-    double HardwareModel::placementMaximumCongestion(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
-        uint32_t max_x = coresAlongX();
-        uint32_t max_y = coresAlongY();
+    template<Topology T>
+    double HardwareModel<T>::placementMaximumCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        std::unordered_map<Coord, double> congestion;
 
-        std::vector<std::vector<double>> congestion_matrix(max_x, std::vector<double>(max_y, 0.0));
-
-        for (const auto& he : part_snn.hedges()) {
+        for (const auto& he : part_hgraph.hedges()) {
             for (const auto src : he.sources()) {
                 const auto& src_core = placement[src];
 
                 for (auto dst : he.destinations()) {
                     const auto& dst_core = placement[dst];
-                    auto transit_prob_matrix = expectedSpikeTransitProbability(src_core.x, src_core.y, dst_core.x, dst_core.y);
+                    const auto paths = topology_.iterMinimumPaths(src_core, dst_core);
+                    if (paths.empty())
+                        throw std::runtime_error("Topology returned no minimum path between two placement coordinates.");
 
-                    int dx = std::abs(dst_core.x - src_core.x);
-                    int dy = std::abs(dst_core.y - src_core.y);
-
-                    int x_base = std::min(dst_core.x, src_core.x);
-                    int y_base = std::min(dst_core.y, src_core.y);
-
-                    for (int x = 0; x <= dx; ++x) {
-                        for (int y = 0; y <= dy; ++y) {
-                            congestion_matrix[static_cast<uint32_t>(x_base + x)][static_cast<uint32_t>(y_base + y)] += static_cast<double>(he.weight()) * transit_prob_matrix[x][y];
+                    const double path_weight = static_cast<double>(he.weight()) / static_cast<double>(paths.size());
+                    for (const auto& path : paths) {
+                        for (const Coord& coordinate : path) {
+                            congestion[coordinate] += path_weight;
                         }
                     }
                 }
@@ -430,30 +399,29 @@ namespace hwmodel {
         }
 
         double max_congestion = 0.0;
-        for (const auto& row : congestion_matrix) {
-            for (double v : row) {
-                if (v > max_congestion)
-                    max_congestion = v;
-            }
+        for (const auto& [coordinate, value] : congestion) {
+            (void)coordinate;
+            max_congestion = std::max(max_congestion, value);
         }
         return max_congestion;
     }
 
-    PlacementMetrics HardwareModel::getAllUnicastMetrics(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
+    template<Topology T>
+    PlacementMetrics HardwareModel<T>::getAllUnicastMetrics(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
         PlacementMetrics metrics;
 
-        bool valid = checkPlacementValidity(part_snn, placement);
+        bool valid = checkPlacementValidity(part_hgraph, placement);
         metrics.valid = valid;
 
         if (!valid)
             return metrics;
 
-        metrics.energy = placementEnergyConsumption(part_snn, placement);
-        metrics.avg_latency = placementAverageLatency(part_snn, placement);
-        metrics.max_latency = placementMaximumLatency(part_snn, placement);
-        metrics.avg_congestion = placementAverageCongestion(part_snn, placement);
-        metrics.max_congestion  = placementMaximumCongestion(part_snn, placement);
-        metrics.connections_locality = connectionsLocality(part_snn, placement);
+        metrics.energy = placementEnergyConsumption(part_hgraph, placement);
+        metrics.avg_latency = placementAverageLatency(part_hgraph, placement);
+        metrics.max_latency = placementMaximumLatency(part_hgraph, placement);
+        metrics.avg_congestion = placementAverageCongestion(part_hgraph, placement);
+        metrics.max_congestion = placementMaximumCongestion(part_hgraph, placement);
+        metrics.connections_locality = connectionsLocality(part_hgraph, placement);
         return metrics;
     }
 
@@ -566,29 +534,29 @@ namespace hwmodel {
 
         // exact minimum-tree statistics for a set of terminals on a rectangular lattice
         uint32_t exactSteinerHops(
-            std::vector<hwgeom::Coord2D>& terminals,
+            std::vector<Coord<2>>& terminals,
             uint32_t cores_y,
             std::vector<double>* congestion,
             double weight,
             const std::chrono::steady_clock::time_point* deadline
         ) {
             std::sort(terminals.begin(), terminals.end(), [](const auto& a, const auto& b) {
-                return a.x < b.x || (a.x == b.x && a.y < b.y);
+                return a[0] < b[0] || (a[0] == b[0] && a[1] < b[1]);
             });
             terminals.erase(std::unique(terminals.begin(), terminals.end()), terminals.end());
 
             if (terminals.empty())
                 return 0u;
 
-            int min_x = terminals.front().x;
-            int max_x = terminals.front().x;
-            int min_y = terminals.front().y;
-            int max_y = terminals.front().y;
+            int min_x = terminals.front()[0];
+            int max_x = terminals.front()[0];
+            int min_y = terminals.front()[1];
+            int max_y = terminals.front()[1];
             for (const auto& terminal : terminals) {
-                min_x = std::min(min_x, terminal.x);
-                max_x = std::max(max_x, terminal.x);
-                min_y = std::min(min_y, terminal.y);
-                max_y = std::max(max_y, terminal.y);
+                min_x = std::min(min_x, terminal[0]);
+                max_x = std::max(max_x, terminal[0]);
+                min_y = std::min(min_y, terminal[1]);
+                max_y = std::max(max_y, terminal[1]);
             }
 
             const uint32_t span_x = static_cast<uint32_t>(max_x - min_x + 1);
@@ -611,8 +579,8 @@ namespace hwmodel {
             if (terminals.size() == 2u) {
                 const auto& source = terminals[0];
                 const auto& destination = terminals[1];
-                const uint32_t total_dx = static_cast<uint32_t>(std::abs(destination.x - source.x));
-                const uint32_t total_dy = static_cast<uint32_t>(std::abs(destination.y - source.y));
+                const uint32_t total_dx = static_cast<uint32_t>(std::abs(destination[0] - source[0]));
+                const uint32_t total_dy = static_cast<uint32_t>(std::abs(destination[1] - source[1]));
                 const uint32_t distance = total_dx + total_dy;
                 const long double log_paths = logBinomial(distance, total_dx);
 
@@ -621,10 +589,10 @@ namespace hwmodel {
 
                 for (int x = min_x; x <= max_x; ++x) {
                     for (int y = min_y; y <= max_y; ++y) {
-                        const uint32_t first_dx = static_cast<uint32_t>(std::abs(x - source.x));
-                        const uint32_t first_dy = static_cast<uint32_t>(std::abs(y - source.y));
-                        const uint32_t second_dx = static_cast<uint32_t>(std::abs(destination.x - x));
-                        const uint32_t second_dy = static_cast<uint32_t>(std::abs(destination.y - y));
+                        const uint32_t first_dx = static_cast<uint32_t>(std::abs(x - source[0]));
+                        const uint32_t first_dy = static_cast<uint32_t>(std::abs(y - source[1]));
+                        const uint32_t second_dx = static_cast<uint32_t>(std::abs(destination[0] - x));
+                        const uint32_t second_dy = static_cast<uint32_t>(std::abs(destination[1] - y));
                         long double log_containing = logBinomial(first_dx + first_dy, first_dx)
                                                    + logBinomial(second_dx + second_dy, second_dx);
                         double probability = static_cast<double>(std::exp(log_containing - log_paths));
@@ -648,15 +616,15 @@ namespace hwmodel {
                 uint32_t row = position / frontier_width;
                 uint32_t column = position % frontier_width;
                 if (transpose)
-                    return hwgeom::Coord2D{min_x + static_cast<int>(row), min_y + static_cast<int>(column)};
-                return hwgeom::Coord2D{min_x + static_cast<int>(column), min_y + static_cast<int>(row)};
+                    return Coord<2>{min_x + static_cast<int>(row), min_y + static_cast<int>(column)};
+                return Coord<2>{min_x + static_cast<int>(column), min_y + static_cast<int>(row)};
             };
 
             std::vector<uint8_t> required(area, 0u);
             for (uint32_t position = 0; position < area; ++position) {
-                hwgeom::Coord2D coord = coordAt(position);
+                Coord<2> coord = coordAt(position);
                 required[position] = std::binary_search(terminals.begin(), terminals.end(), coord, [](const auto& a, const auto& b) {
-                    return a.x < b.x || (a.x == b.x && a.y < b.y);
+                    return a[0] < b[0] || (a[0] == b[0] && a[1] < b[1]);
                 });
             }
 
@@ -816,8 +784,8 @@ namespace hwmodel {
 
             for (uint32_t position = 0; position < area; ++position) {
                 if (containing_log_count[position] == LOG_ZERO) continue;
-                hwgeom::Coord2D coord = coordAt(position);
-                uint32_t core = static_cast<uint32_t>(coord.x) * cores_y + static_cast<uint32_t>(coord.y);
+                Coord<2> coord = coordAt(position);
+                uint32_t core = static_cast<uint32_t>(coord[0]) * cores_y + static_cast<uint32_t>(coord[1]);
                 double probability = static_cast<double>(std::exp(containing_log_count[position] - total_log_count));
                 (*congestion)[core] += weight * probability;
             }
@@ -826,8 +794,9 @@ namespace hwmodel {
 
         // evaluate every source-multicast once, optionally accumulating the expensive Steiner-derived metrics
         MulticastEvaluation evaluateMulticast(
-            const HyperGraph& part_snn,
-            const std::vector<hwgeom::Coord2D>& placement,
+            const HyperGraph& part_hgraph,
+            const std::vector<Coord<2>>& placement,
+            const Lattice2D& lattice,
             uint32_t cores_count,
             uint32_t cores_y,
             double energy_per_routing,
@@ -838,8 +807,8 @@ namespace hwmodel {
             bool need_latency,
             bool need_congestion
         ) {
-            const auto& hedges = part_snn.hedges();
-            const auto& hedges_flat = part_snn.hedgesFlat();
+            const auto& hedges = part_hgraph.hedges();
+            const auto& hedges_flat = part_hgraph.hedgesFlat();
             const size_t hedges_count = hedges.size();
 
             size_t tasks_count = 0u;
@@ -858,7 +827,7 @@ namespace hwmodel {
             }
 
             const bool need_steiner = need_energy || need_congestion;
-            const bool limit_steiner_time = need_steiner && part_snn.nodes() >= MULTICAST_STEINER_NODE_LIMIT;
+            const bool limit_steiner_time = need_steiner && part_hgraph.nodes() >= MULTICAST_STEINER_NODE_LIMIT;
             if (limit_steiner_time) {
                 std::stable_sort(tasks.begin(), tasks.end(), [&](const auto& a, const auto& b) {
                     return hedges[a.hedge].weight() > hedges[b.hedge].weight();
@@ -882,7 +851,7 @@ namespace hwmodel {
                 auto& local = locals[static_cast<size_t>(tid)];
                 if (need_congestion)
                     local.congestion.assign(cores_count, 0.0);
-                std::vector<hwgeom::Coord2D> terminals;
+                std::vector<Coord<2>> terminals;
 
                 #pragma omp for schedule(dynamic, 1)
                 for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
@@ -907,7 +876,7 @@ namespace hwmodel {
                             int max_distance = 0;
                             for (uint32_t pin = destinations_begin; pin < destinations_end; ++pin) {
                                 uint32_t destination = hedges_flat[pin];
-                                max_distance = std::max(max_distance, hwgeom::manhattan(placement[task.source], placement[destination]));
+                                max_distance = std::max<int>(max_distance, lattice.distance(placement[task.source], placement[destination]));
                             }
                             double latency = static_cast<double>(max_distance) * (latency_per_routing + latency_per_wire) + latency_per_routing;
                             weighted_latency = weight * latency;
@@ -1036,55 +1005,100 @@ namespace hwmodel {
     }
 
     // total spike-traffic energy under exact minimum multicast trees
-    double HardwareModel::multicastEnergyConsumption(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
-        return evaluateMulticast(
-            part_snn, placement, coresCount(), coresAlongY(),
-            energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
-            true, false, false
-        ).energy;
+    template<Topology T>
+    double HardwareModel<T>::multicastEnergyConsumption(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        if constexpr (!std::same_as<T, Lattice2D>) {
+            // TODO: the exact Steiner solver is specialized for rectangular 2D lattices.
+            throw std::logic_error("Multicast energy is only implemented for Lattice2D.");
+        } else {
+            return evaluateMulticast(
+                part_hgraph, placement, topology_, coresCount(), coresAlongDim(1) /*y*/,
+                energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
+                true, false, false
+            ).energy;
+        }
     }
 
     // frequency-weighted delivery completion latency, with one multicast per source
-    double HardwareModel::multicastAverageLatency(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
-        MulticastEvaluation result = evaluateMulticast(
-            part_snn, placement, coresCount(), coresAlongY(),
-            energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
-            false, true, false
-        );
-        return result.weight > 0.0 ? result.weighted_latency / result.weight : 0.0;
+    template<Topology T>
+    double HardwareModel<T>::multicastAverageLatency(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        double weighted_latency = 0.0;
+        double total_weight = 0.0;
+
+        for (const auto& hyperedge : part_hgraph.hedges()) {
+            const double weight = static_cast<double>(hyperedge.weight());
+            for (uint32_t source : hyperedge.sources()) {
+                uint32_t max_distance = 0;
+                for (uint32_t destination : hyperedge.destinations()) {
+                    max_distance = std::max(
+                        max_distance,
+                        topology_.distance(placement[source], placement[destination])
+                    );
+                }
+
+                const double latency = static_cast<double>(max_distance) *
+                    (latency_per_routing_ + latency_per_wire_) + latency_per_routing_;
+                weighted_latency += weight * latency;
+                total_weight += weight;
+            }
+        }
+
+        return total_weight > 0.0 ? weighted_latency / total_weight : 0.0;
     }
 
     // expected per-core traffic under the uniform distribution over exact minimum multicast core sets
-    std::vector<double> HardwareModel::multicastCongestion(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
-        return evaluateMulticast(
-            part_snn, placement, coresCount(), coresAlongY(),
-            energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
-            false, false, true
-        ).congestion;
+    template<Topology T>
+    std::vector<double> HardwareModel<T>::multicastCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        if constexpr (!std::same_as<T, Lattice2D>) {
+            // TODO: congestion requires topology-wide coordinate indexing and a generic multicast solver.
+            throw std::logic_error("Multicast congestion is only implemented for Lattice2D.");
+        } else {
+            return evaluateMulticast(
+                part_hgraph, placement, topology_, coresCount(), coresAlongDim(1) /*y*/,
+                energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
+                false, false, true
+            ).congestion;
+        }
     }
 
     // peak expected per-core traffic under exact minimum multicast trees
-    double HardwareModel::multicastMaximumCongestion(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
-        std::vector<double> congestion = multicastCongestion(part_snn, placement);
+    template<Topology T>
+    double HardwareModel<T>::multicastMaximumCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        std::vector<double> congestion = multicastCongestion(part_hgraph, placement);
         return congestion.empty() ? 0.0 : *std::max_element(congestion.begin(), congestion.end());
     }
 
     // compute the three analytical multicast placement metrics in one pass over the hypergraph
-    MulticastPlacementMetrics HardwareModel::getAllMulticastMetrics(const HyperGraph& part_snn, const std::vector<hwgeom::Coord2D>& placement) const {
+    template<Topology T>
+    MulticastPlacementMetrics HardwareModel<T>::getAllMulticastMetrics(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
         MulticastPlacementMetrics metrics;
-        metrics.valid = checkPlacementValidity(part_snn, placement);
+        metrics.valid = checkPlacementValidity(part_hgraph, placement);
         if (!metrics.valid)
             return metrics;
 
-        MulticastEvaluation result = evaluateMulticast(
-            part_snn, placement, coresCount(), coresAlongY(),
-            energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
-            true, true, true
-        );
-        metrics.energy = result.energy;
-        metrics.avg_latency = result.weight > 0.0 ? result.weighted_latency / result.weight : 0.0;
-        metrics.max_congestion = result.congestion.empty() ? 0.0 : *std::max_element(result.congestion.begin(), result.congestion.end());
-        metrics.evaluation_fraction = result.evaluation_fraction;
+        if constexpr (std::same_as<T, Lattice2D>) {
+            MulticastEvaluation result = evaluateMulticast(
+                part_hgraph, placement, topology_, coresCount(), coresAlongDim(1) /*y*/,
+                energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
+                true, true, true
+            );
+            metrics.energy = result.energy;
+            metrics.avg_latency = result.weight > 0.0 ? result.weighted_latency / result.weight : 0.0;
+            metrics.max_congestion = result.congestion.empty() ? 0.0 : *std::max_element(result.congestion.begin(), result.congestion.end());
+            metrics.evaluation_fraction = result.evaluation_fraction;
+        } else {
+            // TODO: multicast Steiner energy and congestion are still specialized for Lattice2D.
+            metrics.energy = std::nullopt;
+            metrics.avg_latency = multicastAverageLatency(part_hgraph, placement);
+            metrics.max_congestion = std::nullopt;
+            metrics.evaluation_fraction = 0.0f;
+        }
         return metrics;
     }
+
+    template class HardwareModel<Lattice2D>;
+    template class HardwareModel<Lattice3D>;
+    template class HardwareModel<Torus2D>;
+    template class HardwareModel<Torus3D>;
+    template class HardwareModel<Torus6D>;
 }

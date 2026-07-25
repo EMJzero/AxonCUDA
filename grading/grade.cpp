@@ -19,7 +19,7 @@
 using namespace hgraph;
 using namespace constraints;
 using namespace hwmodel;
-using namespace hwgeom;
+using namespace topology;
 
 
 enum class PartConstrType {
@@ -44,6 +44,7 @@ void printHelp() {
         "  -m-prt <> <> <> Partitioning constraints set to use, in order: max part. size, max part. distinct inbound hedges, max num. of part.s (overrides '-c-prt')\n"
         "  -k-prt <k> <ε>  K-way balanced constraints set to use (overrides '-c-prt' and '-m-prt')\n"
         "  -c-plc <name>   Placement constraints set to use (valid ones: truenorth, loihi, loihi64, loihi84, loihi1024)\n"
+        "  -t-plc <name>   Placement topology (valid ones: lat2d, tor6d)\n"
         "  -ff         Reorder the partitioned hypergraph's nodes with the greedy feedforward algorithm (use if '-ff' was used for placement)\n"
         "  -noum       Disables the evaluation and logging of unicast-based placement quality metrics\n"
         "  -nomm       Disables the evaluation and logging of multicast-based placement quality metrics (which can be very slow)\n"
@@ -117,13 +118,15 @@ Constraints setupPartConstr(PartConstrType constraints_type, ConstraintsConfig c
     }
 }
 
-HardwareModel setupPlacConstr(std::string hw_name) {
-    std::unordered_map<std::string, HardwareModel (*)()> configurations {
-        { "loihi", HardwareModel::createLoihi },
-        { "loihi64", HardwareModel::createLoihiLarge },
-        { "loihi84", HardwareModel::createLoihiJin84 },
-        { "loihi1024", HardwareModel::createLoihiJin1024 },
-        { "truenorth", HardwareModel::createTrueNorth }
+template<Topology T>
+HardwareModel<T> setupPlacConstr(std::string hw_name) {
+    using Model = HardwareModel<T>;
+    std::unordered_map<std::string, Model (*)()> configurations {
+        { "loihi", Model::createLoihi },
+        { "loihi64", Model::createLoihiLarge },
+        { "loihi84", Model::createLoihiJin84 },
+        { "loihi1024", Model::createLoihiJin1024 },
+        { "truenorth", Model::createTrueNorth }
     };
     auto hw_it = configurations.find(hw_name);
     if (hw_it == configurations.end()) {
@@ -175,6 +178,7 @@ int main(int argc, char** argv) {
     float epsi = 0.0f;
     // |
     std::string plac_constraints_name;
+    std::string topology_name;
     bool feedforward_order = false;
     bool unicast_metrics = true;
     bool multicast_metrics = true;
@@ -256,14 +260,6 @@ int main(int argc, char** argv) {
     // load hypergraph
     HyperGraph hg = loadHgraph(load_path);
 
-    // setup partitioning constraints
-    std::optional<Constraints> part_constr;
-    if (eval_part) part_constr.emplace(setupPartConstr(part_constraints_type, part_constr_config, hg, kway, epsi));
-
-    // setup placement constraints
-    std::optional<HardwareModel> plac_constr;
-    if (eval_plac) plac_constr.emplace(setupPlacConstr(plac_constraints_name));
-
     std::optional<HyperGraph> partitioned_hg;
 
     // print statistics
@@ -274,24 +270,14 @@ int main(int argc, char** argv) {
     std::cout << "  Total connections weight: " << std::fixed << std::setprecision(3) << hg.connectivity() << "\n";
 
     if (eval_part) {
-        std::cout << "Using partitioning constraints \"" << part_constr->name() << "\":\n";
-        std::cout << "  Nodes per partition:         " << part_constr->nodesPerPart() << "\n";
-        std::cout << "  Inbound hedge per partition: " << part_constr->inboundPerPart() << "\n";
-        std::cout << "  Maximum partitions:          " << part_constr->maxParts() << "\n";
-    }
+        // setup partitioning constraints
+        Constraints part_constr = setupPartConstr(part_constraints_type, part_constr_config, hg, kway, epsi);
 
-    if (eval_plac) {
-        std::cout << "Using placement constraints \"" << plac_constr->name() << "\":\n";
-        std::cout << "  Neurons per core:  " << plac_constr->neuronsPerCore() << "\n";
-        std::cout << "  Synapses per core: " << plac_constr->synapsesPerCore() << "\n";
-        std::cout << "  Cores along x, y:  " << plac_constr->coresPerChipX() << ", " << plac_constr->coresPerChipY() << " (" << plac_constr->coresPerChipX() * plac_constr->coresPerChipY() << " tot.)" << "\n";
-        std::cout << "  Chips along x, y:  " << plac_constr->chipsPerSystemX() << ", " << plac_constr->chipsPerSystemY() << " (" << plac_constr->chipsPerSystemX() * plac_constr->chipsPerSystemY() << " tot.)" << "\n";
-        std::cout << "  Routing energy, latency: " << std::fixed << std::setprecision(3) << plac_constr->energyPerRouting() << " pJ, " << plac_constr->latencyPerRouting() << " ns\n";
-        std::cout << "  Wire energy, latency:    " << std::fixed << std::setprecision(3) << plac_constr->energyPerWire() << " pJ, " << plac_constr->latencyPerWire() << " ns\n";
-    }
+        std::cout << "Using partitioning constraints \"" << part_constr.name() << "\":\n";
+        std::cout << "  Nodes per partition:         " << part_constr.nodesPerPart() << "\n";
+        std::cout << "  Inbound hedge per partition: " << part_constr.inboundPerPart() << "\n";
+        std::cout << "  Maximum partitions:          " << part_constr.maxParts() << "\n";
 
-
-    if (eval_part) {
         // load partitioning
         std::vector<uint32_t> partitions;
         try {
@@ -303,10 +289,10 @@ int main(int argc, char** argv) {
         }
 
         // apply and grade partitioning
-        if (part_constr->checkPartitionValidity(hg, partitions, true)) {
+        if (part_constr.checkPartitionValidity(hg, partitions, true)) {
             // log metrics
             partitioned_hg.emplace(hg.getPartitionsHypergraph(partitions, 2, true)); // remove the destination if self-cycles happen
-            auto hedge_overlap = part_constr->hedgeOverlap(hg, partitions);
+            auto hedge_overlap = part_constr.hedgeOverlap(hg, partitions);
             std::cout << "Partitioned hypergraph metrics:\n";
             std::cout << "  Nodes:         " << partitioned_hg->nodes() << "\n";
             std::cout << "  Hyperedges:    " << partitioned_hg->hedges().size() << "\n";
@@ -325,53 +311,83 @@ int main(int argc, char** argv) {
     }
 
     if (eval_plac) {
-        // load placement
-        std::vector<Coord2D> placement;
-        try {
-            if (!std::filesystem::is_regular_file(plac_path)) throw std::runtime_error("Failed to load placement, the provided path is not a file.");
-            placement = coords_from_file(plac_path);
-        } catch (const std::exception& e) {
-            std::cerr << "Error loading placement: " << e.what() << "\n";
-            return 1;
-        }
+        // topology-templated evaluation routine
+        auto place_eval = [&]<Topology T>() -> int {
+            // setup placement constraints
+            HardwareModel<T> plac_constr = setupPlacConstr<T>(plac_constraints_name);
 
-        HyperGraph& placement_hg = partitioned_hg.has_value() ? *partitioned_hg : hg;
+            using Coord = Coord_t<T>;
 
-        if (feedforward_order) {
-            placement_hg.buildIncidenceSets();
-            std::vector<uint32_t> nodes_order_idx = placement_hg.feedForwardOrder();
-            std::vector<Coord2D> placement_ord(placement_hg.nodes());
-            for (uint32_t i = 0; i < placement_ord.size(); i++) {
-                placement_ord[i] = placement[nodes_order_idx[i]];
-            }
-            placement = placement_ord;
-        }
-        
-        // apply and grade placement
-        if (plac_constr->checkPlacementValidity(placement_hg, placement, true)) {
-            if (unicast_metrics) {
-                auto uc_metrics = plac_constr->getAllUnicastMetrics(placement_hg, placement);
-                std::cout << "Placement unicast metrics:\n";
-                std::cout << "  Energy:        " << std::fixed << std::setprecision(3) << uc_metrics.energy.value() << "\n";
-                std::cout << "  Avg. latency:  " << std::fixed << std::setprecision(3) << uc_metrics.avg_latency.value() << "\n";
-                std::cout << "  Max. latency:  " << std::fixed << std::setprecision(3) << uc_metrics.max_latency.value() << "\n";
-                std::cout << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << uc_metrics.avg_congestion.value() << "\n";
-                std::cout << "  Max. congestion:  " << std::fixed << std::setprecision(3) << uc_metrics.max_congestion.value() << "\n";
-                std::cout << "  Connections locality:\n";
-                std::cout << "    Flat:     " << std::fixed << std::setprecision(3) << uc_metrics.connections_locality.value().ar_mean << " ar. mean, " << uc_metrics.connections_locality.value().geo_mean << " geo. mean\n";
-                std::cout << "    Weighted: " << std::fixed << std::setprecision(3) << uc_metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << uc_metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
+            std::cout << "Using placement constraints \"" << plac_constr.name() << "\":\n";
+            std::cout << "  Topology:          " << topology_name << "\n";
+            std::cout << "  Neurons per core:  " << plac_constr.neuronsPerCore() << "\n";
+            std::cout << "  Synapses per core: " << plac_constr.synapsesPerCore() << "\n";
+            std::cout << "  Cores per dim:  " << plac_constr.coresAlongDim(0);
+            for (uint32_t dim = 1; dim < T::dimensions; dim++)
+                std::cout << ", " << plac_constr.coresAlongDim(dim);
+            std::cout << " (" << plac_constr.coresCount() << " tot.)" << "\n";
+            std::cout << "  Routing energy, latency: " << std::fixed << std::setprecision(3) << plac_constr.energyPerRouting() << " pJ, " << plac_constr.latencyPerRouting() << " ns\n";
+            std::cout << "  Wire energy, latency:    " << std::fixed << std::setprecision(3) << plac_constr.energyPerWire() << " pJ, " << plac_constr.latencyPerWire() << " ns\n";
+
+            // load placement
+            std::vector<Coord> placement;
+            try {
+                if (!std::filesystem::is_regular_file(plac_path)) throw std::runtime_error("Failed to load placement, the provided path is not a file.");
+                placement = Coord::fromFile(plac_path);
+            } catch (const std::exception& e) {
+                std::cerr << "Error loading placement: " << e.what() << "\n";
+                return 1;
             }
 
-            if (multicast_metrics) {
-                auto mc_metrics = plac_constr->getAllMulticastMetrics(placement_hg, placement);
-                std::cout << "Placement multicast metrics:\n";
-                std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << mc_metrics.energy.value() << "\n";
-                std::cout << "  Avg. latency:    " << std::fixed << std::setprecision(3) << mc_metrics.avg_latency.value() << "\n";
-                std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.max_congestion.value() << "\n";
+            // if partitioning was evaluated, use the partitioned hgraph
+            HyperGraph& placement_hg = partitioned_hg.has_value() ? *partitioned_hg : hg;
+
+            if (feedforward_order) {
+                placement_hg.buildIncidenceSets();
+                std::vector<uint32_t> nodes_order_idx = placement_hg.feedForwardOrder();
+                std::vector<Coord> placement_ord(placement_hg.nodes());
+                for (uint32_t i = 0; i < placement_ord.size(); i++) {
+                    placement_ord[i] = placement[nodes_order_idx[i]];
+                }
+                placement = placement_ord;
             }
-        } else {
-            std::cerr << "WARNING, invalid placement !!\n";
-        }
+            
+            // apply and grade placement
+            if (plac_constr.checkPlacementValidity(placement_hg, placement, true)) {
+                if (unicast_metrics) {
+                    auto uc_metrics = plac_constr.getAllUnicastMetrics(placement_hg, placement);
+                    std::cout << "Placement unicast metrics:\n";
+                    std::cout << "  Energy:        " << std::fixed << std::setprecision(3) << uc_metrics.energy.value() << "\n";
+                    std::cout << "  Avg. latency:  " << std::fixed << std::setprecision(3) << uc_metrics.avg_latency.value() << "\n";
+                    std::cout << "  Max. latency:  " << std::fixed << std::setprecision(3) << uc_metrics.max_latency.value() << "\n";
+                    std::cout << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << uc_metrics.avg_congestion.value() << "\n";
+                    std::cout << "  Max. congestion:  " << std::fixed << std::setprecision(3) << uc_metrics.max_congestion.value() << "\n";
+                    std::cout << "  Connections locality:\n";
+                    std::cout << "    Flat:     " << std::fixed << std::setprecision(3) << uc_metrics.connections_locality.value().ar_mean << " ar. mean, " << uc_metrics.connections_locality.value().geo_mean << " geo. mean\n";
+                    std::cout << "    Weighted: " << std::fixed << std::setprecision(3) << uc_metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << uc_metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
+                }
+
+                if (multicast_metrics) {
+                    auto mc_metrics = plac_constr.getAllMulticastMetrics(placement_hg, placement);
+                    std::cout << "Placement multicast metrics:\n";
+                    std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << mc_metrics.energy.value() << "\n";
+                    std::cout << "  Avg. latency:    " << std::fixed << std::setprecision(3) << mc_metrics.avg_latency.value() << "\n";
+                    std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.max_congestion.value() << "\n";
+                }
+            } else {
+                std::cerr << "WARNING, invalid placement !!\n";
+            }
+
+            return 0;
+        };  // place_eval end
+
+        // dispatch based on topology
+        if (topology_name == "lat2d")
+            return place_eval.template operator()<Lattice<2>>();
+        else if (topology_name == "tor6d")
+            return place_eval.template operator()<Torus<6>>();
+        else
+            throw std::runtime_error("Topology not yet implemented *-* !");
     }
 
     return 0;

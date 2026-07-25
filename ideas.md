@@ -866,3 +866,10 @@ Big neighbors iterations upgrade idea:
 
 Hilbert or snake curve? It’s a trade-off depending on how well the tree reordering works.
 If the tree reordering is very strong, snake exploits it the most, otherwise Hilbert still exploits it up to 50%!
+
+----
+
+Eventually support placement on any target graph, with a topology called anygraph:
+- store in the class a map (either matrix, or better CSR from node to neighbors list) from node to neighbors
+- that map gets loaded in the device-side constant
+- the neighbor maps are constant time to access, if you have the memory :)

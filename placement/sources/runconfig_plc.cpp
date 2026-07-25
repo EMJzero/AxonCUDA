@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "hgraph.hpp"
+#include "topology.hpp"
 #include "nmhardware.hpp"
 
 #include "defines_plc.cuh"
@@ -20,7 +21,7 @@
 
 using namespace hgraph;
 using namespace hwmodel;
-using namespace hwgeom;
+using namespace topology;
 
 namespace config_plc {
 
@@ -38,9 +39,14 @@ namespace config_plc {
             "  -cnc <num>  Set the count of candidate swaps proposed per node during force-directed refinement\n"
             "  -mso <num>  Overrides the number of multi-start attempts (default is chosen to maximally occupy the GPU)\n"
             "  -thr <num>  Overrides the number of threads and streams to spawn (default equals multi-start attempts)\n"
+            "  -t <name>   Set the topology of the target graph where to place hypergraph nodes, valid names are:\n"
+            "      - lat2d: 2D lattice (default)    - tor6d: 6D torus\n"
+            "      - hcube: N-D hypercube           - hx3d: 3D HyperX\n"
             "  -sfc <name> Determines the 1D-to-2D mapping used to preserve locality after ordering nodes, valid names are:\n"
             "      - hilb: Hilbert space-filling curve (default)    - snak: square-ish serpentine sweep\n"
-            "      - zord: Z-order curve                            - quad: cyclic quadtree pattern \n"
+            "      - zord: Z-order curve                            - quad: cyclic quadtree pattern\n"
+            "    => sfc x topology support lists:\n"
+            "      - hilb, snak, zord, quad: lattice, torus\n"
             "  -ff         Replaces the 1D ordering heuristic with host-side sequential feedforward ordering\n"
             "  -noum       Disables the evaluation and logging of unicast-based placement quality metrics\n"
             "  -nomm       Disables the evaluation and logging of multicast-based placement quality metrics (which can be very slow)\n"
@@ -60,6 +66,7 @@ namespace config_plc {
         uint32_t candidates_count = MAX_CANDIDATE_MOVES;
         uint32_t multi_start_override = MULTISTART_ATTEMPTS;
         uint32_t num_host_threads = NUM_HOST_THREADS;
+        TargetTopology topology = TargetTopology::LATTICE2D;
         SpaceFillingCurve space_filling_curve = SpaceFillingCurve::HILB;
         bool feedforward_order = false; // NB: runs sequentially on the HOST!
         bool unicast_metrics = true;
@@ -103,10 +110,14 @@ namespace config_plc {
                 if (i + 1 >= argc) { std::cerr << "Error: -cnc requires a positive integer value\n"; std::exit(1); }
                 candidates_count = std::stoul(argv[++i]);
                 if (candidates_count == 0 || candidates_count > MAX_CANDIDATE_MOVES) { std::cerr << "Error: -cnc must be greater than 0 and less or equal to " << MAX_CANDIDATE_MOVES << "\n"; std::exit(1); }
+            } else if (arg == "-t") {
+                if (i + 1 >= argc) { std::cerr << "Error: -t requires a topology name\n"; std::exit(1); }
+                std::string topo_name = argv[++i];
+                if (!parseTopology(topo_name, topology)) { std::cerr << "Error: -t requested an invalid topology name\n"; std::exit(1); }
             } else if (arg == "-sfc") {
                 if (i + 1 >= argc) { std::cerr << "Error: -sfc requires a curve name\n"; std::exit(1); }
                 std::string curve_name = argv[++i];
-                if (!parseSFC(curve_name, space_filling_curve)) { std::cerr << "Error: -sfc requested an invalid curve name \n"; std::exit(1); }
+                if (!parseSFC(curve_name, space_filling_curve)) { std::cerr << "Error: -sfc requested an invalid curve name\n"; std::exit(1); }
             } else if (arg == "-ff") {
                 feedforward_order = true;
             } else if (arg == "-noum") {
@@ -121,7 +132,7 @@ namespace config_plc {
             } else if (arg == "-v") {
                 if (i + 1 >= argc) { std::cerr << "Error: -v requires a positive value between 0 and 4\n"; std::exit(1); }
                 int verbosity = std::stoul(argv[++i]);
-                if (verbosity < 0 || verbosity > 4) { std::cerr << "Error: -v must be between 0 and 4 (extremes included) \n"; std::exit(1); }
+                if (verbosity < 0 || verbosity > 4) { std::cerr << "Error: -v must be between 0 and 4 (extremes included)\n"; std::exit(1); }
                 verbose_logs = verbosity > 2;
                 verbose_info = verbosity > 0;
                 verbose_errs_and_warns = verbosity > 0;
@@ -129,6 +140,11 @@ namespace config_plc {
                 debug = verbosity > 3;
                 if (verbosity > 2) std::cerr << "WARNING: verbosity 3 and 4 can hinder performance, especially on the host side !!\n";
             } else { std::cerr << "Unknown option: " << arg << "\n"; std::exit(1); }
+        }
+
+        if (!validateTopologySFC(topology, space_filling_curve)) {
+            std::cerr << "Error: space filling curve '" << SFCtoString(space_filling_curve) << "' does not support topology '" << topologyToString(topology) << "'\n";
+            std::exit(1);
         }
 
         return {
@@ -140,6 +156,7 @@ namespace config_plc {
             candidates_count,
             multi_start_override,
             num_host_threads,
+            topology,
             space_filling_curve,
             feedforward_order,
             unicast_metrics,
@@ -187,23 +204,26 @@ namespace config_plc {
         return hg;
     }
 
-    HardwareModel setupNMH(runconfig &cfg) {
-        std::unordered_map<std::string, HardwareModel (*)()> configurations {
-            { "loihi", HardwareModel::createLoihi },
-            { "loihi64", HardwareModel::createLoihiLarge },
-            { "loihi84", HardwareModel::createLoihiJin84 },
-            { "loihi1024", HardwareModel::createLoihiJin1024 },
-            { "truenorth", HardwareModel::createTrueNorth }
+    template<Topology T>
+    HardwareModel<T> setupNMH(runconfig &cfg) {
+        using Model = HardwareModel<T>;
+        std::unordered_map<std::string, Model (*)()> configurations {
+            { "loihi", Model::createLoihi },
+            { "loihi64", Model::createLoihiLarge },
+            { "loihi84", Model::createLoihiJin84 },
+            { "loihi1024", Model::createLoihiJin1024 },
+            { "truenorth", Model::createTrueNorth }
         };
         auto hw_it = configurations.find(cfg.constraints);
         if (hw_it == configurations.end()) {
             std::cerr << "WARNING, no valid constraints provided (-c), using loihi64 !!\n";
-            return HardwareModel::createLoihiLarge();
+            return Model::createLoihiLarge();
         }
         return hw_it->second();
     }
 
-    void saveResult(runconfig &cfg, std::vector<Coord2D> h_placement) {
+    template<Topology T>
+    void saveResult(runconfig &cfg, std::vector<Coord_t<T>> h_placement) {
         // save hypergraph
         if (!cfg.save_path.empty()) {
             if (cfg.load_path.empty()) {
@@ -211,14 +231,31 @@ namespace config_plc {
                 std::exit(1);
             }
             try {
-                // TODO: apply the partitioning before saving!
-                coords_to_file(h_placement, cfg.save_path);
+                T::Coord::toFile(h_placement, cfg.save_path);
                 std::cout << "Placement data saved to " << cfg.save_path << "\n";
             } catch (const std::exception& e) {
                 std::cerr << "Error saving file: " << e.what() << "\n";
                 std::exit(1);
             }
         }
+    }
+
+    const char* topologyToString(TargetTopology topology) {
+        for (const auto& [value, name] : TOPOLOGY_NAMES) {
+            if (value == topology)
+                return name;
+        }
+        return "unknown";
+    }
+
+    bool parseTopology(const std::string& name, TargetTopology& topology) {
+        for (const auto& [value, text] : TOPOLOGY_NAMES) {
+            if (name == text) {
+                topology = value;
+                return true;
+            }
+        }
+        return false;
     }
 
     const char* SFCtoString(SpaceFillingCurve curve) {
@@ -238,4 +275,20 @@ namespace config_plc {
         }
         return false;
     }
+
+    bool validateTopologySFC(TargetTopology topology, SpaceFillingCurve curve) {
+        for (const auto& [c, supported_topologies] : CURVE_TOPOLOGY_SUPPORT) {
+            if (curve == c) {
+                return (supported_topologies & topologySupport(topology)) != 0;
+            }
+        }
+        return false;
+    }
+
+    // explicit instantiations of topology variants
+    template HardwareModel<Lattice2D> setupNMH<Lattice2D>(runconfig&);
+    template HardwareModel<Torus6D> setupNMH<Torus6D>(runconfig&);
+    // |
+    template void saveResult<Lattice2D>(runconfig&, std::vector<Lattice2D::Coord>);
+    template void saveResult<Torus6D>(runconfig&, std::vector<Torus6D::Coord>);
 }

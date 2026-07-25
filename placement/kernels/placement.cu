@@ -3,15 +3,19 @@
 #include "utils.cuh"
 
 // DEVICE CONSTANTS:
-__constant__ uint32_t max_width;
-__constant__ uint32_t max_height;
+// explicitly instantiated topology constants
+template<>
+__constant__ Lattice2D c_topo<Lattice2D>{};
+template<>
+__constant__ Torus6D c_topo<Torus6D>{};
 
 // assign to each inverse placement slot the node occupying that place
 // SEQUENTIAL COMPLEXITY: n
 // PARALLEL OVER: n
+template<Topology T>
 __global__
 void inverse_placement_kernel(
-    const coords* __restrict__ placement,
+    const Coord_t<T>* __restrict__ placement,
     const uint32_t num_nodes,
     uint32_t* __restrict__ inv_placement
 ) {
@@ -19,14 +23,15 @@ void inverse_placement_kernel(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_nodes) return;
 
-    const coords my_place = placement[tid];
-    inv_placement[my_place.y * max_width + my_place.x] = tid;
+    const Coord_t<T> my_place = placement[tid];
+    inv_placement[c_topo<T>.flattenedIdx(my_place)] = tid;
 }
 
 // compute the forces pulling each node in the four cardinal directions
 // SEQUENTIAL COMPLEXITY: n*h*d
 // PARALLEL OVER: n
 // SHUFFLES OVER: d (hedges)
+template<Topology T>
 __global__
 void forces_kernel(
     const uint32_t* __restrict__ hedges,
@@ -34,7 +39,7 @@ void forces_kernel(
     const uint32_t* __restrict__ touching,
     const dim_t* __restrict__ touching_offsets,
     const float* __restrict__ hedge_weights,
-    const coords* __restrict__ placement,
+    const Coord_t<T>* __restrict__ placement,
     const uint32_t num_nodes,
     float* __restrict__ forces
 ) {
@@ -46,18 +51,18 @@ void forces_kernel(
 
     /*
     * Idea:
-    * - iterate, for each node, on its touching hedges, and on each node in each hedge, for each node updating all 4 forces
-    * - let a warp handle a node, reduce among its threads the four forces
+    * - iterate, for each node, on its touching hedges, and on each node in each hedge, for each node updating all directional forces
+    * - let a warp handle a node, reduce among its threads the forces
     */
     
-    const coords my_place = placement[warp_id];
+    const Coord_t<T> my_place = placement[warp_id];
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
     const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
     //uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
     
     float my_base_potential = 0.0f;
-    float my_forces[4];
-    thr_init<float>(my_forces, 4, 0.0f);
+    float my_forces[T::neighborsCount()];
+    thr_init<float>(my_forces, T::neighborsCount(), 0.0f);
     
     // scan touching hyperedges
     // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
@@ -72,39 +77,39 @@ void forces_kernel(
             if (my_hedge < not_my_hedge) {
                 const uint32_t pin = *my_hedge;
                 if (pin == warp_id) continue;
-                const coords pin_place = placement[pin];
-                const uint32_t distance = manhattan(my_place, pin_place);
+                const Coord_t<T> pin_place = placement[pin];
+                const uint32_t distance = c_topo<T>.distance(my_place, pin_place);
                 my_base_potential += my_hedge_weight * distance;
                 // logic: base potential = how much distant I am be from my connectees
                 //        my_force = how much distant I would be from my connectees if moved
-                my_forces[LEFT] += my_hedge_weight * max(distance + (pin_place.x >= my_place.x) * 2 - 1, 1); // doing (cnd)*2-1 maps the condition's evaluation from 1/0 --to--> 1/-1
-                my_forces[RIGHT] += my_hedge_weight * max(distance + (pin_place.x <= my_place.x) * 2 - 1, 1); // if pin is to my left, add 1
-                my_forces[UP] += my_hedge_weight * max(distance + (pin_place.y >= my_place.y) * 2 - 1, 1); // if pin is below me, add 1
-                my_forces[DOWN] += my_hedge_weight * max(distance + (pin_place.y <= my_place.y) * 2 - 1, 1); // if pin is above me, add 1
+                // TODO: could optimize, instead of doing another "distance" call, compute the new distance incrementally
+                for (uint32_t neigh_idx = 0; neigh_idx < T::neighborsCount(); neigh_idx++) {
+                    const Coord_t<T> neigh_place = c_topo<T>.neighbor(my_place, neigh_idx);
+                    my_forces[neigh_idx] += my_hedge_weight * max(c_topo<T>.distance(neigh_place, pin_place), 1);
+                }
             }
         }
     }
     
     // reduce across the warp
     my_base_potential = warpReduceSumLN0<float>(my_base_potential);
-    for (uint32_t f = 0; f < 4; f++)
+    for (uint32_t f = 0; f < T::neighborsCount(); f++)
         my_forces[f] = warpReduceSumLN0<float>(my_forces[f]);
     
     if (lane_id == 0) {
         // logic: final force = reduction in distance if moved (higher is better)
-        forces[warp_id*4 + LEFT] = my_base_potential - my_forces[LEFT];
-        forces[warp_id*4 + RIGHT] = my_base_potential - my_forces[RIGHT];
-        forces[warp_id*4 + UP] = my_base_potential - my_forces[UP];
-        forces[warp_id*4 + DOWN] = my_base_potential - my_forces[DOWN];
+        for (uint32_t neigh_idx = 0; neigh_idx < T::neighborsCount(); neigh_idx++)
+            forces[warp_id*T::neighborsCount() + neigh_idx] = my_base_potential - my_forces[neigh_idx];
     }
 }
 
-// compute the tension of each node along the 4 cardinal directions, thereby proposing swapping pairs
+// compute the tension of each node with its neighbors, thereby proposing swapping pairs
 // SEQUENTIAL COMPLEXITY: n
 // PARALLEL OVER: n
+template<Topology T>
 __global__
 void tensions_kernel(
-    const coords* __restrict__ placement,
+    const Coord_t<T>* __restrict__ placement,
     const uint32_t* __restrict__ inv_placement,
     const float* __restrict__ forces,
     const uint32_t num_nodes,
@@ -116,65 +121,27 @@ void tensions_kernel(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_nodes) return;
 
-    uint32_t my_pairs[4];
-    float my_scores[4];
+    uint32_t my_pairs[T::neighborsCount()];
+    float my_scores[T::neighborsCount()];
 
-    const coords my_place = placement[tid];
-    
-    if (my_place.x > 0) {
-        const uint32_t neighbor = inv_placement[my_place.y * max_width + my_place.x - 1];
-        if (neighbor != UINT32_MAX) {
-            my_pairs[LEFT] = neighbor;
-            my_scores[LEFT] = forces[tid*4 + LEFT] + forces[neighbor*4 + RIGHT]; // tension = sum of forces
-        } else {
-            my_pairs[LEFT] = UINT32_MAX - LEFT - 1; // flag for "empty spot"
-            my_scores[LEFT] = forces[tid*4 + LEFT];
-        }
-    } else {
-        my_pairs[LEFT] = UINT32_MAX;
-        my_scores[LEFT] = 0.0f;
-    }
+    const Coord_t<T> my_place = placement[tid];
 
-    if (my_place.x < max_width - 1) {
-        const uint32_t neighbor = inv_placement[my_place.y * max_width + my_place.x + 1];
-        if (neighbor != UINT32_MAX) {
-            my_pairs[RIGHT] = neighbor;
-            my_scores[RIGHT] = forces[tid*4 + RIGHT] + forces[neighbor*4 + LEFT]; // tension = sum of forces
+    // compute tensions (aka scores)
+    for (uint32_t neigh_idx = 0; neigh_idx < T::neighborsCount(); neigh_idx++) {
+        const Coord_t<T> neigh_place = c_topo<T>.neighbor(my_place, neigh_idx);
+        if (c_topo<T>.contains(neigh_place)) { // valid neighbor
+            const uint32_t neighbor = inv_placement[c_topo<T>.flattenedIdx(neigh_place)];
+            if (neighbor != UINT32_MAX) { // there is a node placed on the neighboring spot
+                my_pairs[neigh_idx] = neighbor;
+                my_scores[neigh_idx] = forces[tid*T::neighborsCount() + neigh_idx] + forces[neighbor*T::neighborsCount() + neigh_idx]; // tension = sum of forces
+            } else { // empty neighboring spot
+                my_pairs[neigh_idx] = UINT32_MAX - neigh_idx - 1; // flag for "empty spot towards the neigh-th neighbor"
+                my_scores[neigh_idx] = forces[tid*T::neighborsCount() + neigh_idx];
+            }
         } else {
-            my_pairs[RIGHT] = UINT32_MAX - RIGHT - 1; // flag for "empty spot"
-            my_scores[RIGHT] = forces[tid*4 + RIGHT];
+            my_pairs[neigh_idx] = UINT32_MAX;
+            my_scores[neigh_idx] = 0.0f;
         }
-    } else {
-        my_pairs[RIGHT] = UINT32_MAX;
-        my_scores[RIGHT] = 0.0f;
-    }
-
-    if (my_place.y > 0) {
-        const uint32_t neighbor = inv_placement[(my_place.y - 1) * max_width + my_place.x];
-        if (neighbor != UINT32_MAX) {
-            my_pairs[UP] = neighbor;
-            my_scores[UP] = forces[tid*4 + UP] + forces[neighbor*4 + DOWN]; // tension = sum of forces
-        } else {
-            my_pairs[UP] = UINT32_MAX - UP - 1; // flag for "empty spot"
-            my_scores[UP] = forces[tid*4 + UP];
-        }
-    } else {
-        my_pairs[UP] = UINT32_MAX;
-        my_scores[UP] = 0.0f;
-    }
-
-    if (my_place.y < max_height - 1) {
-        const uint32_t neighbor = inv_placement[(my_place.y + 1) * max_width + my_place.x];
-        if (neighbor != UINT32_MAX) {
-            my_pairs[DOWN] = neighbor;
-            my_scores[DOWN] = forces[tid*4 + DOWN] + forces[neighbor*4 + UP]; // tension = sum of forces
-        } else {
-            my_pairs[DOWN] = UINT32_MAX - DOWN - 1; // flag for "empty spot"
-            my_scores[DOWN] = forces[tid*4 + DOWN];
-        }
-    } else {
-        my_pairs[DOWN] = UINT32_MAX;
-        my_scores[DOWN] = 0.0f;
     }
 
     // write pairs and scores, from highest to lowest score
@@ -184,7 +151,7 @@ void tensions_kernel(
         uint32_t max_pair = UINT32_MAX;
         float max_score = 0.0f;
         uint32_t max_idx = UINT32_MAX;
-        for (uint32_t j = 0; j < 4; j++) {
+        for (uint32_t j = 0; j < T::neighborsCount(); j++) {
             if (my_scores[j] > max_score || (my_scores[j] == max_score && my_scores[j] > 0 && my_pairs[j] > max_pair)) {
                 max_pair = my_pairs[j];
                 max_score = my_scores[j];
@@ -192,7 +159,7 @@ void tensions_kernel(
             }
         }
         final_pairs[i] = max_pair;
-        final_scores[i] = (uint32_t)min((uint64_t)(UINT32_MAX - 4), (uint64_t)(max_score*FORCE_FIXED_POINT_SCALE)); // go to fixed point to later use scores for book-keeping -> negative scores go to 0
+        final_scores[i] = (uint32_t)min((uint64_t)(UINT32_MAX - T::neighborsCount() - 1), (uint64_t)(max_score*FORCE_FIXED_POINT_SCALE)); // go to fixed point to later use scores for book-keeping -> negative scores go to 0
         if (max_idx != UINT32_MAX) {
             my_pairs[max_idx] = UINT32_MAX;
             my_scores[max_idx] = 0.0f;
@@ -203,6 +170,7 @@ void tensions_kernel(
 // choose the pairs of at most 2 nodes, highest score first, that become candidate for swapping
 // SEQUENTIAL COMPLEXITY: n*log n
 // PARALLEL OVER: n
+template<Topology T>
 __global__
 void exclusive_swaps_kernel(
     const uint32_t* __restrict__ pairs, // pairs[idx] is the partner idx wants to be swapped with
@@ -264,7 +232,7 @@ void exclusive_swaps_kernel(
 
             // go up the tree
             bool outcome = false;
-            if (target >= UINT32_MAX - 4 && target < UINT32_MAX) {
+            if (target >= UINT32_MAX - T::neighborsCount() && target < UINT32_MAX) {
                 // the target is an empty cell (counts as a root, lock immediately -> nobody else could think of claiming you if you chose this path, because tension is symmetric)
                 set_slot(swap_slots, current, target, UINT32_MAX - i);
             } else if (target != UINT32_MAX) {
@@ -278,13 +246,13 @@ void exclusive_swaps_kernel(
                     curr_path[curr_path_length++] = target;
                     current = target;
                     target = target_target;
-                    if (target >= UINT32_MAX - 4) break; // alternative root: a node with no target
+                    if (target >= UINT32_MAX - T::neighborsCount()) break; // alternative root: a node with no target
                     target_target = pairs[target_target * candidates_count + i]; // if this goes to -1, stop after the next iteration, as to still handle the current "target" that will be the "root"
                     score = scores[current * candidates_count + i];
                 }
             }
             // handle "root(s)" as a pair of nodes pointing to each other
-            if (outcome && target < UINT32_MAX - 4 && swap_slots[target].score <= UINT32_MAX - candidates_count) {
+            if (outcome && target < UINT32_MAX - T::neighborsCount() && swap_slots[target].score <= UINT32_MAX - candidates_count) {
                 set_slot(swap_slots, current, target, UINT32_MAX - i); // mutually-pointing pair
                 set_slot(swap_slots, target, current, UINT32_MAX - i);
             }
@@ -363,7 +331,7 @@ void exclusive_swaps_kernel(
             // TODO: only the lower-id node actually needs to right score to generate the event!
             const uint32_t i_of_pair_formation = UINT32_MAX - swap_slots[curr_tid].score; // reconstruct the 'i' of the pair that caused the swap-pair
             uint32_t swap_score = scores[curr_tid * candidates_count + i_of_pair_formation];
-            if (other_tid < UINT32_MAX - 4)
+            if (other_tid < UINT32_MAX - T::neighborsCount())
                 swap_score = max(swap_score, scores[other_tid * candidates_count + i_of_pair_formation]);
             swap_slots[curr_tid].score = swap_score;
         }
@@ -373,6 +341,7 @@ void exclusive_swaps_kernel(
 // from each node involved in a swap, produce a swap event
 // SEQUENTIAL COMPLEXITY: n
 // PARALLEL OVER: n
+template<Topology T>
 __global__
 void swap_events_kernel(
     const slot* __restrict__ swap_slots,
@@ -390,7 +359,7 @@ void swap_events_kernel(
     if (my_swap_slot.id <= tid) return;
     // filter-out no-pair nodes
     if (my_swap_slot.id == UINT32_MAX) return;
-    if (my_swap_slot.id < UINT32_MAX - 4) {
+    if (my_swap_slot.id < UINT32_MAX - T::neighborsCount()) {
         const slot target_swap_slot = swap_slots[my_swap_slot.id];
         if (target_swap_slot.id != tid) return;
         if (my_swap_slot.score != target_swap_slot.score)
@@ -403,13 +372,14 @@ void swap_events_kernel(
     swap* my_ev_swap = ev_swaps + ev_idx;
     float* my_ev_score = ev_scores + ev_idx;
     (*my_ev_swap).lo = tid;
-    (*my_ev_swap).hi = my_swap_slot.id; // this could be UINT32_MAX - 1..4 for empty cells!
+    (*my_ev_swap).hi = my_swap_slot.id; // this could be 'UINT32_MAX - 1..neighborsCount' for empty cells!
     *my_ev_score = ((float)my_swap_slot.score)/FORCE_FIXED_POINT_SCALE;
 }
 
 // from each event (now sorted) give the swapped nodes their rank
 // SEQUENTIAL COMPLEXITY: n (actually, this should be the # events)
 // PARALLEL OVER: n
+template<Topology T>
 __global__
 void scatter_ranks_kernel(
     const swap* __restrict__ ev_swaps,
@@ -422,7 +392,7 @@ void scatter_ranks_kernel(
 
     const swap my_ev_swap = ev_swaps[tid];
     nodes_rank[my_ev_swap.lo] = tid;
-    if (my_ev_swap.hi < UINT32_MAX - 4) // be wary of empty cells
+    if (my_ev_swap.hi < UINT32_MAX - T::neighborsCount()) // be wary of empty cells
         nodes_rank[my_ev_swap.hi] = tid;
 }
 
@@ -431,6 +401,7 @@ void scatter_ranks_kernel(
 // SEQUENTIAL COMPLEXITY: n*h*d
 // PARALLEL OVER: n
 // SHUFFLES OVER: d (hedges)
+template<Topology T>
 __global__
 void cascade_kernel(
     const uint32_t* __restrict__ hedges,
@@ -438,7 +409,7 @@ void cascade_kernel(
     const uint32_t* __restrict__ touching,
     const dim_t* __restrict__ touching_offsets,
     const float* __restrict__ hedge_weights,
-    const coords* __restrict__ placement,
+    const Coord_t<T>* __restrict__ placement,
     const swap* __restrict__ ev_swaps,
     const uint32_t* __restrict__ nodes_rank,
     const uint32_t num_events,
@@ -464,17 +435,14 @@ void cascade_kernel(
     // LOWER-ID NODE (always valid)
 
     uint32_t curr_node = my_ev_swaps.lo;
-    coords my_place = placement[curr_node];
+    Coord_t<T> my_place = placement[curr_node];
 
-    uint32_t direction;
-    if (my_ev_swaps.hi >= UINT32_MAX - 4) {
+    uint32_t direction; // same as "neigh_idx" -> swap-pair neighbor index
+    if (my_ev_swaps.hi >= UINT32_MAX - T::neighborsCount()) {
         direction = UINT32_MAX - my_ev_swaps.hi - 1;
     } else {
-        const coords other_place = placement[my_ev_swaps.hi];
-        if (my_place.x == other_place.x + 1) direction = LEFT;
-        else if (my_place.x == other_place.x - 1) direction = RIGHT;
-        else if (my_place.y == other_place.y + 1) direction = UP;
-        else if (my_place.y == other_place.y - 1) direction = DOWN;
+        const Coord_t<T> other_place = placement[my_ev_swaps.hi];
+        direction = c_topo<T>.neighborIdx(my_place, other_place);
     }
 
     const uint32_t* my_touching = touching + touching_offsets[curr_node];
@@ -496,31 +464,27 @@ void cascade_kernel(
             if (my_hedge < not_my_hedge) {
                 const uint32_t pin = *my_hedge;
                 if (pin == curr_node) continue;
-                coords pin_place;
+                Coord_t<T> pin_place;
                 uint32_t pin_event_idx = nodes_rank[pin];
                 // reconstruct the pin's placement w.r.t. the sequence of events
                 if (pin_event_idx < warp_id) {
                     const swap pin_ev_swaps = ev_swaps[pin_event_idx];
                     if (pin == pin_ev_swaps.hi) pin_place = placement[pin_ev_swaps.lo];
                     else {
-                        if (pin_ev_swaps.hi < UINT32_MAX - 4) pin_place = placement[pin_ev_swaps.hi];
+                        if (pin_ev_swaps.hi < UINT32_MAX - T::neighborsCount()) pin_place = placement[pin_ev_swaps.hi];
                         else {
-                            uint32_t pin_direction = UINT32_MAX - pin_ev_swaps.hi - 1;
+                            uint32_t pin_direction = UINT32_MAX - pin_ev_swaps.hi - 1; // swap neighbor idx
                             pin_place = placement[pin];
-                            if (pin_direction == LEFT) pin_place.x -= 1;
-                            else if (pin_direction == RIGHT) pin_place.x += 1;
-                            else if (pin_direction == UP) pin_place.y -= 1;
-                            else if (pin_direction == DOWN) pin_place.y += 1;
+                            pin_place = c_topo<T>.neighbor(pin_place, pin_direction);
                         }
                     }
                 } else
                     pin_place = placement[pin];
-                const uint32_t distance = manhattan(my_place, pin_place);
+                const uint32_t distance = c_topo<T>.distance(my_place, pin_place);
                 base_potential += my_hedge_weight * distance;
-                if (direction == LEFT) force += my_hedge_weight * max(distance + (pin_place.x >= my_place.x) * 2 - 1, 1);
-                else if (direction == RIGHT) force += my_hedge_weight * max(distance + (pin_place.x <= my_place.x) * 2 - 1, 1);
-                else if (direction == UP) force += my_hedge_weight * max(distance + (pin_place.y >= my_place.y) * 2 - 1, 1);
-                else if (direction == DOWN) force += my_hedge_weight * max(distance + (pin_place.y <= my_place.y) * 2 - 1, 1);
+                // |
+                const Coord_t<T> neigh_place = c_topo<T>.neighbor(my_place, direction);
+                force += my_hedge_weight * max(c_topo<T>.distance(neigh_place, pin_place), 1);
             }
         }
     }
@@ -533,14 +497,13 @@ void cascade_kernel(
 
     // HIGHER-ID NODE (if valid)
 
-    if (my_ev_swaps.hi < UINT32_MAX - 4) {
+    if (my_ev_swaps.hi < UINT32_MAX - T::neighborsCount()) {
         curr_node = my_ev_swaps.hi;
         my_place = placement[curr_node];
         
-        if (direction == LEFT) direction = RIGHT;
-        else if (direction == RIGHT) direction = LEFT;
-        else if (direction == UP) direction = DOWN;
-        else if (direction == DOWN) direction = UP;
+        // ALWAYS TRUE: my_ev_swaps.lo < UINT32_MAX - T::neighborsCount()
+        const Coord_t<T> other_place = placement[my_ev_swaps.lo];
+        direction = c_topo<T>.neighborIdx(my_place, other_place);
 
         const uint32_t* my_touching = touching + touching_offsets[curr_node];
         const uint32_t* not_my_touching = touching + touching_offsets[curr_node + 1];
@@ -561,31 +524,27 @@ void cascade_kernel(
                 if (my_hedge < not_my_hedge) {
                     const uint32_t pin = *my_hedge;
                     if (pin == curr_node) continue;
-                    coords pin_place;
+                    Coord_t<T> pin_place;
                     uint32_t pin_event_idx = nodes_rank[pin];
                     // reconstruct the pin's placement w.r.t. the sequence of events
                     if (pin_event_idx < warp_id) {
                         const swap pin_ev_swaps = ev_swaps[pin_event_idx];
                         if (pin == pin_ev_swaps.hi) pin_place = placement[pin_ev_swaps.lo];
                         else {
-                            if (pin_ev_swaps.hi < UINT32_MAX - 4) pin_place = placement[pin_ev_swaps.hi];
+                            if (pin_ev_swaps.hi < UINT32_MAX - T::neighborsCount()) pin_place = placement[pin_ev_swaps.hi];
                             else {
-                                uint32_t pin_direction = UINT32_MAX - pin_ev_swaps.hi - 1;
+                                uint32_t pin_direction = UINT32_MAX - pin_ev_swaps.hi - 1; // swap neighbor idx
                                 pin_place = placement[pin];
-                                if (pin_direction == LEFT) pin_place.x -= 1;
-                                else if (pin_direction == RIGHT) pin_place.x += 1;
-                                else if (pin_direction == UP) pin_place.y -= 1;
-                                else if (pin_direction == DOWN) pin_place.y += 1;
+                                pin_place = c_topo<T>.neighbor(pin_place, pin_direction);
                             }
                         }
                     } else
                         pin_place = placement[pin];
-                    const uint32_t distance = manhattan(my_place, pin_place);
+                    const uint32_t distance = c_topo<T>.distance(my_place, pin_place);
                     base_potential += my_hedge_weight * distance;
-                    if (direction == LEFT) force += my_hedge_weight * max(distance + (pin_place.x >= my_place.x) * 2 - 1, 1);
-                    else if (direction == RIGHT) force += my_hedge_weight * max(distance + (pin_place.x <= my_place.x) * 2 - 1, 1);
-                    else if (direction == UP) force += my_hedge_weight * max(distance + (pin_place.y >= my_place.y) * 2 - 1, 1);
-                    else if (direction == DOWN) force += my_hedge_weight * max(distance + (pin_place.y <= my_place.y) * 2 - 1, 1);
+                    // |
+                    const Coord_t<T> neigh_place = c_topo<T>.neighbor(my_place, direction);
+                    force += my_hedge_weight * max(c_topo<T>.distance(neigh_place, pin_place), 1);
                 }
             }
         }
@@ -594,9 +553,10 @@ void cascade_kernel(
         base_potential = warpReduceSumLN0<float>(base_potential);
         force = warpReduceSumLN0<float>(force);
         second_force = base_potential - force;
-    } else
+    } else {
         second_force = 0.0f;
-    
+    }
+
     if (lane_id == 0)
         scores[warp_id] = first_force + second_force;
 }
@@ -604,11 +564,12 @@ void cascade_kernel(
 // from each node involved in a swap, produce a swap event
 // SEQUENTIAL COMPLEXITY: n (actually, this is the # swaps to apply)
 // PARALLEL OVER: n
+template<Topology T>
 __global__
 void apply_swaps_kernel(
     const swap* __restrict__ ev_swaps,
     const uint32_t num_good_swaps,
-    coords* __restrict__ placement,
+    Coord_t<T>* __restrict__ placement,
     uint32_t* __restrict__ inv_placement
 ) {
     // STYLE: one node per thread!
@@ -633,25 +594,22 @@ void apply_swaps_kernel(
     */
 
     const swap my_swap = ev_swaps[tid];
-    if (my_swap.hi < UINT32_MAX - 4) {
-        const coords plac_lo = placement[my_swap.lo];
-        const coords plac_hi = placement[my_swap.hi];
+    if (my_swap.hi < UINT32_MAX - T::neighborsCount()) {
+        const Coord_t<T> plac_lo = placement[my_swap.lo];
+        const Coord_t<T> plac_hi = placement[my_swap.hi];
         placement[my_swap.lo] = plac_hi;
         placement[my_swap.hi] = plac_lo;
-        inv_placement[plac_lo.y * max_width + plac_lo.x] = my_swap.hi;
-        inv_placement[plac_hi.y * max_width + plac_hi.x] = my_swap.lo;
+        inv_placement[c_topo<T>.flattenedIdx(plac_lo)] = my_swap.hi;
+        inv_placement[c_topo<T>.flattenedIdx(plac_hi)] = my_swap.lo;
     } else {
-        const coords plac_lo = placement[my_swap.lo];
-        coords plac_hi = plac_lo;
+        const Coord_t<T> plac_lo = placement[my_swap.lo];
+        Coord_t<T> plac_hi = plac_lo;
         uint32_t direction = UINT32_MAX - my_swap.hi - 1;
-        if (direction == LEFT) plac_hi.x -= 1;
-        else if (direction == RIGHT) plac_hi.x += 1;
-        else if (direction == UP) plac_hi.y -= 1;
-        else if (direction == DOWN) plac_hi.y += 1;
-        const uint32_t prev = atomicCAS(&inv_placement[plac_hi.y * max_width + plac_hi.x], UINT32_MAX, my_swap.lo);
+        plac_hi = c_topo<T>.neighbor(plac_hi, direction);
+        const uint32_t prev = atomicCAS(&inv_placement[c_topo<T>.flattenedIdx(plac_hi)], UINT32_MAX, my_swap.lo);
         if (prev == UINT32_MAX) {
             placement[my_swap.lo] = plac_hi;
-            inv_placement[plac_lo.y * max_width + plac_lo.x] = UINT32_MAX;
+            inv_placement[c_topo<T>.flattenedIdx(plac_lo)] = UINT32_MAX;
         }
     }
 }
@@ -661,9 +619,10 @@ void apply_swaps_kernel(
 // NOTE: the 'd^2' is only due to the serialization over sources => it is only 'd' when there is one source
 // PARALLEL OVER: e
 // SHUFFLES OVER: d
+template<Topology T>
 __global__
 void max_src_dst_distance_kernel(
-    const coords* __restrict__ placement,
+    const Coord_t<T>* __restrict__ placement,
     const uint32_t* __restrict__ hedges,
     const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ srcs_count,
@@ -693,11 +652,11 @@ void max_src_dst_distance_kernel(
     uint32_t tot_distance = 0u;
 
     for (const uint32_t* src_ptr = srcs_start; src_ptr < dsts_start; src_ptr++) {
-        const coords src_plc = placement[*src_ptr];
+        const Coord_t<T> src_plc = placement[*src_ptr];
         uint32_t max_distance = 0u;
         for (const uint32_t* dst_ptr = dsts_start + lane_id; dst_ptr < dsts_end; dst_ptr += WARP_SIZE) {
-            const coords dst_plc = placement[*dst_ptr];
-            max_distance = max(max_distance, manhattan(src_plc, dst_plc));
+            const Coord_t<T> dst_plc = placement[*dst_ptr];
+            max_distance = max(max_distance, c_topo<T>.distance(src_plc, dst_plc));
         }
         tot_distance += warpReduceMaxLN0(max_distance);
     }
@@ -707,9 +666,10 @@ void max_src_dst_distance_kernel(
 }
 
 // same as 'max_src_dst_distance_kernel', but accumulates the manhattan distance over all src-dst per hedge
+template<Topology T>
 __global__
 void tot_src_dst_distance_kernel(
-    const coords* __restrict__ placement,
+    const Coord_t<T>* __restrict__ placement,
     const uint32_t* __restrict__ hedges,
     const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ srcs_count,
@@ -730,10 +690,10 @@ void tot_src_dst_distance_kernel(
     uint32_t tot_distance = 0u;
 
     for (const uint32_t* src_ptr = srcs_start; src_ptr < dsts_start; src_ptr++) {
-        const coords src_plc = placement[*src_ptr];
+        const Coord_t<T> src_plc = placement[*src_ptr];
         for (const uint32_t* dst_ptr = dsts_start + lane_id; dst_ptr < dsts_end; dst_ptr += WARP_SIZE) {
-            const coords dst_plc = placement[*dst_ptr];
-            tot_distance += manhattan(src_plc, dst_plc);
+            const Coord_t<T> dst_plc = placement[*dst_ptr];
+            tot_distance += c_topo<T>.distance(src_plc, dst_plc);
         }
     }
 
@@ -747,9 +707,10 @@ void tot_src_dst_distance_kernel(
 // SEQUENTIAL COMPLEXITY: e*d^2
 // PARALLEL OVER: e
 // SHUFFLES OVER: d
+template<Topology T>
 __global__
 void min_spanning_tree_weight_kernel(
-    const coords* __restrict__ placement,
+    const Coord_t<T>* __restrict__ placement,
     const uint32_t* __restrict__ hedges,
     const dim_t* __restrict__ hedges_offsets,
     const float* __restrict__ hedge_weights,
@@ -788,12 +749,12 @@ void min_spanning_tree_weight_kernel(
 
     uint32_t tot_span = 0u;
 
-    coords new_mst_pin_plc = placement[hedge_start[hedge_size]]; // last pin in the hedge
+    Coord_t<T> new_mst_pin_plc = placement[hedge_start[hedge_size]]; // last pin in the hedge
 
     // initialize distance to the first MST pin (last one)
     for (uint32_t pin_idx = 0u; pin_idx < lane_pins_count; pin_idx++) {
-        const coords pin_plc = placement[hedge_start[pin_idx * WARP_SIZE + lane_id]];
-        mst_distance[pin_idx] = manhattan(new_mst_pin_plc, pin_plc);
+        const Coord_t<T> pin_plc = placement[hedge_start[pin_idx * WARP_SIZE + lane_id]];
+        mst_distance[pin_idx] = c_topo<T>.distance(new_mst_pin_plc, pin_plc);
     }
 
     while (true) {
@@ -819,8 +780,8 @@ void min_spanning_tree_weight_kernel(
         // TODO: could optimize by skipping already flagged pins
         new_mst_pin_plc = placement[hedge_start[min_pin]];
         for (uint32_t pin_idx = 0u; pin_idx < lane_pins_count; pin_idx++) {
-            const coords pin_plc = placement[hedge_start[pin_idx * WARP_SIZE + lane_id]];
-            mst_distance[pin_idx] = min(mst_distance[pin_idx], manhattan(new_mst_pin_plc, pin_plc));
+            const Coord_t<T> pin_plc = placement[hedge_start[pin_idx * WARP_SIZE + lane_id]];
+            mst_distance[pin_idx] = min(mst_distance[pin_idx], c_topo<T>.distance(new_mst_pin_plc, pin_plc));
         }
         
         tot_span += min_dst;
@@ -829,3 +790,54 @@ void min_spanning_tree_weight_kernel(
     if (lane_id == 0)
         result[warp_id] = tot_span * hedge_weights[warp_id];
 }
+
+// TEMPLATE INSTANTIATIONS
+
+#define INSTANTIATE_PLACEMENT_KERNELS(T) \
+    template __global__ void inverse_placement_kernel<T>( \
+        const Coord_t<T>*, uint32_t, uint32_t*); \
+     \
+    template __global__ void forces_kernel<T>( \
+        const uint32_t*, const dim_t*, \
+        const uint32_t*, const dim_t*, \
+        const float*, const Coord_t<T>*, uint32_t, float*); \
+     \
+    template __global__ void tensions_kernel<T>( \
+        const Coord_t<T>*, const uint32_t*, const float*, \
+        uint32_t, uint32_t, uint32_t*, uint32_t*); \
+     \
+    template __global__ void exclusive_swaps_kernel<T>( \
+        const uint32_t*, const uint32_t*, uint32_t, uint32_t, \
+        slot*, uint32_t*); \
+     \
+    template __global__ void swap_events_kernel<T>( \
+        const slot*, const uint32_t*, uint32_t, swap*, float*); \
+     \
+    template __global__ void scatter_ranks_kernel<T>( \
+        const swap*, uint32_t, uint32_t*); \
+     \
+    template __global__ void cascade_kernel<T>( \
+        const uint32_t*, const dim_t*, \
+        const uint32_t*, const dim_t*, \
+        const float*, const Coord_t<T>*, \
+        const swap*, const uint32_t*, uint32_t, float*); \
+     \
+    template __global__ void apply_swaps_kernel<T>( \
+        const swap*, uint32_t, Coord_t<T>*, uint32_t*); \
+     \
+    template __global__ void max_src_dst_distance_kernel<T>( \
+        const Coord_t<T>*, const uint32_t*, const dim_t*, \
+        const uint32_t*, const float*, uint32_t, float*); \
+     \
+    template __global__ void tot_src_dst_distance_kernel<T>( \
+        const Coord_t<T>*, const uint32_t*, const dim_t*, \
+        const uint32_t*, const float*, uint32_t, float*); \
+     \
+    template __global__ void min_spanning_tree_weight_kernel<T>( \
+        const Coord_t<T>*, const uint32_t*, const dim_t*, \
+        const float*, uint32_t, float*);
+
+INSTANTIATE_PLACEMENT_KERNELS(Lattice2D)
+INSTANTIATE_PLACEMENT_KERNELS(Torus6D)
+
+#undef INSTANTIATE_PLACEMENT_KERNELS
