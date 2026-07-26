@@ -398,6 +398,48 @@ void scatter_ranks_kernel(
         nodes_rank[my_ev_swap.hi] = tid;
 }
 
+// deterministically cancel duplicate claims on the same empty cell, keeping only the best-scoring (lowest event idx) one
+// SEQUENTIAL COMPLEXITY: n*neighborsCount (actually, n -> # events)
+// PARALLEL OVER: n
+template<Topology T>
+__global__
+void resolve_empty_conflicts_kernel(
+    const Coord_t<T>* __restrict__ placement,
+    const uint32_t* __restrict__ inv_placement,
+    const uint32_t* __restrict__ nodes_rank,
+    const uint32_t num_events,
+    swap* __restrict__ ev_swaps
+) {
+    // STYLE: one event per thread!
+    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_events) return;
+
+    const swap my_ev_swap = ev_swaps[tid];
+    if (my_ev_swap.hi < UINT32_MAX - T::neighborsCount()) return; // not an empty-cell move
+
+    const uint32_t direction = UINT32_MAX - my_ev_swap.hi - 1;
+    const Coord_t<T> target = c_topo<T>.neighbor(placement[my_ev_swap.lo], direction);
+
+    // scan the target cell's neighbors: only they could possibly be contending for it too
+    uint32_t best_event = tid;
+    for (uint32_t neigh_idx = 0; neigh_idx < T::neighborsCount(); neigh_idx++) {
+        const Coord_t<T> nb_coord = c_topo<T>.neighbor(target, neigh_idx);
+        if (!c_topo<T>.contains(nb_coord)) continue;
+        const uint32_t nb_node = inv_placement[c_topo<T>.flattenedIdx(nb_coord)];
+        if (nb_node == UINT32_MAX) continue;
+        const uint32_t nb_event = nodes_rank[nb_node];
+        if (nb_event == UINT32_MAX || nb_event == tid) continue;
+        const swap nb_ev_swap = ev_swaps[nb_event];
+        if (nb_ev_swap.lo != nb_node || nb_ev_swap.hi < UINT32_MAX - T::neighborsCount()) continue; // not an empty move
+        const uint32_t nb_direction = UINT32_MAX - nb_ev_swap.hi - 1;
+        if (c_topo<T>.neighbor(placement[nb_node], nb_direction) == target)
+            best_event = min(best_event, nb_event);
+    }
+
+    if (best_event != tid)
+        ev_swaps[tid].hi = UINT32_MAX; // event cancelled, lost the cell to a better-scoring neighbor
+}
+
 // update forces, and then tensions, pulling each swap-pair one towards the other
 // => this is not done "in isolation" anymore, but considering the "sequence" of swaps by score
 // SEQUENTIAL COMPLEXITY: n*h*d
@@ -430,6 +472,12 @@ void cascade_kernel(
 
     const swap my_ev_swaps = ev_swaps[warp_id];
     // NOTE: current rank == tid
+
+    // cancelled by conflict resolution
+    if (my_ev_swaps.hi == UINT32_MAX) {
+        if (lane_id == 0) scores[warp_id] = 0.0f;
+        return;
+    }
 
     float first_force, second_force;
 
@@ -472,6 +520,7 @@ void cascade_kernel(
                 if (pin_event_idx < warp_id) {
                     const swap pin_ev_swaps = ev_swaps[pin_event_idx];
                     if (pin == pin_ev_swaps.hi) pin_place = placement[pin_ev_swaps.lo];
+                    else if (pin_ev_swaps.hi == UINT32_MAX) pin_place = placement[pin]; // cancelled empty move, pin never moved
                     else {
                         if (pin_ev_swaps.hi < UINT32_MAX - T::neighborsCount()) pin_place = placement[pin_ev_swaps.hi];
                         else {
@@ -532,6 +581,7 @@ void cascade_kernel(
                     if (pin_event_idx < warp_id) {
                         const swap pin_ev_swaps = ev_swaps[pin_event_idx];
                         if (pin == pin_ev_swaps.hi) pin_place = placement[pin_ev_swaps.lo];
+                        else if (pin_ev_swaps.hi == UINT32_MAX) pin_place = placement[pin]; // cancelled empty move, pin never moved
                         else {
                             if (pin_ev_swaps.hi < UINT32_MAX - T::neighborsCount()) pin_place = placement[pin_ev_swaps.hi];
                             else {
@@ -580,22 +630,14 @@ void apply_swaps_kernel(
 
     /*
     * Notes:
-    * - no need for atomics, swaps are already mutually exclusive
-    * - exceptional case, if two nodes aiming for an empty cell, wanted the same empty cell, give it to the lowest-id one!
-    *   The other one can try again on the next round!
-    *   => For now, this is not deterministic, not even lowest-id, literally first-come-first-served!
-    * 
-    * TODO: the solution in the "exceptional case" isn't great, because it screws up the "in sequence" gain calculation...
-    *       Must find a way to preclude moves into the same cell earlier than here...
-    * HOW: re-design the whole "pairing" and "slots" mechanism during the tension, walks, and events generation kernels:
-    * - the tensions kernel proposes, as candidates, not the id of the node with which to swap, but the coordinates the node wants to occupy
-    * - slots are one per cell, not one per node, everything else is the same, but now empty cells are contended too like every other
-    *   - all the walks logic is the same, empty cells are simply passive actors, behaving just like roots that have no target of their own
-    * - even the flags scan happens the same way, here we could keep one flag per node, only set by the lowest-id node, no issue
-    * - events generation is again one thread per node, pass through the node's placement to get to its slot tho
+    * - no need for atomics:
+    *   - node<->node swaps are already mutually exclusive
+    *   - conflict resolution made empty-cell moves mutually exclusive
     */
 
     const swap my_swap = ev_swaps[tid];
+    if (my_swap.hi == UINT32_MAX) return; // cancelled by 'resolve_empty_conflicts_kernel'
+
     if (my_swap.hi < UINT32_MAX - T::neighborsCount()) {
         const Coord_t<T> plac_lo = placement[my_swap.lo];
         const Coord_t<T> plac_hi = placement[my_swap.hi];
@@ -605,14 +647,11 @@ void apply_swaps_kernel(
         inv_placement[c_topo<T>.flattenedIdx(plac_hi)] = my_swap.lo;
     } else {
         const Coord_t<T> plac_lo = placement[my_swap.lo];
-        Coord_t<T> plac_hi = plac_lo;
         uint32_t direction = UINT32_MAX - my_swap.hi - 1;
-        plac_hi = c_topo<T>.neighbor(plac_hi, direction);
-        const uint32_t prev = atomicCAS(&inv_placement[c_topo<T>.flattenedIdx(plac_hi)], UINT32_MAX, my_swap.lo);
-        if (prev == UINT32_MAX) {
-            placement[my_swap.lo] = plac_hi;
-            inv_placement[c_topo<T>.flattenedIdx(plac_lo)] = UINT32_MAX;
-        }
+        const Coord_t<T> plac_hi = c_topo<T>.neighbor(plac_lo, direction);
+        placement[my_swap.lo] = plac_hi;
+        inv_placement[c_topo<T>.flattenedIdx(plac_hi)] = my_swap.lo;
+        inv_placement[c_topo<T>.flattenedIdx(plac_lo)] = UINT32_MAX;
     }
 }
 
@@ -817,6 +856,9 @@ void min_spanning_tree_weight_kernel(
      \
     template __global__ void scatter_ranks_kernel<T>( \
         const swap*, uint32_t, uint32_t*); \
+     \
+    template __global__ void resolve_empty_conflicts_kernel<T>( \
+        const Coord_t<T>*, const uint32_t*, const uint32_t*, uint32_t, swap*); \
      \
     template __global__ void cascade_kernel<T>( \
         const uint32_t*, const dim_t*, \

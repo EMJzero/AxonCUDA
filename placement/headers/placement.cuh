@@ -171,6 +171,16 @@ void scatter_ranks_kernel(
 
 template<Topology T>
 __global__
+void resolve_empty_conflicts_kernel(
+    const Coord_t<T>* __restrict__ placement,
+    const uint32_t* __restrict__ inv_placement,
+    const uint32_t* __restrict__ nodes_rank,
+    const uint32_t num_events,
+    swap* __restrict__ ev_swaps
+);
+
+template<Topology T>
+__global__
 void cascade_kernel(
     const uint32_t* __restrict__ hedges,
     const dim_t* __restrict__ hedges_offsets,

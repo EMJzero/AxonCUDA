@@ -265,6 +265,24 @@ void forceDirectedRefinement(
         }
 
         {
+            // launch configuration - resolve empty conflicts kernel
+            int threads_per_block = 128;
+            int num_threads_needed = num_events; // 1 thread per event
+            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+            // launch - resolve empty conflicts kernel
+            LAUNCH(cfg) TID(tid) RUN << "resolve empty conflicts kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            resolve_empty_conflicts_kernel<T><<<blocks, threads_per_block, 0, stream>>>(
+                d_placement,
+                d_inv_placement,
+                d_nodes_rank,
+                num_events,
+                d_ev_swaps
+            );
+            DBG(cfg) CUDA_CHECK(cudaGetLastError());
+            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+
+        {
             // launch configuration - cascade kernel
             int threads_per_block = 128; // 128/32 -> 4 warps per block
             int warps_per_block = threads_per_block / WARP_SIZE;
