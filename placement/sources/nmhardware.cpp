@@ -235,17 +235,19 @@ namespace hwmodel {
         if (hedges.empty())
             return {};
 
-        Coord min, max;
-        min.setAll(std::numeric_limits<int>::max());
-        max.setAll(0);
         for (const auto& hyperedge : hedges) {
+            Coord min, max;
+            min.setAll(std::numeric_limits<int>::max());
+            max.setAll(0);
             for (uint32_t pin = hyperedge.offset(); pin < hyperedge.offset() + hyperedge.length(); ++pin) {
                 Coord plc = placement[hedges_flat[pin]];
                 min = min.componentWiseMin(plc);
                 max = max.componentWiseMax(plc);
             }
 
-            const double volume = static_cast<double>((max - min).volume());
+            double volume = 1.0;
+            for (uint32_t dim = 0; dim < Coord::dimensions(); ++dim)
+                volume *= static_cast<double>(max[dim] - min[dim] + 1);
             const double weight = static_cast<double>(hyperedge.weight());
             ar_mean += volume;
             geo_mean += std::log(volume);

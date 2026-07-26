@@ -113,7 +113,7 @@ namespace hwmodel {
         double latencyPerRouting() const { return latency_per_routing_; }
         double latencyPerWire() const { return latency_per_wire_; }
 
-        uint32_t coresCount() const { return topology_.extent().volume(); }
+        uint64_t coresCount() const { return topology_.extent().volume(); }
         uint32_t coresAlongDim(uint32_t dim) const { return topology_.extent()[dim]; }
 
         // empirical: can have false negatives (no false positives tho)

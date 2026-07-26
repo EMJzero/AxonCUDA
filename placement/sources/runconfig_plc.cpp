@@ -63,7 +63,7 @@ namespace config_plc {
         std::string constraints;
         uint32_t labelprop_repeats = LABELPROP_REPEATS;
         uint32_t fd_iterations = FD_ITERATIONS;
-        uint32_t candidates_count = MAX_CANDIDATE_MOVES;
+        uint32_t candidates_count = CANDIDATE_MOVES;
         uint32_t multi_start_override = MULTISTART_ATTEMPTS;
         uint32_t num_host_threads = NUM_HOST_THREADS;
         TargetTopology topology = TargetTopology::LATTICE2D;
@@ -109,7 +109,7 @@ namespace config_plc {
             } else if (arg == "-cnc") {
                 if (i + 1 >= argc) { std::cerr << "Error: -cnc requires a positive integer value\n"; std::exit(1); }
                 candidates_count = std::stoul(argv[++i]);
-                if (candidates_count == 0 || candidates_count > MAX_CANDIDATE_MOVES) { std::cerr << "Error: -cnc must be greater than 0 and less or equal to " << MAX_CANDIDATE_MOVES << "\n"; std::exit(1); }
+                if (candidates_count == 0) { std::cerr << "Error: -cnc must be greater than zero\n"; std::exit(1); }
             } else if (arg == "-t") {
                 if (i + 1 >= argc) { std::cerr << "Error: -t requires a topology name\n"; std::exit(1); }
                 std::string topo_name = argv[++i];

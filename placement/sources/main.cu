@@ -95,6 +95,11 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        if (cfg.candidates_count > T::neighborsCount()) {
+            INFO(cfg) std::cout << "WARNING: lowering candidates count (-cnc) to " << T::neighborsCount() << ", which is the maximum neighbors count in the current topology !!\n";
+            cfg.candidates_count = T::neighborsCount();
+        }
+
         std::cout << "CUDA device:\n";
 
         // get device properties
@@ -565,9 +570,11 @@ int main(int argc, char** argv) {
                 DBG(cfg) std::cout << "Computing placement multicast metrics...\n";
                 auto mc_metrics = hw.getAllMulticastMetrics(hg, h_placement);
                 std::cout << "Placement multicast metrics:\n";
-                std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << mc_metrics.energy.value() << "\n";
+                if (mc_metrics.energy.has_value()) std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << mc_metrics.energy.value() << "\n";
+                else std::cout << "  Energy:          N/A (not implemented for this topology)\n";
                 std::cout << "  Avg. latency:    " << std::fixed << std::setprecision(3) << mc_metrics.avg_latency.value() << "\n";
-                std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.max_congestion.value() << "\n";
+                if (mc_metrics.max_congestion.has_value()) std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.max_congestion.value() << "\n";
+                else std::cout << "  Max. congestion: N/A (not implemented for this topology)\n";
                 std::cout << "  Evaluation fraction: " << std::fixed << std::setprecision(3) << mc_metrics.evaluation_fraction << "\n";
             }
 

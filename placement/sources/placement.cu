@@ -33,7 +33,7 @@ void forceDirectedRefinement(
     auto thrust_exec = thrust::cuda::par.on(stream);
     // device pointers
     // refinement structures
-    float *d_forces = nullptr; // forces[4*node idx + 0 for dx, + 1 for sx, +2 for up, +2 for down] -> direction of the node's two proposed moves
+    float *d_forces = nullptr; // forces[neighborsCount*node idx + neigh_idx] -> gain from moving the node towards its neigh_idx-th neighbor
     uint32_t *d_pairs = nullptr; // pairs[4*node idx + 0..] -> nodes the current one wants to swap with, ordered by decreasing score
     uint32_t *d_scores = nullptr; // scores[4*node idx + 0..] -> score with which node wants to pair with other nodes
     slot *d_swap_slots = nullptr; // slot to finalize node pairs while computing exclusive swaps (true dtype: "slot")
@@ -43,7 +43,7 @@ void forceDirectedRefinement(
     float *d_ev_scores = nullptr; // ev_scores[event idx] -> score (cost gain) achieved by the event's swap
     uint32_t *d_nodes_rank = nullptr; // node_rank[node idx] -> rank (index) in the sorted events by score of the node
 
-    CUDA_CHECK(cudaMallocAsync(&d_forces, 4 * num_nodes * sizeof(float), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_forces, T::neighborsCount() * num_nodes * sizeof(float), stream));
     CUDA_CHECK(cudaMallocAsync(&d_pairs, cfg.candidates_count * num_nodes * sizeof(uint32_t), stream));
     CUDA_CHECK(cudaMallocAsync(&d_scores, cfg.candidates_count * num_nodes * sizeof(uint32_t), stream));
     CUDA_CHECK(cudaMallocAsync(&d_swap_slots, num_nodes * sizeof(slot), stream));
@@ -455,8 +455,8 @@ void logForces(
     const cudaStream_t stream,
     const int tid
 ) {
-    std::vector<float> forces_tmp(num_nodes * 4);
-    CUDA_CHECK(cudaMemcpyAsync(forces_tmp.data(), d_forces, num_nodes * 4 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    std::vector<float> forces_tmp(num_nodes * T::neighborsCount());
+    CUDA_CHECK(cudaMemcpyAsync(forces_tmp.data(), d_forces, num_nodes * T::neighborsCount() * sizeof(float), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::cout TID(tid) << "Forces:\n";
     for (uint32_t i = 0; i < num_nodes; ++i) {

@@ -133,7 +133,9 @@ void tensions_kernel(
             const uint32_t neighbor = inv_placement[c_topo<T>.flattenedIdx(neigh_place)];
             if (neighbor != UINT32_MAX) { // there is a node placed on the neighboring spot
                 my_pairs[neigh_idx] = neighbor;
-                my_scores[neigh_idx] = forces[tid*T::neighborsCount() + neigh_idx] + forces[neighbor*T::neighborsCount() + neigh_idx]; // tension = sum of forces
+                // tension = sum of opposing forces = my gain for moving towards the neighbor + the neighbor's gain for moving back towards me
+                const uint32_t back_idx = c_topo<T>.neighborIdx(neigh_place, my_place);
+                my_scores[neigh_idx] = forces[tid*T::neighborsCount() + neigh_idx] + forces[neighbor*T::neighborsCount() + back_idx];
             } else { // empty neighboring spot
                 my_pairs[neigh_idx] = UINT32_MAX - neigh_idx - 1; // flag for "empty spot towards the neigh-th neighbor"
                 my_scores[neigh_idx] = forces[tid*T::neighborsCount() + neigh_idx];

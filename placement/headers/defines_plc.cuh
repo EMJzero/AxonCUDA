@@ -35,8 +35,7 @@
 
 // USED BY: candidate moves kernel
 
-// TODO: go exotic with the stencil, not just a "+", but extend this beyond 4 with the 8-point stencil for instance!!
-#define MAX_CANDIDATE_MOVES 4 // must be between 1 and 4
+#define CANDIDATE_MOVES 4 // must be between 1 and 4
 
 
 // USED BY: force-directed refinement

@@ -98,8 +98,8 @@ namespace topology {
         }
 
         // number of points in the volume between the origin and this coordinate (excluded)
-        TOPOLOGY_HOST_DEVICE uint32_t volume() const noexcept {
-            uint32_t product = 1u;
+        TOPOLOGY_HOST_DEVICE uint64_t volume() const noexcept {
+            uint64_t product = 1u;
             for (uint32_t dim = 0; dim < N; ++dim)
                 product *= std::abs(components_[dim]);
             return product;
@@ -432,7 +432,7 @@ namespace topology {
                 const uint64_t magnitude = static_cast<uint64_t>(difference < 0 ? -difference : difference);
                 const uint32_t extent = static_cast<uint32_t>(extent_[dim]);
                 const uint32_t direct = static_cast<uint32_t>(magnitude % extent);
-                result += std::min(direct, extent - direct);
+                result += (direct < extent - direct) ? direct : extent - direct; // min
             }
             return result;
         }

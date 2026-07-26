@@ -178,7 +178,7 @@ int main(int argc, char** argv) {
     float epsi = 0.0f;
     // |
     std::string plac_constraints_name;
-    std::string topology_name;
+    std::string topology_name = "lat2d";
     bool feedforward_order = false;
     bool unicast_metrics = true;
     bool multicast_metrics = true;
@@ -370,9 +370,11 @@ int main(int argc, char** argv) {
                 if (multicast_metrics) {
                     auto mc_metrics = plac_constr.getAllMulticastMetrics(placement_hg, placement);
                     std::cout << "Placement multicast metrics:\n";
-                    std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << mc_metrics.energy.value() << "\n";
+                    if (mc_metrics.energy.has_value()) std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << mc_metrics.energy.value() << "\n";
+                    else std::cout << "  Energy:          N/A (not implemented for this topology)\n";
                     std::cout << "  Avg. latency:    " << std::fixed << std::setprecision(3) << mc_metrics.avg_latency.value() << "\n";
-                    std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.max_congestion.value() << "\n";
+                    if (mc_metrics.max_congestion.has_value()) std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.max_congestion.value() << "\n";
+                    else std::cout << "  Max. congestion: N/A (not implemented for this topology)\n";
                 }
             } else {
                 std::cerr << "WARNING, invalid placement !!\n";
