@@ -1,4 +1,5 @@
 #pragma once
+#include <cmath>
 #include <vector>
 #include <string>
 #include <limits>
@@ -9,6 +10,9 @@
 #include <algorithm>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
+
+#include "hgraph.hpp"
 
 // TOPOLOGIES
 // => coordinates are usable on both host and device
@@ -492,12 +496,233 @@ namespace topology {
         }
     };
 
+    // ARBITRARY: an undirected weighted graph, used as-is as the target topology
+    // => weights are the "length" of each edge, distances are precomputed shortest weighted paths
+    // => since neighborsCount() is used as a fixed-size register/stack array bound in device kernels, the
+    //    maximum degree of any node must be known at compile time (MaxDegree), same as Torus/Lattice's N
+    // => the whole class is copied byte-for-byte into CUDA __constant__ memory, whose hardware budget is a
+    //    fixed ~64KB shared with every other topology instantiated in the program; this caps how large a
+    //    graph can be supported (MaxNodes) - see the size static_assert below. A future "ArbitrarySparse"
+    //    variant (hash-table based) is the intended escape hatch for graphs too large to fit here.
+    template<uint32_t MaxNodes, uint32_t MaxDegree>
+    class Arbitrary final {
+        static_assert(MaxNodes > 0, "An arbitrary topology must support at least one node.");
+        static_assert(MaxDegree > 0, "An arbitrary topology must support at least one neighbor per node.");
+        static_assert(
+            sizeof(uint32_t) * (2u * MaxNodes * MaxDegree + MaxNodes * MaxNodes) + sizeof(int) <= 65536,
+            "Arbitrary<MaxNodes, MaxDegree> would exceed CUDA's ~64KB __constant__ memory budget; "
+            "reduce MaxNodes/MaxDegree, or wait for the future ArbitrarySparse variant to support larger graphs."
+        );
+
+        public:
+        static constexpr uint32_t dimensions = 1;
+
+        using Coord = typename topology::Coord<1>;
+        using Path = typename std::vector<Coord>;
+        using Paths = typename std::vector<Path>;
+
+        // sentinel marking an unused neighbor slot
+        static constexpr uint32_t INVALID_NODE = UINT32_MAX;
+        // sentinel marking two nodes with no path between them (a disconnected graph is rejected at load time)
+        static constexpr uint32_t UNREACHABLE = UINT32_MAX;
+        // fixed-point scale applied to edge weights ("lengths") so accumulated distances stay integral
+        static constexpr float LENGTH_SCALE = 1024.0f;
+
+        private:
+        Coord extent_; // extent_[0] = number of nodes actually in use (<= MaxNodes)
+        uint32_t neighbors_[MaxNodes * MaxDegree]; // neighbors_[node*MaxDegree + k] -> k-th adjacent node, or INVALID_NODE
+        uint32_t edge_lengths_[MaxNodes * MaxDegree]; // parallel to neighbors_: fixed-point length of that edge
+        uint32_t distances_[MaxNodes * MaxNodes]; // distances_[src*MaxNodes + dst] -> precomputed fixed-point shortest-path length
+
+        public:
+        // default: single isolated node, used as initial storage on device before the real graph is uploaded
+        TOPOLOGY_HOST_DEVICE constexpr Arbitrary() noexcept : extent_{1}, neighbors_{}, edge_lengths_{}, distances_{} {
+            for (uint32_t i = 0; i < MaxNodes * MaxDegree; ++i) neighbors_[i] = INVALID_NODE;
+            for (uint32_t i = 0; i < MaxNodes * MaxDegree; ++i) edge_lengths_[i] = 0;
+            for (uint32_t i = 0; i < MaxNodes * MaxNodes; ++i) distances_[i] = 0;
+        }
+
+        // build the topology from an arbitrary undirected weighted graph, reusing hgraph's loading infrastructure:
+        // every hyperedge is expanded into one undirected edge per (source, destination) pair, weighted by the
+        // hyperedge's weight (its "length") -> a plain 2-pin hyperedge is just a regular graph edge
+        static Arbitrary fromGraph(const hgraph::HyperGraph& graph) {
+            const uint32_t node_count = graph.nodes();
+            if (node_count == 0)
+                throw std::invalid_argument("Arbitrary topology graph has no nodes.");
+            if (node_count > MaxNodes)
+                throw std::invalid_argument(
+                    "Arbitrary topology graph has " + std::to_string(node_count) + " nodes, exceeding the "
+                    "maximum supported (" + std::to_string(MaxNodes) + "); increase the MaxNodes template parameter."
+                );
+
+            // collect undirected edges, keeping the minimum length for any duplicate pair
+            std::vector<std::unordered_map<uint32_t, uint32_t>> adjacency(node_count);
+            auto addEdge = [&](uint32_t u, uint32_t v, float weight) {
+                if (u == v) return; // ignore self-loops
+                if (!(weight > 0.0f))
+                    throw std::invalid_argument("Arbitrary topology edge weights (lengths) must be positive.");
+                const uint32_t length = std::max<uint32_t>(1u, static_cast<uint32_t>(std::llround(static_cast<double>(weight) * LENGTH_SCALE)));
+                auto insertMin = [&](uint32_t a, uint32_t b) {
+                    auto it = adjacency[a].find(b);
+                    if (it == adjacency[a].end() || length < it->second)
+                        adjacency[a][b] = length;
+                };
+                insertMin(u, v);
+                insertMin(v, u);
+            };
+
+            for (const auto& he : graph.hedges()) {
+                const std::vector<uint32_t> srcs = he.sources();
+                const std::vector<uint32_t> dsts = he.destinations();
+                for (uint32_t u : srcs) {
+                    if (u >= node_count) throw std::invalid_argument("Arbitrary topology graph has an out-of-range node id.");
+                    for (uint32_t v : dsts) {
+                        if (v >= node_count) throw std::invalid_argument("Arbitrary topology graph has an out-of-range node id.");
+                        addEdge(u, v, he.weight());
+                    }
+                }
+            }
+
+            Arbitrary topo;
+            topo.extent_[0] = static_cast<int>(node_count);
+            for (uint32_t i = 0; i < MaxNodes * MaxDegree; ++i) topo.neighbors_[i] = INVALID_NODE;
+            for (uint32_t i = 0; i < MaxNodes * MaxDegree; ++i) topo.edge_lengths_[i] = 0;
+            for (uint32_t i = 0; i < MaxNodes * MaxNodes; ++i) topo.distances_[i] = UNREACHABLE;
+
+            for (uint32_t u = 0; u < node_count; ++u) {
+                if (adjacency[u].size() > MaxDegree)
+                    throw std::invalid_argument(
+                        "Node " + std::to_string(u) + " has degree " + std::to_string(adjacency[u].size()) +
+                        ", exceeding the maximum supported degree (" + std::to_string(MaxDegree) + "); increase the MaxDegree template parameter."
+                    );
+
+                std::vector<uint32_t> neighs;
+                neighs.reserve(adjacency[u].size());
+                for (const auto& [v, len] : adjacency[u]) neighs.push_back(v);
+                std::sort(neighs.begin(), neighs.end()); // deterministic ordering
+
+                for (uint32_t k = 0; k < neighs.size(); ++k) {
+                    topo.neighbors_[u * MaxDegree + k] = neighs[k];
+                    topo.edge_lengths_[u * MaxDegree + k] = adjacency[u].at(neighs[k]);
+                }
+            }
+
+            // Floyd-Warshall all-pairs shortest paths (fixed-point integer arithmetic)
+            for (uint32_t u = 0; u < node_count; ++u) {
+                topo.distances_[u * MaxNodes + u] = 0;
+                for (const auto& [v, len] : adjacency[u]) {
+                    const uint32_t idx = u * MaxNodes + v;
+                    if (len < topo.distances_[idx]) topo.distances_[idx] = len;
+                }
+            }
+            for (uint32_t mid = 0; mid < node_count; ++mid) {
+                for (uint32_t u = 0; u < node_count; ++u) {
+                    const uint32_t d_u_mid = topo.distances_[u * MaxNodes + mid];
+                    if (d_u_mid == UNREACHABLE) continue;
+                    for (uint32_t v = 0; v < node_count; ++v) {
+                        const uint32_t d_mid_v = topo.distances_[mid * MaxNodes + v];
+                        if (d_mid_v == UNREACHABLE) continue;
+                        const uint64_t via = static_cast<uint64_t>(d_u_mid) + d_mid_v;
+                        if (via < topo.distances_[u * MaxNodes + v])
+                            topo.distances_[u * MaxNodes + v] = static_cast<uint32_t>(via);
+                    }
+                }
+            }
+
+            for (uint32_t u = 0; u < node_count; ++u) {
+                for (uint32_t v = 0; v < node_count; ++v) {
+                    if (topo.distances_[u * MaxNodes + v] == UNREACHABLE)
+                        throw std::invalid_argument(
+                            "Arbitrary topology graph is disconnected (no path from node " + std::to_string(u) +
+                            " to node " + std::to_string(v) + ")."
+                        );
+                }
+            }
+
+            return topo;
+        }
+
+        const Coord& extent() const noexcept {
+            return extent_;
+        }
+
+        TOPOLOGY_HOST_DEVICE bool contains(const Coord& coordinate) const noexcept {
+            return coordinate[0] >= 0 && coordinate[0] < extent_[0];
+        }
+
+        TOPOLOGY_HOST_DEVICE static constexpr uint32_t neighborsCount() noexcept {
+            return MaxDegree;
+        }
+
+        TOPOLOGY_HOST_DEVICE Coord neighbor(const Coord& src, uint32_t neighbor_idx) const noexcept {
+            const uint32_t node = static_cast<uint32_t>(src[0]);
+            const uint32_t neigh = neighbors_[node * MaxDegree + neighbor_idx];
+            return neigh == INVALID_NODE ? Coord{-1} : Coord{static_cast<int>(neigh)};
+        }
+
+        TOPOLOGY_HOST_DEVICE uint32_t neighborIdx(const Coord& src, const Coord& neigh) const noexcept {
+            const uint32_t node = static_cast<uint32_t>(src[0]);
+            const uint32_t target = static_cast<uint32_t>(neigh[0]);
+            for (uint32_t k = 0; k < MaxDegree; ++k) {
+                if (neighbors_[node * MaxDegree + k] == target)
+                    return k;
+            }
+            return UINT32_MAX;
+        }
+
+        TOPOLOGY_HOST_DEVICE uint32_t distance(const Coord& src, const Coord& dst) const noexcept {
+            return distances_[static_cast<uint32_t>(src[0]) * MaxNodes + static_cast<uint32_t>(dst[0])];
+        }
+
+        TOPOLOGY_HOST_DEVICE uint32_t flattenedIdx(const Coord& plc) const noexcept {
+            return static_cast<uint32_t>(plc[0]);
+        }
+
+        Paths iterMinimumPaths(const Coord& src, const Coord& dst) const {
+            if (!contains(src) || !contains(dst))
+                throw std::invalid_argument("Arbitrary coordinates are outside its extent.");
+
+            Paths paths;
+            Path path{src};
+            Coord current = src;
+
+            auto visit = [&](auto&& self) -> void {
+                if (current == dst) {
+                    paths.push_back(path);
+                    return;
+                }
+
+                const uint32_t remaining = distance(current, dst);
+                const uint32_t node = static_cast<uint32_t>(current[0]);
+                for (uint32_t k = 0; k < MaxDegree; ++k) {
+                    const uint32_t neigh = neighbors_[node * MaxDegree + k];
+                    if (neigh == INVALID_NODE) continue;
+
+                    const uint32_t edge_len = edge_lengths_[node * MaxDegree + k];
+                    const Coord next{static_cast<int>(neigh)};
+                    if (distance(next, dst) + edge_len != remaining) continue;
+
+                    const Coord saved = current;
+                    current = next;
+                    path.push_back(next);
+                    self(self);
+                    path.pop_back();
+                    current = saved;
+                }
+            };
+
+            visit(visit);
+            return paths;
+        }
+    };
+
     // predefined topologies ready for use
     using Lattice2D = Lattice<2>;
     using Lattice3D = Lattice<3>;
     using Torus2D = Torus<2>;
     using Torus3D = Torus<3>;
     using Torus6D = Torus<6>;
+    using ArbitraryGraph = Arbitrary<64, 32>; // capped by the __constant__ memory budget - see static_assert above
 
     // verify that defined topologies satisfy the concept
     static_assert(Topology<Lattice2D>);
@@ -505,6 +730,8 @@ namespace topology {
     static_assert(Topology<Torus2D>);
     static_assert(Topology<Torus3D>);
     static_assert(Topology<Torus6D>);
+    static_assert(Topology<ArbitraryGraph>);
+    static_assert(std::is_trivially_copyable_v<ArbitraryGraph>);
 
     // verify that coordinates are allocated as fixed size buffers
     static_assert(sizeof(Coord<2>) == 2 * sizeof(int));

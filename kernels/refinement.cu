@@ -699,12 +699,15 @@ void sparse_pins_per_partition_count_kernel(
         // now all thread in the warp set their "bitmap.flg" of my_ppp_offsets to 1 in parallel
         // => since multiple threads might want to write the same 64bit word, make them agree on a single update per word
         const dim_t ppp_bitmap_idx = part >> BITMAP_CAPLOG; // aka: part / BITMAP_CAPACITY
-        const uint64_t ppp_bitmask = 1ull << (part & (BITMAP_CAPACITY - 1u)); // put a 1 in position part % BITMAP_CAPACITY, all other bits are zero
+        const uint32_t ppp_bit_pos = part & (BITMAP_CAPACITY - 1u); // aka: part % BITMAP_CAPACITY
         const unsigned active = __activemask();
         // lanes targeting the same 64+64-bit word cooperate
         const unsigned peers = __match_any_sync(active, ppp_bitmap_idx);
         // OR-reduce all bit requests for the same word across peers
-        const uint64_t combined_mask = __reduce_or_sync(peers, ppp_bitmask);
+        const uint32_t ppp_bitmask_lo = ppp_bit_pos < 32u ? (1u << ppp_bit_pos) : 0u;
+        const uint32_t ppp_bitmask_hi = ppp_bit_pos < 32u ? 0u : (1u << (ppp_bit_pos - 32u));
+        const uint64_t combined_mask =
+            ((uint64_t)__reduce_or_sync(peers, ppp_bitmask_hi) << 32) | (uint64_t)__reduce_or_sync(peers, ppp_bitmask_lo);
         const int leader = __ffs(peers) - 1;
         if (static_cast<int>(lane_id) == leader) {
             // exactly one writer per bitmap per iteration
@@ -1199,22 +1202,23 @@ void inbound_sets_size_kernel(
         const dim_t pp_map_idx = part >> 5u; // aka: part / 2**5
         const uint32_t pp_map_bit = 1u << (part & 31u); // aka: put a 1 in position part % 32
         const unsigned active = __activemask();
-        // lanes targeting the same 64+64-bit word cooperate
-        const unsigned peers = __match_any_sync(active, pp_map_idx);
+        // lanes targeting the same 32-bit word cooperate on the update
+        const unsigned word_peers = __match_any_sync(active, pp_map_idx);
+        // lanes targeting the very same partition cooperate on the count
+        const unsigned part_peers = __match_any_sync(active, part);
         // OR-reduce all bit requests for the same word across peers
-        const uint64_t combined_mask = __reduce_or_sync(peers, pp_map_bit);
-        const int leader = __ffs(peers) - 1;
-        uint32_t prev;
+        const uint32_t combined_mask = __reduce_or_sync(word_peers, pp_map_bit);
+        const int leader = __ffs(word_peers) - 1;
+        uint32_t prev = 0u;
         if (static_cast<int>(lane_id) == leader) {
             // exactly one writer per map per iteration
             uint32_t* pp_ptr = my_pp_map + pp_map_idx;
-            const uint32_t old_map = *pp_ptr;
-            const uint32_t updated_bitmap = old_map | combined_mask;
-            *pp_ptr = updated_bitmap;
-            prev = __shfl_sync(peers, old_map, leader);
-        } else {
-            prev = __shfl_sync(peers, 0u, leader);
+            prev = *pp_ptr;
+            *pp_ptr = prev | combined_mask;
         }
-        if ((prev & pp_map_bit) == 0) atomicAdd(&partitions_inbound_sizes[part], 1u);
+        prev = __shfl_sync(word_peers, prev, leader);
+        const int part_leader = __ffs(part_peers) - 1;
+        if (static_cast<int>(lane_id) == part_leader && (prev & pp_map_bit) == 0)
+            atomicAdd(&partitions_inbound_sizes[part], 1u);
     }
 }

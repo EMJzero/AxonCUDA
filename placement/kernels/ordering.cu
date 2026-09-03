@@ -127,6 +127,75 @@ float sibling_move_gain(
     return hedge_weight * static_cast<float>(static_cast<int32_t>(curr_cost) - static_cast<int32_t>(moved_cost));
 }
 
+// warp-cooperatively evaluates, per touching hyperedge, the exact 'sibling_move_gain' from moving to the
+// other side of the bisection, then sums it across every touching hyperedge; pin iteration is flattened
+// across hedge boundaries exactly like 'warpForEachTouchingPin' (so an oversized hedge doesn't stall lanes
+// that already exhausted a smaller one), but since 'sibling_move_gain' is a per-hedge non-linear function,
+// a flattened hedge's pins can now land on several different lanes -> their partial counts are combined
+// through per-hedge shared-memory accumulators before the gain is evaluated
+// 'classify(pin)' must return: 0u if the pin is (still) on my side, 1u if on the other side, UINT32_MAX to ignore it
+// NOTE: 'sm_hedge_*'/'sm_*_part_pins' are per-warp scratch, WARP_SIZE entries each, exclusive to the calling warp
+template<typename Classify>
+__device__ __forceinline__
+float warpTouchingSiblingGain(
+    const uint32_t* __restrict__ hedges,
+    const dim_t* __restrict__ hedges_offsets,
+    const float* __restrict__ hedge_weights,
+    const uint32_t* __restrict__ my_touching,
+    const uint32_t touching_count,
+    const uint32_t lane_id,
+    uint32_t* __restrict__ sm_hedge_idx,
+    uint32_t* __restrict__ sm_hedge_cum,
+    float* __restrict__ sm_hedge_weight,
+    uint32_t* __restrict__ sm_my_part_pins,
+    uint32_t* __restrict__ sm_other_part_pins,
+    Classify&& classify
+) {
+    float gain = 0.0f;
+
+    for (uint32_t group_start = 0; group_start < touching_count; group_start += WARP_SIZE) {
+        const uint32_t group_size = min(WARP_SIZE, touching_count - group_start);
+
+        uint32_t my_hedge_size = 0u;
+        if (lane_id < group_size) {
+            const uint32_t hedge_idx = my_touching[group_start + lane_id];
+            sm_hedge_idx[lane_id] = hedge_idx;
+            my_hedge_size = static_cast<uint32_t>(hedges_offsets[hedge_idx + 1] - hedges_offsets[hedge_idx]);
+            sm_hedge_weight[lane_id] = hedge_weights[hedge_idx];
+            sm_my_part_pins[lane_id] = 1u; // include yourself before the move
+            sm_other_part_pins[lane_id] = 0u;
+        }
+        const uint32_t my_cum = warpExclusiveScan<uint32_t>(my_hedge_size); // my hedge's start position in the flat sequence
+        if (lane_id < group_size)
+            sm_hedge_cum[lane_id] = my_cum;
+        const uint32_t group_pins = __shfl_sync(0xFFFFFFFFu, my_cum + my_hedge_size, group_size - 1);
+        __syncwarp();
+
+        // stride WARP_SIZE flat positions at a time over the group's pins, binary-searching which hedge
+        // each flat position belongs to, and tallying its side into that hedge's shared accumulators
+        for (uint32_t flat_pos = lane_id; flat_pos < group_pins; flat_pos += WARP_SIZE) {
+            uint32_t lo = 0u, hi = group_size - 1u;
+            while (lo < hi) {
+                const uint32_t mid = (lo + hi + 1u) >> 1;
+                if (sm_hedge_cum[mid] <= flat_pos) lo = mid; else hi = mid - 1u;
+            }
+            const uint32_t pin = hedges[hedges_offsets[sm_hedge_idx[lo]] + (flat_pos - sm_hedge_cum[lo])];
+            const uint32_t side = classify(pin);
+            if (side == 0u) atomicAdd(&sm_my_part_pins[lo], 1u);
+            else if (side == 1u) atomicAdd(&sm_other_part_pins[lo], 1u);
+        }
+        __syncwarp();
+
+        // one lane per hedge in the group evaluates its now-complete gain
+        if (lane_id < group_size)
+            gain += sibling_move_gain(sm_my_part_pins[lane_id], sm_other_part_pins[lane_id], sm_hedge_weight[lane_id]);
+
+        __syncwarp(); // every lane must be done reading this group's scratch before the next group overwrites it
+    }
+
+    return warpReduceSumLN0<float>(gain);
+}
+
 // find in which partition (between a pair that was just bisected) each node wants to stay in
 // SEQUENTIAL COMPLEXITY: n*h*d
 // PARALLEL OVER: n
@@ -158,37 +227,32 @@ void label_propagation_kernel(
     * - the score is the exact improvement in weighted minority pin-cut if the node moves
     */
 
+    __shared__ uint32_t sm_hedge_idx[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t sm_hedge_cum[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ float sm_hedge_weight[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t sm_my_part_pins[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t sm_other_part_pins[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    const uint32_t warp_in_block = threadIdx.x / WARP_SIZE;
+
     const uint32_t my_partition = partitions[warp_id];
     const uint32_t other_partition = (my_partition & 1u) == 0 ? my_partition + 1 : my_partition - 1;
 
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
-    const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
-    float gain = 0.0f;
+    const uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
 
-    // scan touching hyperedges
-    for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-        const uint32_t actual_hedge_idx = *hedge_idx;
-        const uint32_t* my_hedge = hedges + hedges_offsets[actual_hedge_idx];
-        my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
-        const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
-        const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-        uint32_t my_part_pins = (lane_id == 0); // include yourself before the move
-        uint32_t other_part_pins = 0u;
-        for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
-            const uint32_t pin = *my_hedge;
-            if (pin == warp_id) continue;
-            if (partitions[pin] == my_partition) // the pin is on my same side
-                my_part_pins++;
-            else if (partitions[pin] == other_partition) // the pin is on the other side of the bisection
-                other_part_pins++;
+    // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
+    // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
+    const float gain = warpTouchingSiblingGain(
+        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+        sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
+        sm_my_part_pins[warp_in_block], sm_other_part_pins[warp_in_block],
+        [&](uint32_t pin) -> uint32_t {
+            if (pin == warp_id) return UINT32_MAX;
+            if (partitions[pin] == my_partition) return 0u; // the pin is on my same side
+            if (partitions[pin] == other_partition) return 1u; // the pin is on the other side of the bisection
+            return UINT32_MAX;
         }
-
-        my_part_pins = warpReduceSumLN0<uint32_t>(my_part_pins);
-        other_part_pins = warpReduceSumLN0<uint32_t>(other_part_pins);
-        if (lane_id == 0) {
-            gain += sibling_move_gain(my_part_pins, other_part_pins, my_hedge_weight);
-        }
-    }
+    );
 
     if (lane_id == 0) {
         if (gain <= 0.0f) {
@@ -321,41 +385,35 @@ void label_cascade_kernel(
     const uint32_t other_part_events_count = other_part_event_offsets[(other_partition >> 1) + 1] - other_part_event_offsets[other_partition >> 1];
     if (my_part_event_rank >= other_part_events_count) return; // omit events that don't have a pair (those exceeding the minimum of the events count between the two partitions)
 
+    __shared__ uint32_t sm_hedge_idx[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t sm_hedge_cum[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ float sm_hedge_weight[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t sm_my_part_pins[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t sm_other_part_pins[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    const uint32_t warp_in_block = threadIdx.x / WARP_SIZE;
+
     const uint32_t* my_touching = touching + touching_offsets[my_node];
-    const uint32_t* not_my_touching = touching + touching_offsets[my_node + 1];
-    float gain = 0.0f;
+    const uint32_t touching_count = touching_offsets[my_node + 1] - touching_offsets[my_node];
 
-    // scan touching hyperedges
-    for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-        const uint32_t actual_hedge_idx = *hedge_idx;
-        const uint32_t* my_hedge = hedges + hedges_offsets[actual_hedge_idx];
-        my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
-        const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
-        const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-        uint32_t my_part_pins = (lane_id == 0); // include yourself before your own move in the sequence
-        uint32_t other_part_pins = 0u;
-        for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
-            const uint32_t pin = *my_hedge;
-            if (pin == my_node) continue;
+    // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
+    // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
+    const float gain = warpTouchingSiblingGain(
+        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+        sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
+        sm_my_part_pins[warp_in_block], sm_other_part_pins[warp_in_block],
+        [&](uint32_t pin) -> uint32_t {
+            if (pin == my_node) return UINT32_MAX;
             if (partitions[pin] == my_partition) {
-                if (my_ranks[pin] == UINT32_MAX || my_ranks[pin] > event_id) // the pin is on my same side and didn't move before me
-                    my_part_pins++;
-                else // the pin was on my same side, but move before me
-                    other_part_pins++;
-            } else if (partitions[pin] == other_partition) {
-                if (other_ranks[pin] == UINT32_MAX || other_ranks[pin] - other_part_events_offset > my_part_event_rank) // the pin is on the other side of the bisection and didn't move before me
-                    other_part_pins++;
-                else // the pin was on the other side of the bisection, but move before me (or -with- me)
-                    my_part_pins++;
+                if (my_ranks[pin] == UINT32_MAX || my_ranks[pin] > event_id) return 0u; // same side, didn't move before me
+                return 1u; // was on my same side, but moved before me
             }
+            if (partitions[pin] == other_partition) {
+                if (other_ranks[pin] == UINT32_MAX || other_ranks[pin] - other_part_events_offset > my_part_event_rank) return 1u; // other side, didn't move before me
+                return 0u; // was on the other side, but moved before me (or -with- me)
+            }
+            return UINT32_MAX;
         }
-
-        my_part_pins = warpReduceSumLN0<uint32_t>(my_part_pins);
-        other_part_pins = warpReduceSumLN0<uint32_t>(other_part_pins);
-        if (lane_id == 0) {
-            gain += sibling_move_gain(my_part_pins, other_part_pins, my_hedge_weight);
-        }
-    }
+    );
 
     if (lane_id == 0) {
         // accumulate everything in the even partition's score
@@ -457,29 +515,31 @@ void sibling_tree_connection_strength_kernel(
     * - the higher-scoring partition gets to be near the sibling
     */
     
+    __shared__ uint32_t sm_hedge_idx[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t sm_hedge_cum[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ float sm_hedge_weight[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    const uint32_t warp_in_block = threadIdx.x / WARP_SIZE;
+
     const uint32_t my_node = order[warp_id];
     const uint32_t my_part = ord_part[warp_id];
     const uint32_t my_part_half = my_part >> 1;
     const uint32_t sibling_part_half = (my_part_half & 1u) == 0 ? my_part_half + 1 : my_part_half - 1;
-    
+
     const uint32_t* my_touching = touching + touching_offsets[my_node];
-    const uint32_t* not_my_touching = touching + touching_offsets[my_node + 1];
+    const uint32_t touching_count = touching_offsets[my_node + 1] - touching_offsets[my_node];
     float score = 0.0f;
 
-    // scan touching hyperedges
-    for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-        const uint32_t actual_hedge_idx = *hedge_idx;
-        const uint32_t* my_hedge = hedges + hedges_offsets[actual_hedge_idx];
-        my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
-        const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
-        const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-        for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
-            uint32_t pin = *my_hedge;
+    // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
+    // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
+    warpForEachTouchingPin(
+        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+        sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
+        [&](uint32_t pin, float my_hedge_weight) {
             uint32_t pin_part_half = partitions[pin] >> 1;
             if (pin_part_half == sibling_part_half) // the pin is in the sibling subtree
                 score += my_hedge_weight;
         }
-    }
+    );
 
     score = warpReduceSumLN0<float>(score);
 

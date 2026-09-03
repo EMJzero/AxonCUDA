@@ -138,6 +138,7 @@ std::tuple<dim_t, uint32_t*, dim_t*, uint32_t*> buildTouching(
     CUDA_CHECK(cudaFree(d_inserted_outbound));
 
     // setup CUB radix sort
+    CUDA_CHECK(cudaMemcpy(d_touching_buffer, d_touching, touching_size * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
     cub::DoubleBuffer<uint32_t> c_touching_double_buffer(d_touching, d_touching_buffer);
     void* c_touching_storage = nullptr;
     size_t c_touching_storage_bytes = 0;
@@ -194,9 +195,15 @@ dim_t sampleMaxNeighborhoodSize(
 
     const size_t bytes_per_sample = ((num_nodes + 31) / 32) * sizeof(uint32_t); // aka ceil(num_nodes / 32) * 4
     const size_t required_bytes = bytes_per_sample * num_samples;
-    size_t free_bytes, total_bytes;
-    cudaMemGetInfo(&free_bytes, &total_bytes);
-    const uint32_t repeats = (required_bytes + free_bytes - 1) / free_bytes; // aka ceil(required_bytes / free_bytes)
+    size_t free_bytes = 0, total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    // budget almost all the free VRAM, if it's not enough, batch neighbors construction
+    const size_t budget_bytes = (size_t)(SAMPLE_BUFFER_VRAM_FRACTION * (float)free_bytes);
+    if (budget_bytes < bytes_per_sample) {
+        ERR(cfg) std::cerr << "WARNING: not enough VRAM to sample even a single neighborhood, skipping the estimate ...\n";
+        return 0;
+    }
+    const uint32_t repeats = (uint32_t)((required_bytes + budget_bytes - 1) / budget_bytes); // aka ceil(required_bytes / budget_bytes)
     const uint32_t samples_per_repeat = (num_samples + repeats - 1) / repeats;
 
     CUDA_CHECK(cudaMalloc(&d_flags_bits, samples_per_repeat * bytes_per_sample));
@@ -246,7 +253,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     const uint32_t *d_touching,
     const dim_t *d_touching_offsets,
     const uint32_t num_nodes,
-    const uint32_t max_neighbors,
+    const dim_t max_neighbors,
     uint32_t *d_neighbors,
     dim_t *d_neighbors_offsets
 ) {
@@ -256,34 +263,50 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     uint32_t *d_oversized_neighbors = nullptr;
     dim_t init_max_neighbors = (dim_t)std::ceil(cfg.oversized_multiplier * (float)max_neighbors);
 
-    size_t free_bytes, total_bytes;
-    cudaMemGetInfo(&free_bytes, &total_bytes);
+    size_t free_bytes = 0, total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
     // check if there could be space to allocate both oversized neighbors and final neighbors at once; with no better guess, use 'max_neighbors' to estimate the final neighbors size...
-    bool direct_scatter_neighbors = (num_nodes * init_max_neighbors /*oversized*/ + num_nodes * max_neighbors /*final upper bound*/) * sizeof(uint32_t) + num_nodes * sizeof(dim_t) /*offsets*/ < free_bytes;
+    bool direct_scatter_neighbors = ((size_t)num_nodes * (size_t)init_max_neighbors /*oversized*/ + (size_t)num_nodes * (size_t)max_neighbors /*final upper bound*/) * sizeof(uint32_t) + (size_t)num_nodes * sizeof(dim_t) /*offsets*/ < free_bytes;
     // no pack? can spare space in the oversized buffer equal to the amount of shared memory used for fast deduping
     if (!direct_scatter_neighbors)
         init_max_neighbors = init_max_neighbors > SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE ? init_max_neighbors - SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE : 0;
     init_max_neighbors = max(init_max_neighbors, (dim_t)GM_MIN_BLOCK_DEDUPE_BUFFER_SIZE);
 
-    if (num_nodes * init_max_neighbors * sizeof(uint32_t) > (1ull << 32))
+    // if VRAM is not enough, deduplicated nodes in consecutive chunks, each one reusing a single chunk-sized buffer
+    const size_t dedupe_bytes_per_node = (size_t)init_max_neighbors * sizeof(uint32_t);
+    const size_t dedupe_reserved_bytes = (num_nodes + 1) * sizeof(dim_t); // offsets, allocated right below
+    const size_t dedupe_budget_bytes = free_bytes > dedupe_reserved_bytes
+        ? (size_t)(DEDUPE_BUFFER_VRAM_FRACTION * (float)(free_bytes - dedupe_reserved_bytes)) : 0;
+    size_t budget_nodes = dedupe_budget_bytes / dedupe_bytes_per_node; // how many hash-sets fit at once
+    if (budget_nodes == 0) budget_nodes = 1; // at least one node per chunk, otherwise not even a single hash-set could be deduplicated
+    const uint32_t max_nodes_per_chunk = budget_nodes < (size_t)num_nodes ? (uint32_t)budget_nodes : (num_nodes > 0 ? num_nodes : 1u);
+    const uint32_t chunks = (num_nodes + max_nodes_per_chunk - 1) / max_nodes_per_chunk; // 0 if there are no nodes at all
+    const uint32_t nodes_per_chunk = chunks > 1 ? (num_nodes + chunks - 1) / chunks : num_nodes; // evenly sized chunks
+    // chunking cannot keep the deduplication buffer of every node alive up to the packing step, fall back to re-scattering
+    if (chunks > 1) direct_scatter_neighbors = false;
+
+    if ((size_t)nodes_per_chunk * dedupe_bytes_per_node > (1ull << 32) || chunks > 1)
         INFO(cfg) std::cout
-            << "Allocating " << std::fixed << std::setprecision(1) << (float)(num_nodes * init_max_neighbors * sizeof(uint32_t)) / (1 << 30)
-            << " GB for neighbors deduplication ...\n";
-    CUDA_CHECK(cudaMalloc(&d_oversized_neighbors, num_nodes * init_max_neighbors * sizeof(uint32_t))); // space for spilling deduplication hash-sets
+            << "Allocating " << std::fixed << std::setprecision(1) << (float)((size_t)nodes_per_chunk * dedupe_bytes_per_node) / (1 << 30)
+            << " GB for neighbors deduplication (" << chunks << " chunk(s) of " << nodes_per_chunk << " nodes) ...\n";
+    CUDA_CHECK(cudaMalloc(&d_oversized_neighbors, (size_t)nodes_per_chunk * dedupe_bytes_per_node)); // space for spilling deduplication hash-sets (one chunk at a time)
     CUDA_CHECK(cudaMalloc(&d_neighbors_offsets, (num_nodes + 1) * sizeof(dim_t))); // node -> neighbors set start idx in d_neighbors
     thrust::device_ptr<dim_t> t_neigh_offsets(d_neighbors_offsets);
-    {
+    for (uint32_t chunk = 0; chunk < chunks; chunk++) {
+        const uint32_t nodes_offset = chunk * nodes_per_chunk; // first node of this chunk
+        const uint32_t chunk_nodes = min(nodes_per_chunk, num_nodes - nodes_offset); // the last chunk can be shorter
         // launch configuration - neighborhoods count kernel
-        int blocks = num_nodes; // 1 block per node
+        int blocks = chunk_nodes; // 1 block per node of the chunk
         int threads_per_block = 256; // 256/32 -> 8 warps per block
-        LAUNCH(cfg) RUN << "neighborhoods count kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        LAUNCH(cfg) RUN << "neighborhoods count kernel (chunk=" << chunk + 1 << "/" << chunks << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
         // launch - neighborhoods count kernel
         neighborhoods_count_kernel<<<blocks, threads_per_block>>>(
             d_hedges,
             d_hedges_offsets,
             d_touching,
             d_touching_offsets,
-            num_nodes,
+            chunk_nodes,
+            nodes_offset,
             init_max_neighbors,
             direct_scatter_neighbors,
             d_oversized_neighbors,
@@ -466,7 +489,9 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
         // => confirm the guess after you counted the exact number of neighbors
         float coarsening_scale = (float)new_num_nodes / curr_num_nodes;
         dim_t expected_new_neighbors_size = std::ceil(neighbors_size * coarsening_scale);
-        bool pack_neighbors = expected_new_neighbors_size - curr_num_nodes * sizeof(dim_t) /*freed offsets*/ < free_bytes;
+        const size_t freed_offsets_bytes = (size_t)curr_num_nodes * sizeof(dim_t);
+        const size_t expected_new_neighbors_bytes = (size_t)expected_new_neighbors_size * sizeof(uint32_t);
+        bool pack_neighbors = expected_new_neighbors_bytes < free_bytes + freed_offsets_bytes /*freed offsets*/;
 
         {
             // launch configuration - rebuild kernel (neighbors - count)
@@ -497,7 +522,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> coarsenNeighbors(
         CUDA_CHECK(cudaMemcpy(&new_neighbors_size, d_coarse_neighbors_offsets + new_num_nodes, sizeof(dim_t), cudaMemcpyDeviceToHost)); // last value in the inclusive scan = full reduce = total number of neighbors among all sets
 
         // refine the decision based on actual new neighbors count
-        pack_neighbors = new_neighbors_size - curr_num_nodes * sizeof(dim_t) /*freed offsets*/ < free_bytes;
+        pack_neighbors = pack_neighbors && (size_t)new_neighbors_size * sizeof(uint32_t) < free_bytes + freed_offsets_bytes /*freed offsets*/;
 
         if (pack_neighbors) {
             // this alloc should never fail, since we updated the check for the pack vs rebuild

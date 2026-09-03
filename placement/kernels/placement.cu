@@ -8,6 +8,8 @@ template<>
 __constant__ Lattice2D c_topo<Lattice2D>{};
 template<>
 __constant__ Torus6D c_topo<Torus6D>{};
+template<>
+__constant__ ArbitraryGraph c_topo<ArbitraryGraph>{};
 
 // assign to each inverse placement slot the node occupying that place
 // SEQUENTIAL COMPLEXITY: n
@@ -54,43 +56,40 @@ void forces_kernel(
     * - iterate, for each node, on its touching hedges, and on each node in each hedge, for each node updating all directional forces
     * - let a warp handle a node, reduce among its threads the forces
     */
-    
+
+    __shared__ uint32_t sm_hedge_idx[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t sm_hedge_cum[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ float sm_hedge_weight[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    const uint32_t warp_in_block = threadIdx.x / WARP_SIZE;
+
     const Coord_t<T> my_place = placement[warp_id];
     const uint32_t* my_touching = touching + touching_offsets[warp_id];
-    const uint32_t* not_my_touching = touching + touching_offsets[warp_id + 1];
-    //uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
-    
+    const uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
+
     float my_base_potential = 0.0f;
     float my_forces[T::neighborsCount()];
     thr_init<float>(my_forces, T::neighborsCount(), 0.0f);
-    
-    // scan touching hyperedges
-    // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
-    for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-        const uint32_t actual_hedge_idx = *hedge_idx;
-        // NOTE: this is not a warp-sync kernel, so using shuffles here to share data looses time, it's better to exploit caches with redundant reads!
-        const uint32_t* my_hedge = hedges + hedges_offsets[actual_hedge_idx];
-        my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
-        const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
-        const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-        for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
-            if (my_hedge < not_my_hedge) {
-                const uint32_t pin = *my_hedge;
-                if (pin == warp_id) continue;
-                const Coord_t<T> pin_place = placement[pin];
-                const uint32_t distance = c_topo<T>.distance(my_place, pin_place);
-                my_base_potential += my_hedge_weight * distance;
-                // logic: base potential = how much distant I am be from my connectees
-                //        my_force = how much distant I would be from my connectees if moved
-                // TODO: could optimize, instead of doing another "distance" call, compute the new distance incrementally
-                for (uint32_t neigh_idx = 0; neigh_idx < T::neighborsCount(); neigh_idx++) {
-                    const Coord_t<T> neigh_place = c_topo<T>.neighbor(my_place, neigh_idx);
-                    my_forces[neigh_idx] += my_hedge_weight * max(c_topo<T>.distance(neigh_place, pin_place), 1);
-                }
+
+    // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
+    // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
+    warpForEachTouchingPin(
+        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+        sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
+        [&](uint32_t pin, float my_hedge_weight) {
+            if (pin == warp_id) return;
+            const Coord_t<T> pin_place = placement[pin];
+            const uint32_t distance = c_topo<T>.distance(my_place, pin_place);
+            my_base_potential += my_hedge_weight * distance;
+            // logic: base potential = how much distant I am be from my connectees
+            //        my_force = how much distant I would be from my connectees if moved
+            // TODO: could optimize, instead of doing another "distance" call, compute the new distance incrementally
+            for (uint32_t neigh_idx = 0; neigh_idx < T::neighborsCount(); neigh_idx++) {
+                const Coord_t<T> neigh_place = c_topo<T>.neighbor(my_place, neigh_idx);
+                my_forces[neigh_idx] += my_hedge_weight * max(c_topo<T>.distance(neigh_place, pin_place), 1);
             }
         }
-    }
-    
+    );
+
     // reduce across the warp
     my_base_potential = warpReduceSumLN0<float>(my_base_potential);
     for (uint32_t f = 0; f < T::neighborsCount(); f++)
@@ -479,6 +478,11 @@ void cascade_kernel(
         return;
     }
 
+    __shared__ uint32_t sm_hedge_idx[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t sm_hedge_cum[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ float sm_hedge_weight[MAX_WARPS_PER_BLOCK][WARP_SIZE];
+    const uint32_t warp_in_block = threadIdx.x / WARP_SIZE;
+
     float first_force, second_force;
 
 
@@ -496,24 +500,72 @@ void cascade_kernel(
     }
 
     const uint32_t* my_touching = touching + touching_offsets[curr_node];
-    const uint32_t* not_my_touching = touching + touching_offsets[curr_node + 1];
+    const uint32_t touching_count = touching_offsets[curr_node + 1] - touching_offsets[curr_node];
 
     float base_potential = 0.0f;
     float force = 0.0f;
 
-    // scan touching hyperedges
-    // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
-    for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-        const uint32_t actual_hedge_idx = *hedge_idx;
-        // NOTE: this is not a warp-sync kernel, so using shuffles here to share data looses time, it's better to exploit caches with redundant reads!
-        const uint32_t* my_hedge = hedges + hedges_offsets[actual_hedge_idx];
-        my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
-        const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
-        const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-        for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
-            if (my_hedge < not_my_hedge) {
-                const uint32_t pin = *my_hedge;
-                if (pin == curr_node) continue;
+    // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
+    // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
+    warpForEachTouchingPin(
+        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+        sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
+        [&](uint32_t pin, float my_hedge_weight) {
+            if (pin == curr_node) return;
+            Coord_t<T> pin_place;
+            uint32_t pin_event_idx = nodes_rank[pin];
+            // reconstruct the pin's placement w.r.t. the sequence of events
+            if (pin_event_idx < warp_id) {
+                const swap pin_ev_swaps = ev_swaps[pin_event_idx];
+                if (pin == pin_ev_swaps.hi) pin_place = placement[pin_ev_swaps.lo];
+                else if (pin_ev_swaps.hi == UINT32_MAX) pin_place = placement[pin]; // cancelled empty move, pin never moved
+                else {
+                    if (pin_ev_swaps.hi < UINT32_MAX - T::neighborsCount()) pin_place = placement[pin_ev_swaps.hi];
+                    else {
+                        uint32_t pin_direction = UINT32_MAX - pin_ev_swaps.hi - 1; // swap neighbor idx
+                        pin_place = placement[pin];
+                        pin_place = c_topo<T>.neighbor(pin_place, pin_direction);
+                    }
+                }
+            } else
+                pin_place = placement[pin];
+            const uint32_t distance = c_topo<T>.distance(my_place, pin_place);
+            base_potential += my_hedge_weight * distance;
+            // |
+            const Coord_t<T> neigh_place = c_topo<T>.neighbor(my_place, direction);
+            force += my_hedge_weight * max(c_topo<T>.distance(neigh_place, pin_place), 1);
+        }
+    );
+
+    // reduce across the warp
+    base_potential = warpReduceSumLN0<float>(base_potential);
+    force = warpReduceSumLN0<float>(force);
+    first_force = base_potential - force;
+
+
+    // HIGHER-ID NODE (if valid)
+
+    if (my_ev_swaps.hi < UINT32_MAX - T::neighborsCount()) {
+        curr_node = my_ev_swaps.hi;
+        my_place = placement[curr_node];
+        
+        // ALWAYS TRUE: my_ev_swaps.lo < UINT32_MAX - T::neighborsCount()
+        const Coord_t<T> other_place = placement[my_ev_swaps.lo];
+        direction = c_topo<T>.neighborIdx(my_place, other_place);
+
+        const uint32_t* my_touching = touching + touching_offsets[curr_node];
+        const uint32_t touching_count = touching_offsets[curr_node + 1] - touching_offsets[curr_node];
+
+        base_potential = 0.0f;
+        force = 0.0f;
+
+        // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
+        // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
+        warpForEachTouchingPin(
+            hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+            sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
+            [&](uint32_t pin, float my_hedge_weight) {
+                if (pin == curr_node) return;
                 Coord_t<T> pin_place;
                 uint32_t pin_event_idx = nodes_rank[pin];
                 // reconstruct the pin's placement w.r.t. the sequence of events
@@ -537,69 +589,7 @@ void cascade_kernel(
                 const Coord_t<T> neigh_place = c_topo<T>.neighbor(my_place, direction);
                 force += my_hedge_weight * max(c_topo<T>.distance(neigh_place, pin_place), 1);
             }
-        }
-    }
-
-    // reduce across the warp
-    base_potential = warpReduceSumLN0<float>(base_potential);
-    force = warpReduceSumLN0<float>(force);
-    first_force = base_potential - force;
-
-
-    // HIGHER-ID NODE (if valid)
-
-    if (my_ev_swaps.hi < UINT32_MAX - T::neighborsCount()) {
-        curr_node = my_ev_swaps.hi;
-        my_place = placement[curr_node];
-        
-        // ALWAYS TRUE: my_ev_swaps.lo < UINT32_MAX - T::neighborsCount()
-        const Coord_t<T> other_place = placement[my_ev_swaps.lo];
-        direction = c_topo<T>.neighborIdx(my_place, other_place);
-
-        const uint32_t* my_touching = touching + touching_offsets[curr_node];
-        const uint32_t* not_my_touching = touching + touching_offsets[curr_node + 1];
-        
-        base_potential = 0.0f;
-        force = 0.0f;
-        
-        // scan touching hyperedges
-        // TODO: could optimize by having threads that don't have anything left in the current hedge already wrap over to the next one
-        for (const uint32_t* hedge_idx = my_touching; hedge_idx < not_my_touching; hedge_idx++) {
-            const uint32_t actual_hedge_idx = *hedge_idx;
-            // NOTE: this is not a warp-sync kernel, so using shuffles here to share data looses time, it's better to exploit caches with redundant reads!
-            const uint32_t* my_hedge = hedges + hedges_offsets[actual_hedge_idx];
-            my_hedge += lane_id; // each thread in the warp reads one every WARP_SIZE pins
-            const uint32_t* not_my_hedge = hedges + hedges_offsets[actual_hedge_idx + 1];
-            const float my_hedge_weight = hedge_weights[actual_hedge_idx];
-            for (; my_hedge < not_my_hedge; my_hedge += WARP_SIZE) {
-                if (my_hedge < not_my_hedge) {
-                    const uint32_t pin = *my_hedge;
-                    if (pin == curr_node) continue;
-                    Coord_t<T> pin_place;
-                    uint32_t pin_event_idx = nodes_rank[pin];
-                    // reconstruct the pin's placement w.r.t. the sequence of events
-                    if (pin_event_idx < warp_id) {
-                        const swap pin_ev_swaps = ev_swaps[pin_event_idx];
-                        if (pin == pin_ev_swaps.hi) pin_place = placement[pin_ev_swaps.lo];
-                        else if (pin_ev_swaps.hi == UINT32_MAX) pin_place = placement[pin]; // cancelled empty move, pin never moved
-                        else {
-                            if (pin_ev_swaps.hi < UINT32_MAX - T::neighborsCount()) pin_place = placement[pin_ev_swaps.hi];
-                            else {
-                                uint32_t pin_direction = UINT32_MAX - pin_ev_swaps.hi - 1; // swap neighbor idx
-                                pin_place = placement[pin];
-                                pin_place = c_topo<T>.neighbor(pin_place, pin_direction);
-                            }
-                        }
-                    } else
-                        pin_place = placement[pin];
-                    const uint32_t distance = c_topo<T>.distance(my_place, pin_place);
-                    base_potential += my_hedge_weight * distance;
-                    // |
-                    const Coord_t<T> neigh_place = c_topo<T>.neighbor(my_place, direction);
-                    force += my_hedge_weight * max(c_topo<T>.distance(neigh_place, pin_place), 1);
-                }
-            }
-        }
+        );
 
         // reduce across the warp
         base_potential = warpReduceSumLN0<float>(base_potential);
@@ -883,5 +873,6 @@ void min_spanning_tree_weight_kernel(
 
 INSTANTIATE_PLACEMENT_KERNELS(Lattice2D)
 INSTANTIATE_PLACEMENT_KERNELS(Torus6D)
+INSTANTIATE_PLACEMENT_KERNELS(ArbitraryGraph)
 
 #undef INSTANTIATE_PLACEMENT_KERNELS

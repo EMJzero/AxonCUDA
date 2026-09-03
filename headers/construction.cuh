@@ -21,6 +21,8 @@ using namespace hgraph;
 
 #define SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE 8192u // 16384 is too big for an A100...
 #define GM_MIN_BLOCK_DEDUPE_BUFFER_SIZE 256u
+#define DEDUPE_BUFFER_VRAM_FRACTION 0.8f // fraction of the free VRAM the deduplication buffer may take at once, the rest is left to offsets, scans and the final neighbors array
+#define SAMPLE_BUFFER_VRAM_FRACTION 0.95f // fraction of the free VRAM the neighborhood sampling flags may take at once, the rest is left to the counters and the driver's slack
 
 
 // USED BY: coarsening routines (all, touching, hedges, and neighbors)
@@ -62,7 +64,7 @@ std::tuple<dim_t, uint32_t*, dim_t*> buildNeighbors(
     const uint32_t *d_touching,
     const dim_t *d_touching_offsets,
     const uint32_t num_nodes,
-    const uint32_t max_neighbors,
+    const dim_t max_neighbors,
     uint32_t *d_neighbors,
     dim_t *d_neighbors_offsets
 );
@@ -152,6 +154,7 @@ void neighborhoods_count_kernel(
     const uint32_t* __restrict__ touching,
     const dim_t* __restrict__ touching_offsets,
     const uint32_t num_nodes,
+    const uint32_t nodes_offset,
     const dim_t max_neighbors,
     const bool discharge,
     uint32_t* __restrict__ neighbors,

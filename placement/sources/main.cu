@@ -407,6 +407,7 @@ int main(int argc, char** argv) {
                     while (!topo.contains(topo.neighbor(place, neigh_rotator)))
                         neigh_rotator = (neigh_rotator + 1) % T::neighborsCount();
                     place = topo.neighbor(place, neigh_rotator);
+                    neigh_rotator = (neigh_rotator + 1) % T::neighborsCount(); // keep advancing so non-mesh topologies (e.g. Arbitrary) don't just bounce between 2 nodes
                 }
                 std::vector<uint32_t>().swap(inv_place_tmp);
             }
@@ -498,6 +499,7 @@ int main(int argc, char** argv) {
                 while (!topo.contains(topo.neighbor(place, neigh_rotator)))
                     neigh_rotator = (neigh_rotator + 1) % T::neighborsCount();
                 place = topo.neighbor(place, neigh_rotator);
+                neigh_rotator = (neigh_rotator + 1) % T::neighborsCount(); // keep advancing so non-mesh topologies (e.g. Arbitrary) don't just bounce between 2 nodes
             }
         }
         // =============================
@@ -593,6 +595,8 @@ int main(int argc, char** argv) {
             return place_routine.template operator()<Lattice<2>>();
         case TargetTopology::TORUS6D:
             return place_routine.template operator()<Torus<6>>();
+        case TargetTopology::ARBITRARY:
+            return place_routine.template operator()<ArbitraryGraph>();
         default:
             throw std::runtime_error("Topology not yet implemented *-* !");
     }

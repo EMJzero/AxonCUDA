@@ -188,7 +188,14 @@ namespace hwmodel {
             const HyperGraph& part_hgraph,
             const std::vector<Coord>& placement) const;
 
+        // NOTE: every factory below is a member *template* (with a dummy, defaulted U=T parameter) rather than
+        // a plain static member function. This matters because "extern template class HardwareModel<...>;" /
+        // "template class HardwareModel<...>;" explicit instantiations force every non-template member's body
+        // to compile for that T - which would break for topologies like Arbitrary that don't have a grid-style
+        // Extents... constructor. Member *templates* are exempt from that, so they only get compiled on actual use.
+
         // predefined harwdare models
+        template<typename U = T>
         static HardwareModel<T> createLoihi() {
             std::array<int, T::dimensions> extent;
             extent.fill(8);
@@ -205,6 +212,7 @@ namespace hwmodel {
             return HardwareModel<T>(cfg_loihi, topo);
         };
 
+        template<typename U = T>
         static HardwareModel<T> createLoihiLarge() {
             std::array<int, T::dimensions> extent;
             extent.fill(64);
@@ -220,6 +228,7 @@ namespace hwmodel {
             return HardwareModel<T>(cfg_loihi_large, topo);
         };
 
+        template<typename U = T>
         static HardwareModel<T> createLoihiJin84() {
             std::array<int, T::dimensions> extent;
             extent.fill(84);
@@ -235,6 +244,7 @@ namespace hwmodel {
             return HardwareModel<T>(cfg_loihi_jin_84, topo);
         };
 
+        template<typename U = T>
         static HardwareModel<T> createLoihiJin1024() {
             std::array<int, T::dimensions> extent;
             extent.fill(1024);
@@ -250,6 +260,7 @@ namespace hwmodel {
             return HardwareModel<T>(cfg_loihi_jin_1024, topo);
         };
 
+        template<typename U = T>
         static HardwareModel<T> createTrueNorth() {
             std::array<int, T::dimensions> extent;
             extent.fill(64);
@@ -264,6 +275,13 @@ namespace hwmodel {
             cfg_truenorth.latency_per_wire = 5.3; // unknown (this is from Loihi)
             return HardwareModel<T>(cfg_truenorth, topo);
         };
+
+        // for topologies built from an explicit graph (e.g. Arbitrary::fromGraph) rather than a fixed grid extent
+        template<typename U = T>
+        static HardwareModel<T> createFromGraph(const HyperGraph& topology_graph, const HardwareModelConfig& cfg) {
+            T topo = T::fromGraph(topology_graph);
+            return HardwareModel<T>(cfg, topo);
+        };
     };
 
     // ready to use topologies
@@ -272,5 +290,6 @@ namespace hwmodel {
     extern template class HardwareModel<Torus2D>;
     extern template class HardwareModel<Torus3D>;
     extern template class HardwareModel<Torus6D>;
+    extern template class HardwareModel<ArbitraryGraph>;
 
 }

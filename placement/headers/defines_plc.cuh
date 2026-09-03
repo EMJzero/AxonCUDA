@@ -41,3 +41,8 @@
 // USED BY: force-directed refinement
 
 #define FD_ITERATIONS 64 // 1024
+
+
+// USED BY: warp-cooperative touching-hedge pin flattening (forces / cascade / label kernels)
+
+#define MAX_WARPS_PER_BLOCK 4u // per-warp shared-memory scratch capacity -> must match (threads-per-block / WARP_SIZE) at every launch site

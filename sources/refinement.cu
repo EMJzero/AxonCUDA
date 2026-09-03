@@ -337,12 +337,19 @@ void refinementRepeats(
         uint32_t *d_inbound_count_events_index = nullptr; // inbound_count_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
         uint32_t *d_inbound_count_events_hedge = nullptr; // d_inbound_count_events_hedge[ev] -> hedge involved in the event
         int32_t *d_inbound_count_events_delta = nullptr; // inbound_count_events_delta[ev] -> inbound_count variation brought by the event
-        const uint32_t num_inbound_count_events = 2 * touching_size; // TODO: this is slightly larger than truly needed, because we just use inbound hedges...
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_partition, num_inbound_count_events * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_index, num_inbound_count_events * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_hedge, num_inbound_count_events * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_delta, num_inbound_count_events * sizeof(int32_t)));
-        CUDA_CHECK(cudaMemset(d_inbound_count_events_partition, 0xFF, num_inbound_count_events * sizeof(uint32_t))); // => use inbound_count_events_partition being UINT32_MAX to spot invalid events
+        // TODO: this is slightly larger than truly needed, because we just use inbound hedges...
+        const dim_t num_inbound_count_events_wide = 2ull * touching_size;
+        if (num_inbound_count_events_wide > (dim_t)UINT32_MAX) {
+            ERR(cfg) std::cerr << "ABORTING: refinement needs " << num_inbound_count_events_wide
+                << " inbound events, more than the " << UINT32_MAX << " addressable by the event kernels !!\n";
+            abort();
+        }
+        const uint32_t num_inbound_count_events = (uint32_t)num_inbound_count_events_wide;
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_partition, (size_t)num_inbound_count_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_index, (size_t)num_inbound_count_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_hedge, (size_t)num_inbound_count_events * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_count_events_delta, (size_t)num_inbound_count_events * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_inbound_count_events_partition, 0xFF, (size_t)num_inbound_count_events * sizeof(uint32_t))); // => use inbound_count_events_partition being UINT32_MAX to spot invalid events
         thrust::device_ptr<uint32_t> t_inbound_count_events_partition(d_inbound_count_events_partition);
         thrust::device_ptr<uint32_t> t_inbound_count_events_index(d_inbound_count_events_index);
         thrust::device_ptr<uint32_t> t_inbound_count_events_hedge(d_inbound_count_events_hedge);
@@ -386,8 +393,8 @@ void refinementRepeats(
         // new array of events, one event for each time the counter of an hedge in the inbound set (+ the overall inbounds per partition counter) goes from 0 to >0,
         // the event carrying a +1 to the inbound set size, one event for each time the counter of an hedge goes from >0 to 0 carrying a -1 to the inbound set size for that partition
         dim_t *d_inbound_size_events_offsets = nullptr; // inbound_size_events_offsets[event idx] -> initially a flag of whether each event will produce an increase/decrese in inbound counts, after the scan it becomes the offset of each new event
-        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_offsets, (num_inbound_count_events + 1) * sizeof(dim_t)));
-        CUDA_CHECK(cudaMemset(d_inbound_size_events_offsets, 0x00, (num_inbound_count_events + 1) * sizeof(dim_t)));
+        CUDA_CHECK(cudaMalloc(&d_inbound_size_events_offsets, ((size_t)num_inbound_count_events + 1) * sizeof(dim_t)));
+        CUDA_CHECK(cudaMemset(d_inbound_size_events_offsets, 0x00, ((size_t)num_inbound_count_events + 1) * sizeof(dim_t)));
         {
             // launch configuration - count inbound events kernel
             int threads_per_block = 128;
@@ -633,7 +640,7 @@ void refinementSparseRepeats(
     uint32_t* d_ppp = nullptr; // ppp[ppp_offsets[e*num_partitions+p/64].cnt + bits-at-one-before-the(p%64)th-in(ppp_offsets[e*num_partitions+p/64].flg)] -> pins count held by hedge e in partition p
 
     const uint32_t ppp_per_hedge = (num_partitions + BITMAP_CAPACITY - 1) / BITMAP_CAPACITY; // aka: ceil(num_partitions / 64)
-    dim_t ppp_offsets_size = num_hedges * ppp_per_hedge;
+    dim_t ppp_offsets_size = static_cast<dim_t>(num_hedges) * ppp_per_hedge;
     if (ppp_offsets_size * sizeof(bitmap) > (1ull << 32))
         INFO(cfg) std::cout
             << "Allocating " << std::fixed << std::setprecision(1) << (float)(ppp_offsets_size * sizeof(bitmap)) / (1 << 30)

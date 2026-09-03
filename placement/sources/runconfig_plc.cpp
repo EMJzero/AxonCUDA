@@ -32,6 +32,7 @@ namespace config_plc {
             "  prog -h\n\n"
             "Options:\n"
             "  -r <file>   Reload hypergraph from file\n"
+            "  -g <file>   Load the target topology graph from file (mandatory when -t arb is used)\n"
             "  -s <file>   Save placement data to file\n"
             "  -c <name>   Constraints set to use (valid ones: truenorth, loihi, loihi64, loihi84, loihi1024 - default is loihi64)\n"
             "  -lpr <num>  Set the number of label propagation repeats during recursive bisection initial partitioning\n"
@@ -42,11 +43,14 @@ namespace config_plc {
             "  -t <name>   Set the topology of the target graph where to place hypergraph nodes, valid names are:\n"
             "      - lat2d: 2D lattice (default)    - tor6d: 6D torus\n"
             "      - hcube: N-D hypercube           - hx3d: 3D HyperX\n"
+            "      - arb: arbitrary weighted graph (requires -g)\n"
             "  -sfc <name> Determines the 1D-to-2D mapping used to preserve locality after ordering nodes, valid names are:\n"
             "      - hilb: Hilbert space-filling curve (default)    - snak: square-ish serpentine sweep\n"
             "      - zord: Z-order curve                            - quad: cyclic quadtree pattern\n"
+            "      - flat: identity 1D mapping (default, and only supported option, for arb)\n"
             "    => sfc x topology support lists:\n"
             "      - hilb, snak, zord, quad: lattice, torus\n"
+            "      - flat: arbitrary\n"
             "  -ff         Replaces the 1D ordering heuristic with host-side sequential feedforward ordering\n"
             "  -noum       Disables the evaluation and logging of unicast-based placement quality metrics\n"
             "  -nomm       Disables the evaluation and logging of multicast-based placement quality metrics (which can be very slow)\n"
@@ -59,6 +63,7 @@ namespace config_plc {
     runconfig parseArgs(int argc, char** argv) {
         // defaults
         std::string load_path;
+        std::string graph_path;
         std::string save_path;
         std::string constraints;
         uint32_t labelprop_repeats = LABELPROP_REPEATS;
@@ -68,6 +73,7 @@ namespace config_plc {
         uint32_t num_host_threads = NUM_HOST_THREADS;
         TargetTopology topology = TargetTopology::LATTICE2D;
         SpaceFillingCurve space_filling_curve = SpaceFillingCurve::HILB;
+        bool space_filling_curve_explicit = false;
         bool feedforward_order = false; // NB: runs sequentially on the HOST!
         bool unicast_metrics = true;
         bool multicast_metrics = true;
@@ -86,6 +92,9 @@ namespace config_plc {
             else if (arg == "-r") {
                 if (i + 1 >= argc) { std::cerr << "Error: -r requires a file path\n"; std::exit(1); }
                 load_path = argv[++i];
+            } else if (arg == "-g") {
+                if (i + 1 >= argc) { std::cerr << "Error: -g requires a file path\n"; std::exit(1); }
+                graph_path = argv[++i];
             } else if (arg == "-s") {
                 if (i + 1 >= argc) { std::cerr << "Error: -s requires a file path\n"; std::exit(1); }
                 save_path = argv[++i];
@@ -118,6 +127,7 @@ namespace config_plc {
                 if (i + 1 >= argc) { std::cerr << "Error: -sfc requires a curve name\n"; std::exit(1); }
                 std::string curve_name = argv[++i];
                 if (!parseSFC(curve_name, space_filling_curve)) { std::cerr << "Error: -sfc requested an invalid curve name\n"; std::exit(1); }
+                space_filling_curve_explicit = true;
             } else if (arg == "-ff") {
                 feedforward_order = true;
             } else if (arg == "-noum") {
@@ -142,6 +152,16 @@ namespace config_plc {
             } else { std::cerr << "Unknown option: " << arg << "\n"; std::exit(1); }
         }
 
+        if (topology == TargetTopology::ARBITRARY && graph_path.empty()) {
+            std::cerr << "Error: topology 'arb' requires a target topology graph file (-g)\n";
+            std::exit(1);
+        }
+
+        if (!space_filling_curve_explicit && topology == TargetTopology::ARBITRARY) {
+            // arbitrary topologies have no embeddable multi-dimensional locality curve -> default to the identity mapping
+            space_filling_curve = SpaceFillingCurve::FLAT;
+        }
+
         if (!validateTopologySFC(topology, space_filling_curve)) {
             std::cerr << "Error: space filling curve '" << SFCtoString(space_filling_curve) << "' does not support topology '" << topologyToString(topology) << "'\n";
             std::exit(1);
@@ -149,6 +169,7 @@ namespace config_plc {
 
         return {
             load_path,
+            graph_path,
             save_path,
             constraints,
             labelprop_repeats,
@@ -171,28 +192,31 @@ namespace config_plc {
         };
     }
 
+    // shared by loadHgraph (-r) and loadTopologyGraph (-g): both are plain HyperGraph files, dispatched by extension
+    static HyperGraph loadHyperGraphFile(const std::string& path, bool verbose) {
+        if (!std::filesystem::is_regular_file(path)) throw std::runtime_error("Failed to load hypergraph, the provided path is not a file.");
+        std::filesystem::path file_path(path);
+        std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(path)) / (1 << 20) << " MB\n";
+        if (file_path.extension() == ".hgr") {
+            std::cout << "Loading hypergraph from: " << path << " (hMETIS format) ...\n";
+            return HyperGraph::loadhMETIS(path, verbose);
+        } else if (file_path.extension() == ".snn") {
+            std::cout << "Loading hypergraph from: " << path << " (SNN format) ...\n";
+            return HyperGraph::loadSNN(path, verbose);
+        } else if (file_path.extension() == ".axh") {
+            std::cout << "Loading hypergraph from: " << path << " (AXH format) ...\n";
+            return HyperGraph::loadAXH(path, verbose);
+        } else {
+            throw std::runtime_error("Failed to load hypergraph, unsupported file format (supported: '.hgr', '.snn', '.axh').");
+        }
+    }
+
     HyperGraph loadHgraph(runconfig &cfg) {
         HyperGraph hg(0, {}, {}); // placeholder -> overwritten if "-r" is given
 
         if (!cfg.load_path.empty()) {
             try {
-                if (!std::filesystem::is_regular_file(cfg.load_path)) throw std::runtime_error("Failed to load hypergraph, the provided path is not a file.");
-                std::filesystem::path file_path(cfg.load_path);
-                if (file_path.extension() == ".hgr") {
-                    std::cout << "Loading hypergraph from: " << cfg.load_path << " (hMETIS format) ...\n";
-                    std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(cfg.load_path)) / (1 << 20) << " MB\n";
-                    hg = HyperGraph::loadhMETIS(cfg.load_path, cfg.verbose_errs_and_warns);
-                } else if (file_path.extension() == ".snn") {
-                    std::cout << "Loading hypergraph from: " << cfg.load_path << " (SNN format) ...\n";
-                    std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(cfg.load_path)) / (1 << 20) << " MB\n";
-                    hg = HyperGraph::loadSNN(cfg.load_path, cfg.verbose_errs_and_warns);
-                } else if (file_path.extension() == ".axh") {
-                    std::cout << "Loading hypergraph from: " << cfg.load_path << " (AXH format) ...\n";
-                    std::cout << "Hypergraph file size: " << std::fixed << std::setprecision(1) << (float)(std::filesystem::file_size(cfg.load_path)) / (1 << 20) << " MB\n";
-                    hg = HyperGraph::loadAXH(cfg.load_path, cfg.verbose_errs_and_warns);
-                } else {
-                    throw std::runtime_error("Failed to load hypergraph, unsupported file format (supported: '.hgr', '.snn', '.axh').");
-                }
+                hg = loadHyperGraphFile(cfg.load_path, cfg.verbose_errs_and_warns);
             } catch (const std::exception& e) {
                 std::cerr << "Error loading file: " << e.what() << "\n";
                 std::exit(1);
@@ -204,22 +228,59 @@ namespace config_plc {
         return hg;
     }
 
+    HyperGraph loadTopologyGraph(runconfig &cfg) {
+        try {
+            return loadHyperGraphFile(cfg.graph_path, cfg.verbose_errs_and_warns);
+        } catch (const std::exception& e) {
+            std::cerr << "Error loading topology graph file: " << e.what() << "\n";
+            std::exit(1);
+        }
+    }
+
     template<Topology T>
     HardwareModel<T> setupNMH(runconfig &cfg) {
         using Model = HardwareModel<T>;
-        std::unordered_map<std::string, Model (*)()> configurations {
-            { "loihi", Model::createLoihi },
-            { "loihi64", Model::createLoihiLarge },
-            { "loihi84", Model::createLoihiJin84 },
-            { "loihi1024", Model::createLoihiJin1024 },
-            { "truenorth", Model::createTrueNorth }
-        };
-        auto hw_it = configurations.find(cfg.constraints);
-        if (hw_it == configurations.end()) {
-            std::cerr << "WARNING, no valid constraints provided (-c), using loihi64 !!\n";
-            return Model::createLoihiLarge();
+
+        if constexpr (requires (const HyperGraph& hg) { { T::fromGraph(hg) } -> std::same_as<T>; }) {
+            // topologies built from an explicit graph file (-g), e.g. Arbitrary: costs are still picked by
+            // name (-c), reusing the same named profiles as the grid-based topologies, minus their grid extent
+            static const std::unordered_map<std::string, HardwareModelConfig> profiles {
+                { "loihi", { "Loihi", 1024, 4096, 1.7, 3.5, 2.1, 5.3 } },
+                { "loihi64", { "Loihi Large", 1024, 4096, 1.7, 3.5, 2.1, 5.3 } },
+                { "loihi84", { "Loihi Jin 84", 4096, 1024*64, 1.0, 0.1, 1.0, 0.01 } },
+                { "loihi1024", { "Loihi Jin 1024", 4096, 1024*64, 1.0, 0.1, 1.0, 0.01 } },
+                { "truenorth", { "TrueNorth", 256, 256, 1.7, 3.5, 2.1, 5.3 } }
+            };
+            auto cfg_it = profiles.find(cfg.constraints);
+            HardwareModelConfig hwcfg;
+            if (cfg_it == profiles.end()) {
+                std::cerr << "WARNING, no valid constraints provided (-c), using loihi64 !!\n";
+                hwcfg = profiles.at("loihi64");
+            } else {
+                hwcfg = cfg_it->second;
+            }
+            HyperGraph topology_graph = loadTopologyGraph(cfg);
+            try {
+                return Model::createFromGraph(topology_graph, hwcfg);
+            } catch (const std::exception& e) {
+                std::cerr << "Error building topology from graph: " << e.what() << "\n";
+                std::exit(1);
+            }
+        } else {
+            std::unordered_map<std::string, Model (*)()> configurations {
+                { "loihi", Model::createLoihi },
+                { "loihi64", Model::createLoihiLarge },
+                { "loihi84", Model::createLoihiJin84 },
+                { "loihi1024", Model::createLoihiJin1024 },
+                { "truenorth", Model::createTrueNorth }
+            };
+            auto hw_it = configurations.find(cfg.constraints);
+            if (hw_it == configurations.end()) {
+                std::cerr << "WARNING, no valid constraints provided (-c), using loihi64 !!\n";
+                return Model::createLoihiLarge();
+            }
+            return hw_it->second();
         }
-        return hw_it->second();
     }
 
     template<Topology T>
@@ -288,7 +349,9 @@ namespace config_plc {
     // explicit instantiations of topology variants
     template HardwareModel<Lattice2D> setupNMH<Lattice2D>(runconfig&);
     template HardwareModel<Torus6D> setupNMH<Torus6D>(runconfig&);
+    template HardwareModel<ArbitraryGraph> setupNMH<ArbitraryGraph>(runconfig&);
     // |
     template void saveResult<Lattice2D>(runconfig&, std::vector<Lattice2D::Coord>);
     template void saveResult<Torus6D>(runconfig&, std::vector<Torus6D::Coord>);
+    template void saveResult<ArbitraryGraph>(runconfig&, std::vector<ArbitraryGraph::Coord>);
 }

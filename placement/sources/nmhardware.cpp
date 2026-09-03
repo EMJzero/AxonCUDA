@@ -1103,4 +1103,5 @@ namespace hwmodel {
     template class HardwareModel<Torus2D>;
     template class HardwareModel<Torus3D>;
     template class HardwareModel<Torus6D>;
+    template class HardwareModel<ArbitraryGraph>;
 }

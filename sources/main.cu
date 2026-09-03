@@ -36,6 +36,36 @@ using namespace constraints;
 using namespace config;
 
 
+// validate the final partitioning, then log its quality metrics and save it to file
+// returns false if the partitioning violates the constraints
+static bool evaluateAndSaveResults(
+    runconfig &cfg,
+    const Constraints &constr,
+    const HyperGraph &hg,
+    const std::vector<uint32_t> &partitions
+) {
+    if (!constr.checkPartitionValidity(hg, partitions, cfg.verbose_errs_and_warns))
+        return false;
+
+    // log metrics
+    DBG(cfg) std::cout << "Preparing partitioned hypergraph and computing quality metrics...\n";
+    auto partitioned_hg = hg.getPartitionsHypergraph(partitions, 2, true); // remove the destination if self-cycles happen
+    auto hedge_overlap = constr.hedgeOverlap(hg, partitions);
+    std::cout << "Partitioned hypergraph:\n";
+    std::cout << "  Nodes:         " << partitioned_hg.nodes() << "\n";
+    std::cout << "  Hyperedges:    " << partitioned_hg.hedges().size() << "\n";
+    std::cout << "  Total pins:    " << partitioned_hg.hedgesFlat().size() << "\n";
+    std::cout << "  Cut-net:       " << partitioned_hg.cutnet() << "\n";
+    std::cout << "  Connectivity:  " << partitioned_hg.connectivity() << "\n";
+    std::cout << "  SOED:          " << hg.soedFromPart(partitions) << "\n";
+    std::cout << "  Hedge overlap: " << std::fixed << std::setprecision(3) << hedge_overlap.ar_mean << " ar. mean, " << hedge_overlap.geo_mean << " geo. mean\n";
+
+    // save results
+    saveResult(cfg, partitioned_hg, partitions);
+    return true;
+}
+
+
 int main(int argc, char** argv) {
     if (argc == 1) {
         printHelp();
@@ -62,6 +92,19 @@ int main(int argc, char** argv) {
     std::cout << "  Nodes per partition:         " << constr.nodesPerPart() << "\n";
     std::cout << "  Inbound hedge per partition: " << constr.inboundPerPart() << "\n";
     std::cout << "  Maximum partitions:          " << constr.maxParts() << "\n";
+
+    // quick path: a single partition was requested ('-k 1'), every node trivially belongs to partition 0
+    if (cfg.mode == Mode::KWAY && cfg.kway == 1) {
+        INFO(cfg) std::cout << "Single partition requested ('-k 1'), skipping the partitioning routine...\n";
+        // HP: no duplicates per hedge, no self-cycles (keep the src only) -> same treatment as the regular path, so that metrics are comparable
+        hg.deduplicateHyperedges(2, false); // remove the srcs
+        std::vector<uint32_t> partitions(hg.nodes(), 0u);
+        if (!evaluateAndSaveResults(cfg, constr, hg, partitions)) {
+            std::cerr << "ERROR, invalid partitining !!\n";
+            return 1;
+        }
+        return 0;
+    }
 
     std::cout << "Using settings:\n";
     std::cout << "  Candidates count:            " << cfg.candidates_count << "\n";
@@ -388,6 +431,10 @@ int main(int argc, char** argv) {
             d_partitions_sizes = d_init_partitions_sizes;
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, max_parts * sizeof(uint32_t))); // TODO: remove, not needed in KWAY mode
 
+            // neighbors are no longer needed after coarsening is done
+            CUDA_CHECK(cudaFree(d_neighbors));
+            CUDA_CHECK(cudaFree(d_neighbors_offsets));
+
             return std::make_tuple(max_parts, d_init_partitions);
         }
         // ======================================
@@ -481,6 +528,10 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaFree(d_ungroups));
             CUDA_CHECK(cudaFree(d_ungroups_offsets));
             CUDA_CHECK(cudaFree(d_groups_sizes));
+
+            // neighbors are no longer needed after coarsening is done
+            CUDA_CHECK(cudaFree(d_neighbors));
+            CUDA_CHECK(cudaFree(d_neighbors_offsets));
 
             return std::make_tuple(max_parts, d_init_partitions);
         }
@@ -915,25 +966,10 @@ int main(int argc, char** argv) {
     float dbg_cutn = hg.cutnetFromPart(partitions);
     */
 
-    if (constr.checkPartitionValidity(hg, partitions, cfg.verbose_errs_and_warns)) {
-        // log metrics
-        DBG(cfg) std::cout << "Preparing partitioned hypergraph and computing quality metrics...\n";
-        auto partitioned_hg = hg.getPartitionsHypergraph(partitions, 2, true); // remove the destination if self-cycles happen
-        auto hedge_overlap = constr.hedgeOverlap(hg, partitions);
-        std::cout << "Partitioned hypergraph:\n";
-        std::cout << "  Nodes:         " << partitioned_hg.nodes() << "\n";
-        std::cout << "  Hyperedges:    " << partitioned_hg.hedges().size() << "\n";
-        std::cout << "  Total pins:    " << partitioned_hg.hedgesFlat().size() << "\n";
-        std::cout << "  Cut-net:       " << partitioned_hg.cutnet() << "\n";
-        std::cout << "  Connectivity:  " << partitioned_hg.connectivity() << "\n";
-        std::cout << "  SOED:          " << hg.soedFromPart(partitions) << "\n";
-        std::cout << "  Hedge overlap: " << std::fixed << std::setprecision(3) << hedge_overlap.ar_mean << " ar. mean, " << hedge_overlap.geo_mean << " geo. mean\n";
-        //if (dbg_conn != partitioned_hg.connectivity()) std::cerr << "ERROR, incorrect metric calculation for connectivity: " << dbg_conn << " vs " << partitioned_hg.connectivity() << " !!\n";
-        //if (dbg_cutn != partitioned_hg.cutnet()) std::cerr << "ERROR, incorrect metric calculation for cut-net: " << dbg_cutn << " vs " << partitioned_hg.cutnet() << " !!\n";
-        
-        // save results
-        saveResult(cfg, partitioned_hg, partitions);
-    } else {
+    //if (dbg_conn != partitioned_hg.connectivity()) std::cerr << "ERROR, incorrect metric calculation for connectivity: " << dbg_conn << " vs " << partitioned_hg.connectivity() << " !!\n";
+    //if (dbg_cutn != partitioned_hg.cutnet()) std::cerr << "ERROR, incorrect metric calculation for cut-net: " << dbg_cutn << " vs " << partitioned_hg.cutnet() << " !!\n";
+
+    if (!evaluateAndSaveResults(cfg, constr, hg, partitions)) {
         std::cerr << "ERROR, invalid partitining !!\n";
         return 1;
     }

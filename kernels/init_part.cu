@@ -19,7 +19,7 @@ void init_partitions_random(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_nodes) return;
 
-    uint32_t x = seed ^ tid;
+    uint32_t x = (seed ^ tid) | 1u;
     auto rng = [&]() {
         x ^= x << 13;
         x ^= x >> 17;
@@ -244,9 +244,9 @@ void armonic_degree_score_kernel(
     }
 
     score = warpReduceSumLN0<float>(score);
-    
+
     if (lane_id == 0)
-        hedge_ratio[warp_id] = hedge_weights[warp_id] / score;
+        hedge_ratio[warp_id] = score > 0.0f ? hedge_weights[warp_id] / score : 0.0f;
         //hedge_score[warp_id] = 1/score;
 }
 
@@ -277,7 +277,8 @@ void prune_hedges_kernel(
     const float rand = curand_uniform(&state);
 
     keep[tid] = keep_prob >= rand;
-    hedge_scaled_weights[tid] = hedge_weights[tid] / keep_prob; // rescale weights (lower probability -> higher weight)
+    // rescale weights (lower probability -> higher weight)
+    hedge_scaled_weights[tid] = keep_prob > 0.0f ? hedge_weights[tid] / keep_prob : 0.0f;
 }
 
 // quickly compute the connectivity resulting from a given partitioning

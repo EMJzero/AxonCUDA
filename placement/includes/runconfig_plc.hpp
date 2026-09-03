@@ -19,28 +19,32 @@ namespace config_plc {
         LATTICE2D, // 2D lattice -> intrinsic dim. = 2, distance func. = Manhattan
         TORUS6D, // 6D torus -> intrinsic dim. = 6, distance func. = wrapping Manhattan
         HYPERCUBE, // N-D hypercube -> intrinsic dim. = 1, distance func. = Hamming
-        HYPERX3D // 3D HyperX -> intrinsic dim. = 3, distance func. = # not-equal dim. (any-radix Hamming)
+        HYPERX3D, // 3D HyperX -> intrinsic dim. = 3, distance func. = # not-equal dim. (any-radix Hamming)
+        ARBITRARY // arbitrary undirected weighted graph -> intrinsic dim. = 1, distance func. = precomputed weighted shortest path
     };
 
     static constexpr std::pair<TargetTopology, const char*> TOPOLOGY_NAMES[] = {
         { TargetTopology::LATTICE2D, "lat2d" },
         { TargetTopology::TORUS6D, "tor6d" },
         { TargetTopology::HYPERCUBE, "hcube" },
-        { TargetTopology::HYPERX3D, "hx3d" }
+        { TargetTopology::HYPERX3D, "hx3d" },
+        { TargetTopology::ARBITRARY, "arb" }
     };
 
     enum class SpaceFillingCurve {
         HILB, // Hilbert curve
         SNAK, // S-like snake curve
         ZORD, // Z-order curve
-        QUAD // quadtree-style layout
+        QUAD, // quadtree-style layout
+        FLAT // identity 1D mapping (no curve) - for topologies without an embeddable multi-dimensional locality curve
     };
 
     static constexpr std::pair<SpaceFillingCurve, const char*> SPACE_FILLING_CURVE_NAMES[] = {
         { SpaceFillingCurve::HILB, "hilb" },
         { SpaceFillingCurve::SNAK, "snak" },
         { SpaceFillingCurve::ZORD, "zord" },
-        { SpaceFillingCurve::QUAD, "quad" }
+        { SpaceFillingCurve::QUAD, "quad" },
+        { SpaceFillingCurve::FLAT, "flat" }
     };
 
     using TopologySupport = uint32_t; // flag bits -> the i-th bit is set if the i-th topology in TargetTopology's order is supported
@@ -53,11 +57,13 @@ namespace config_plc {
         { SpaceFillingCurve::HILB, topologySupport(TargetTopology::LATTICE2D) | topologySupport(TargetTopology::TORUS6D) },
         { SpaceFillingCurve::SNAK, topologySupport(TargetTopology::LATTICE2D) | topologySupport(TargetTopology::TORUS6D) },
         { SpaceFillingCurve::ZORD, topologySupport(TargetTopology::LATTICE2D) | topologySupport(TargetTopology::TORUS6D) },
-        { SpaceFillingCurve::QUAD, topologySupport(TargetTopology::LATTICE2D) | topologySupport(TargetTopology::TORUS6D) }
+        { SpaceFillingCurve::QUAD, topologySupport(TargetTopology::LATTICE2D) | topologySupport(TargetTopology::TORUS6D) },
+        { SpaceFillingCurve::FLAT, topologySupport(TargetTopology::ARBITRARY) }
     };
 
     struct runconfig {
         std::string load_path; // path to the hgraph to load 'n' partition
+        std::string graph_path; // path to the target topology graph to load (mandatory when topology == ARBITRARY)
         std::string save_path; // path where to save the placement data
         std::string constraints; // name the constraints set to use
         uint32_t labelprop_repeats; // number of labelprop rounds performed at each level of recursive bisection in the parallel initial placement
@@ -84,6 +90,8 @@ namespace config_plc {
     runconfig parseArgs(int argc, char** argv);
 
     hgraph::HyperGraph loadHgraph(runconfig &cfg);
+
+    hgraph::HyperGraph loadTopologyGraph(runconfig &cfg);
 
     template<topology::Topology T>
     hwmodel::HardwareModel<T> setupNMH(runconfig &cfg);

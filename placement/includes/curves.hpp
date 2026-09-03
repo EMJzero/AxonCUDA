@@ -601,6 +601,20 @@ inline std::vector<Coord_t<T>> quadPlacement(uint32_t nodes, const T& topology, 
 
 // EXTERNAL INTERFACE
 
+// trivial fallback for topologies with no embeddable multi-dimensional locality curve (e.g. Arbitrary):
+// node i in the 1D order simply becomes coordinate {i} -> only meaningful for 1-dimensional topologies,
+// whose Coord already IS the flat node index, so there is nothing to "curve" in the first place
+template<Topology T> requires (T::dimensions == 1)
+inline std::vector<Coord_t<T>> identityPlacement(uint32_t nodes, const T& topology, bool verbose) {
+    (void)topology;
+    if (verbose) std::cout << "Generating identity (flat) placement for " << nodes << " nodes...\n";
+    std::vector<Coord_t<T>> result;
+    result.reserve(nodes);
+    for (uint32_t i = 0; i < nodes; ++i)
+        result.push_back(Coord_t<T>{static_cast<int>(i)});
+    return result;
+}
+
 template<Topology T>
 std::vector<Coord_t<T>> generatePlacementCurve(
     SpaceFillingCurve curve,
@@ -630,6 +644,12 @@ std::vector<Coord_t<T>> generatePlacementCurve(
         case SpaceFillingCurve::QUAD:
             if constexpr (requires { quadPlacement<T>(nodes, topology, verbose); }) {
                 return quadPlacement<T>(nodes, topology, verbose);
+            }
+            break;
+
+        case SpaceFillingCurve::FLAT:
+            if constexpr (requires { identityPlacement<T>(nodes, topology, verbose); }) {
+                return identityPlacement<T>(nodes, topology, verbose);
             }
             break;
     }

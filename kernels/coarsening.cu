@@ -258,7 +258,7 @@ void grouping_kernel(
 
     //const uint32_t num_repeats = (num_nodes + tcount - 1) / tcount;
     const uint32_t actual_repeats = tid < num_nodes ? 1u + (num_nodes - 1u - tid) / tcount : 0u;
-    if (actual_repeats == 0) return;
+    // IMPORTANT: threads with no node must NOT return early, every thread has to reach each the grid sync
 
     /*
     * Logic: a walk up (and down) the tree for grouping!
@@ -402,11 +402,13 @@ void grouping_kernel(
                     const uint32_t prev_target_score_wout_sum = atomicAdd(&dp_scores[target].with, score_wout); // dp_scores[...].with contains the sum of childrens' wouts!
                     const uint32_t target_score_wout_sum = prev_target_score_wout_sum + score_wout;
                     slot prev_slot;
+                    const int64_t raw_gain = (int64_t)score_with - (int64_t)score_wout;
+                    const uint32_t gain = raw_gain > 0 ? (uint32_t)raw_gain : 0u;
                     // NOTE: if, by bad luck, the fixed-point score is the same, the id is used as a tie-breaker
-                    outcome = atomic_max_on_slot_ret(group_slots, target, current, score_with - score_wout, prev_slot); // atomic are done with the GAIN from the wout->with transition, wins the subtree with the highest gain if given the target
+                    outcome = atomic_max_on_slot_ret(group_slots, target, current, gain, prev_slot); // atomic are done with the GAIN from the wout->with transition, wins the subtree with the highest gain if given the target
                     if (prev_slot.score == UINT32_MAX) break; // alternative root: a node locked in a previous round
                     //const uint32_t holder_id = outcome ? current : prev_slot.id;
-                    const uint32_t holder_with_minus_wout = outcome ? score_with - score_wout : prev_slot.score;
+                    const uint32_t holder_with_minus_wout = outcome ? gain : prev_slot.score;
                     // DEBUG: prevent cycles longer than 2!
                     /*bool die = false;
                     for (uint32_t j = 0; j < curr_path_length; j++) {
@@ -437,7 +439,7 @@ void grouping_kernel(
 
         // repeat for every node that you need to handle
         // NOTE: do these backward as to unfold the path from the rear
-        for (int32_t repeat = actual_repeats - 1; repeat >= 0; repeat--) {
+        for (int32_t repeat = (int32_t)actual_repeats - 1; repeat >= 0; repeat--) {
             const uint32_t curr_tid = tid + repeat * tcount;
 
             // if you formed a pair, stop

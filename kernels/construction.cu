@@ -159,16 +159,18 @@ void neighborhoods_count_kernel(
     const dim_t* __restrict__ hedges_offsets,
     const uint32_t* __restrict__ touching,
     const dim_t* __restrict__ touching_offsets,
-    const uint32_t num_nodes,
+    const uint32_t num_nodes, // number of nodes handled by this launch (aka the size of the current chunk)
+    const uint32_t nodes_offset, // id of the first node handled by this launch (non-zero only when chunking, see 'buildNeighbors')
     const dim_t max_neighbors,
     const bool discharge, // if true -> finish by dumping SM into GM too, making GM contain the whole (sparse) set
-    uint32_t* __restrict__ neighbors,
+    uint32_t* __restrict__ neighbors, // only holds the 'num_nodes' hash-sets of the current chunk, indexed from 0
     dim_t* __restrict__ neighbors_offsets // here filled as counters of "how many neighbors per node" -> then do a prefix sum for the offsets
 ) {
     // STYLE: one node per block, one touching hedge per warp, distinct neighbors in shared memory!
-    const uint32_t node_id = blockIdx.x;
+    const uint32_t local_node_id = blockIdx.x; // node id within the current chunk
     // NOTE: the whole block returns, no need to sync
-    if (node_id >= num_nodes) return;
+    if (local_node_id >= num_nodes) return;
+    const uint32_t node_id = nodes_offset + local_node_id; // global node id
 
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
     // local per block - coincides with the touching hedge to handle
@@ -179,7 +181,7 @@ void neighborhoods_count_kernel(
     //const uint32_t* not_my_touching = touching + touching_offsets[node_id + 1];
     const uint32_t my_touching_count = (uint32_t)(touching_offsets[node_id + 1] - touching_offsets[node_id]);
 
-    uint32_t* my_neighbors = neighbors + node_id * max_neighbors;
+    uint32_t* my_neighbors = neighbors + local_node_id * max_neighbors; // the oversized buffer only spans the current chunk
 
     // hash-set for deduplication (allows false-negatives, back it up with true deduplication in global memory)
     __shared__ uint32_t dedupe[SM_MAX_BLOCK_DEDUPE_BUFFER_SIZE];
@@ -417,6 +419,7 @@ void apply_coarsening_hedges_scatter_dsts(
     extern __shared__ uint32_t block_new_pins[];
     uint32_t *new_pins = block_new_pins + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
     wrp_init<uint32_t>(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    __syncwarp();
 
     // go over the hedge's destinations
     for (const uint32_t* curr = hedge_start + hedge_srcs_count + lane_id; curr < hedge_end; curr += WARP_SIZE) {
@@ -467,6 +470,7 @@ void apply_coarsening_hedges_scatter_srcs(
     extern __shared__ uint32_t block_new_pins[];
     uint32_t *new_pins = block_new_pins + MAX_SM_WARP_DEDUPE_BUFFER_SIZE * (threadIdx.x / WARP_SIZE);
     wrp_init<uint32_t>(new_pins, MAX_SM_WARP_DEDUPE_BUFFER_SIZE, HASH_EMPTY);
+    __syncwarp();
 
     // go over the hedge's destinations
     for (const uint32_t* curr = hedge_start + lane_id; curr < hedge_srcs_end; curr += WARP_SIZE) {
