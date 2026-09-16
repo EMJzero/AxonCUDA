@@ -717,6 +717,12 @@ namespace topology {
     };
 
     // predefined topologies ready for use
+    // trait: minimum-path statistics on a lattice have a closed form (see accumulateMinimumPathTransit),
+    // whereas other topologies must fall back on explicit path enumeration
+    template<typename T> struct is_lattice : std::false_type {};
+    template<uint32_t N> struct is_lattice<Lattice<N>> : std::true_type {};
+    template<typename T> inline constexpr bool is_lattice_v = is_lattice<T>::value;
+
     using Lattice2D = Lattice<2>;
     using Lattice3D = Lattice<3>;
     using Torus2D = Torus<2>;

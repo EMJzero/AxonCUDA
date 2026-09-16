@@ -6,6 +6,8 @@
 #include <iomanip>
 #include <iostream>
 #include <exception>
+#include <array>
+#include <numeric>
 #include <algorithm>
 #include <semaphore>
 #include <unordered_map>
@@ -267,28 +269,93 @@ namespace hwmodel {
         return {ar_mean, geo_mean, ar_mean_weighted, geo_mean_weighted};
     }
 
-    template<Topology T>
-    std::unordered_map<typename HardwareModel<T>::Coord, double> HardwareModel<T>::expectedSpikeTransitProbability(const Coord& src, const Coord& dst) const {
-        // NOTE: updated formulation, now differing from Jin et al.
-        // => every minimum-distance path between source and destination is considered equally likely
-        // =>=> the probability of a core being traversed equates the number of minimum paths including it vs the total number of minimum paths
-
-        const auto paths = topology_.iterMinimumPaths(src, dst);
-        if (paths.empty())
-            throw std::runtime_error("Topology returned no minimum path between two placement coordinates.");
-
-        std::unordered_map<Coord, double> probabilities;
-        for (const auto& path : paths) {
-            for (const Coord& coordinate : path)
-                ++probabilities[coordinate];
+    namespace {
+        // log of n!, cached per thread since the same few values recur across every coordinate
+        long double logFactorial(uint32_t n) {
+            thread_local std::vector<long double> cache{0.0L};
+            if (cache.size() <= n) {
+                size_t old_size = cache.size();
+                cache.resize(static_cast<size_t>(n) + 1u);
+                for (size_t i = old_size; i <= n; ++i)
+                    cache[i] = cache[i - 1u] + std::log(static_cast<long double>(i));
+            }
+            return cache[n];
         }
 
-        const double path_count = static_cast<double>(paths.size());
-        for (auto& entry : probabilities)
-            entry.second /= path_count;
+        // log of the multinomial (sum steps)! / prod(steps_i!), i.e. the number of monotone
+        // lattice paths realizing the given per-dimension step counts
+        template<uint32_t N>
+        long double logMonotonePaths(const std::array<uint32_t, N>& steps) {
+            uint32_t total = 0u;
+            for (uint32_t dim = 0; dim < N; ++dim) total += steps[dim];
+            long double result = logFactorial(total);
+            for (uint32_t dim = 0; dim < N; ++dim) result -= logFactorial(steps[dim]);
+            return result;
+        }
+    }
 
+    // NOTE: every minimum-distance path between source and destination is considered equally likely
+    // => the probability of a core being traversed is the share of minimum paths that include it
+    template<Topology T>
+    template<typename Sink>
+    void HardwareModel<T>::accumulateMinimumPathTransit(const Coord& src, const Coord& dst, double weight, Sink&& sink) const {
+        if constexpr (is_lattice_v<T>) {
+            // On a lattice every minimum path is monotone, so a core h is on such a path iff it lies in
+            // the src-dst bounding box, and the paths through it split into the src->h and h->dst legs:
+            //   p(h) = monotonePaths(src->h) * monotonePaths(h->dst) / monotonePaths(src->dst)
+            // Counting them beats enumerating them: the path count is binomial in the distance.
+            constexpr uint32_t N = T::dimensions;
+            std::array<uint32_t, N> span{};
+            for (uint32_t dim = 0; dim < N; ++dim)
+                span[dim] = static_cast<uint32_t>(std::abs(dst[dim] - src[dim]));
+
+            const long double log_total = logMonotonePaths<N>(span);
+
+            // walk the bounding box as an odometer over the per-dimension offsets from src
+            std::array<uint32_t, N> head{};
+            std::array<uint32_t, N> tail{};
+            Coord coordinate;
+            while (true) {
+                for (uint32_t dim = 0; dim < N; ++dim) {
+                    const int step = dst[dim] >= src[dim] ? 1 : -1;
+                    coordinate[dim] = src[dim] + step * static_cast<int>(head[dim]);
+                    tail[dim] = span[dim] - head[dim];
+                }
+                const long double log_through = logMonotonePaths<N>(head) + logMonotonePaths<N>(tail);
+                sink(coordinate, weight * static_cast<double>(std::exp(log_through - log_total)));
+
+                uint32_t dim = 0;
+                for (; dim < N; ++dim) {
+                    if (head[dim] < span[dim]) { ++head[dim]; break; }
+                    head[dim] = 0u;
+                }
+                if (dim == N) break; // odometer wrapped -> whole box visited
+            }
+        } else {
+            const auto paths = topology_.iterMinimumPaths(src, dst);
+            if (paths.empty())
+                throw std::runtime_error("Topology returned no minimum path between two placement coordinates.");
+
+            const double path_weight = weight / static_cast<double>(paths.size());
+            for (const auto& path : paths) {
+                for (const Coord& coordinate : path)
+                    sink(coordinate, path_weight);
+            }
+        }
+    }
+
+    template<Topology T>
+    std::unordered_map<typename HardwareModel<T>::Coord, double> HardwareModel<T>::expectedSpikeTransitProbability(const Coord& src, const Coord& dst) const {
+        std::unordered_map<Coord, double> probabilities;
+        accumulateMinimumPathTransit(src, dst, 1.0, [&](const Coord& coordinate, double probability) {
+            probabilities[coordinate] += probability;
+        });
         return probabilities;
     }
+
+    // ========================================================================
+    // UNICAST ROUTING POLICY
+    // ========================================================================
 
     template<Topology T>
     double HardwareModel<T>::placementEnergyConsumption(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
@@ -308,30 +375,33 @@ namespace hwmodel {
         return result;
     }
 
+    // frequency-weighted delivery completion latency, i.e. the time for a spike to reach its LAST destination
+    // NOTE: latency is a completion time, hence it takes the maximum over destinations, not their average
+    // => being defined over the shortest path length, it does not depend on the routing policy
     template<Topology T>
     double HardwareModel<T>::placementAverageLatency(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
-        double result = 0.0;
-        double tot_spike_frequency = 0.0;
+        double weighted_latency = 0.0;
+        double total_weight = 0.0;
 
         for (const auto& he : part_hgraph.hedges()) {
+            const double weight = static_cast<double>(he.weight());
             for (const auto src : he.sources()) {
                 const auto& src_core = placement[src];
 
-                double w = static_cast<double>(he.weight());
-                const uint32_t destinations_count = he.length() - he.src_count();
-                tot_spike_frequency += w * static_cast<double>(destinations_count);
-
+                uint32_t max_distance = 0;
                 for (auto dst : he.destinations()) {
                     const auto& dst_core = placement[dst];
-                    double md = static_cast<double>(topology_.distance(src_core, dst_core));
-                    result += w * ((md + 1.0) * latency_per_routing_ + md * latency_per_wire_);
+                    max_distance = std::max(max_distance, topology_.distance(src_core, dst_core));
                 }
+
+                const double latency = static_cast<double>(max_distance) *
+                    (latency_per_routing_ + latency_per_wire_) + latency_per_routing_;
+                weighted_latency += weight * latency;
+                total_weight += weight;
             }
         }
 
-        if (tot_spike_frequency > 0.0)
-            return result / tot_spike_frequency;
-        return 0.0;
+        return total_weight > 0.0 ? weighted_latency / total_weight : 0.0;
     }
 
     template<Topology T>
@@ -386,16 +456,10 @@ namespace hwmodel {
 
                 for (auto dst : he.destinations()) {
                     const auto& dst_core = placement[dst];
-                    const auto paths = topology_.iterMinimumPaths(src_core, dst_core);
-                    if (paths.empty())
-                        throw std::runtime_error("Topology returned no minimum path between two placement coordinates.");
-
-                    const double path_weight = static_cast<double>(he.weight()) / static_cast<double>(paths.size());
-                    for (const auto& path : paths) {
-                        for (const Coord& coordinate : path) {
-                            congestion[coordinate] += path_weight;
-                        }
-                    }
+                    accumulateMinimumPathTransit(src_core, dst_core, static_cast<double>(he.weight()),
+                        [&](const Coord& coordinate, double transit) {
+                            congestion[coordinate] += transit;
+                        });
                 }
             }
         }
@@ -426,6 +490,10 @@ namespace hwmodel {
         metrics.connections_locality = connectionsLocality(part_hgraph, placement);
         return metrics;
     }
+
+    // ========================================================================
+    // STEINER-MULTICAST ROUTING POLICY
+    // ========================================================================
 
     namespace {
         constexpr uint32_t MAX_STEINER_STATES = 2000000;
@@ -481,7 +549,7 @@ namespace hwmodel {
             std::vector<DecisionArc> incoming;
         };
 
-        struct alignas(64) MulticastEvaluation {
+        struct alignas(64) SteinerMulticastEvaluation {
             double energy{0.0};
             double weighted_latency{0.0};
             double weight{0.0};
@@ -494,7 +562,7 @@ namespace hwmodel {
             uint32_t source;
         };
 
-        enum class MulticastTaskStatus : uint8_t {
+        enum class SteinerTaskStatus : uint8_t {
             pending,
             completed,
             state_limited
@@ -795,7 +863,7 @@ namespace hwmodel {
         }
 
         // evaluate every source-multicast once, optionally accumulating the expensive Steiner-derived metrics
-        MulticastEvaluation evaluateMulticast(
+        SteinerMulticastEvaluation evaluateSteinerMulticast(
             const HyperGraph& part_hgraph,
             const std::vector<Coord<2>>& placement,
             const Lattice2D& lattice,
@@ -838,10 +906,10 @@ namespace hwmodel {
 
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::hours(MULTICAST_STEINER_TIME_LIMIT_HOURS);
             const int thread_count = std::max<int>(1, std::min<size_t>(static_cast<size_t>(omp_get_max_threads()), tasks.size()));
-            std::vector<MulticastEvaluation> locals(static_cast<size_t>(thread_count));
-            std::vector<MulticastTaskStatus> task_status(
+            std::vector<SteinerMulticastEvaluation> locals(static_cast<size_t>(thread_count));
+            std::vector<SteinerTaskStatus> task_status(
                 need_steiner ? tasks.size() : 0u,
-                MulticastTaskStatus::pending
+                SteinerTaskStatus::pending
             );
             std::atomic<bool> timed_out{false};
             std::atomic<bool> stop_requested{false};
@@ -907,14 +975,14 @@ namespace hwmodel {
                         if (need_latency)
                             local.weight += weight;
                         if (need_steiner)
-                            task_status[task_idx] = MulticastTaskStatus::completed;
+                            task_status[task_idx] = SteinerTaskStatus::completed;
                     } catch (const SteinerStateLimit&) {
-                        task_status[task_idx] = MulticastTaskStatus::state_limited;
+                        task_status[task_idx] = SteinerTaskStatus::state_limited;
                     } catch (const SteinerTimeout&) {
                         timed_out.store(true, std::memory_order_relaxed);
                         stop_requested.store(true, std::memory_order_relaxed);
                     } catch (...) {
-                        #pragma omp critical(multicast_metrics_failure)
+                        #pragma omp critical(steiner_metrics_failure)
                         {
                             if (!failure)
                                 failure = std::current_exception();
@@ -949,9 +1017,9 @@ namespace hwmodel {
                 return std::tuple{incomplete_count, incomplete_weight, total_weight};
             };
 
-            if (std::find(task_status.begin(), task_status.end(), MulticastTaskStatus::state_limited) != task_status.end()) {
+            if (std::find(task_status.begin(), task_status.end(), SteinerTaskStatus::state_limited) != task_status.end()) {
                 auto [incomplete_count, incomplete_weight, total_weight] = summarize_incomplete([&](size_t task_idx) {
-                    return task_status[task_idx] == MulticastTaskStatus::state_limited;
+                    return task_status[task_idx] == SteinerTaskStatus::state_limited;
                 });
                 double incomplete_percentage = total_weight != 0.0 ? 100.0 * incomplete_weight / total_weight : 0.0;
                 std::cerr << "WARNING: " << incomplete_count << " hyperedges exceeded the "
@@ -962,7 +1030,7 @@ namespace hwmodel {
 
             if (timed_out.load(std::memory_order_relaxed)) {
                 auto [incomplete_count, incomplete_weight, total_weight] = summarize_incomplete([&](size_t task_idx) {
-                    return task_status[task_idx] != MulticastTaskStatus::completed;
+                    return task_status[task_idx] != SteinerTaskStatus::completed;
                 });
                 double incomplete_percentage = total_weight != 0.0 ? 100.0 * incomplete_weight / total_weight : 0.0;
                 std::cerr << "WARNING: multicast Steiner evaluation reached its "
@@ -975,14 +1043,14 @@ namespace hwmodel {
             float evaluation_fraction = 1.0f;
             if (need_steiner) {
                 auto [incomplete_count, incomplete_weight, total_weight] = summarize_incomplete([&](size_t task_idx) {
-                    return task_status[task_idx] != MulticastTaskStatus::completed;
+                    return task_status[task_idx] != SteinerTaskStatus::completed;
                 });
                 (void)incomplete_count;
                 if (total_weight != 0.0)
                     evaluation_fraction = static_cast<float>((total_weight - incomplete_weight) / total_weight);
             }
 
-            MulticastEvaluation result;
+            SteinerMulticastEvaluation result;
             result.evaluation_fraction = evaluation_fraction;
             if (need_congestion)
                 result.congestion.assign(cores_count, 0.0);
@@ -1008,12 +1076,12 @@ namespace hwmodel {
 
     // total spike-traffic energy under exact minimum multicast trees
     template<Topology T>
-    double HardwareModel<T>::multicastEnergyConsumption(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+    double HardwareModel<T>::steinerMulticastEnergyConsumption(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
         if constexpr (!std::same_as<T, Lattice2D>) {
             // TODO: the exact Steiner solver is specialized for rectangular 2D lattices.
             throw std::logic_error("Multicast energy is only implemented for Lattice2D.");
         } else {
-            return evaluateMulticast(
+            return evaluateSteinerMulticast(
                 part_hgraph, placement, topology_, coresCount(), coresAlongDim(1) /*y*/,
                 energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
                 true, false, false
@@ -1023,7 +1091,7 @@ namespace hwmodel {
 
     // frequency-weighted delivery completion latency, with one multicast per source
     template<Topology T>
-    double HardwareModel<T>::multicastAverageLatency(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+    double HardwareModel<T>::steinerMulticastAverageLatency(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
         double weighted_latency = 0.0;
         double total_weight = 0.0;
 
@@ -1050,12 +1118,12 @@ namespace hwmodel {
 
     // expected per-core traffic under the uniform distribution over exact minimum multicast core sets
     template<Topology T>
-    std::vector<double> HardwareModel<T>::multicastCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+    std::vector<double> HardwareModel<T>::steinerMulticastCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
         if constexpr (!std::same_as<T, Lattice2D>) {
             // TODO: congestion requires topology-wide coordinate indexing and a generic multicast solver.
             throw std::logic_error("Multicast congestion is only implemented for Lattice2D.");
         } else {
-            return evaluateMulticast(
+            return evaluateSteinerMulticast(
                 part_hgraph, placement, topology_, coresCount(), coresAlongDim(1) /*y*/,
                 energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
                 false, false, true
@@ -1063,37 +1131,356 @@ namespace hwmodel {
         }
     }
 
+    // mean per-core traffic under Steiner-multicast trees
+    // NOTE: matching the unicast definition, this is the total core-traversal weight spread over every core
+    template<Topology T>
+    double HardwareModel<T>::steinerMulticastAverageCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        std::vector<double> congestion = steinerMulticastCongestion(part_hgraph, placement);
+        if (congestion.empty() || coresCount() == 0)
+            return 0.0;
+        return std::accumulate(congestion.begin(), congestion.end(), 0.0) / static_cast<double>(coresCount());
+    }
+
     // peak expected per-core traffic under exact minimum multicast trees
     template<Topology T>
-    double HardwareModel<T>::multicastMaximumCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
-        std::vector<double> congestion = multicastCongestion(part_hgraph, placement);
+    double HardwareModel<T>::steinerMulticastMaximumCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        std::vector<double> congestion = steinerMulticastCongestion(part_hgraph, placement);
         return congestion.empty() ? 0.0 : *std::max_element(congestion.begin(), congestion.end());
     }
 
     // compute the three analytical multicast placement metrics in one pass over the hypergraph
     template<Topology T>
-    MulticastPlacementMetrics HardwareModel<T>::getAllMulticastMetrics(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
-        MulticastPlacementMetrics metrics;
+    SteinerMulticastPlacementMetrics HardwareModel<T>::getAllSteinerMulticastMetrics(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        SteinerMulticastPlacementMetrics metrics;
         metrics.valid = checkPlacementValidity(part_hgraph, placement);
         if (!metrics.valid)
             return metrics;
 
         if constexpr (std::same_as<T, Lattice2D>) {
-            MulticastEvaluation result = evaluateMulticast(
+            SteinerMulticastEvaluation result = evaluateSteinerMulticast(
                 part_hgraph, placement, topology_, coresCount(), coresAlongDim(1) /*y*/,
                 energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
                 true, true, true
             );
             metrics.energy = result.energy;
             metrics.avg_latency = result.weight > 0.0 ? result.weighted_latency / result.weight : 0.0;
+            metrics.avg_congestion = (result.congestion.empty() || coresCount() == 0) ? 0.0 :
+                std::accumulate(result.congestion.begin(), result.congestion.end(), 0.0) / static_cast<double>(coresCount());
             metrics.max_congestion = result.congestion.empty() ? 0.0 : *std::max_element(result.congestion.begin(), result.congestion.end());
             metrics.evaluation_fraction = result.evaluation_fraction;
         } else {
             // TODO: multicast Steiner energy and congestion are still specialized for Lattice2D.
             metrics.energy = std::nullopt;
-            metrics.avg_latency = multicastAverageLatency(part_hgraph, placement);
+            metrics.avg_latency = steinerMulticastAverageLatency(part_hgraph, placement);
+            metrics.avg_congestion = std::nullopt;
             metrics.max_congestion = std::nullopt;
             metrics.evaluation_fraction = 0.0f;
+        }
+        return metrics;
+    }
+
+    // ========================================================================
+    // XY-MULTICAST ROUTING POLICY
+    // ========================================================================
+
+    namespace {
+
+        // per-thread scratch for the XY tree construction, indexed by lattice column (x)
+        struct XYColumnScratch {
+            std::vector<int> low; // lowest y reached by the Y branch departing the spine on this column
+            std::vector<int> high; // highest y reached by the Y branch departing the spine on this column
+            std::vector<uint8_t> touched; // whether this column hosts at least one destination
+            std::vector<uint32_t> touched_list; // columns marked in 'touched', to reset them in O(destinations)
+
+            explicit XYColumnScratch(uint32_t cores_x) :
+                low(cores_x, 0), high(cores_x, 0), touched(cores_x, 0u)
+            {
+                touched_list.reserve(cores_x);
+            }
+        };
+
+        // exact XY-multicast tree statistics for one source and its destinations on a rectangular lattice
+        // => the tree is the union of the dimension-order (X first, then Y) routes towards every destination
+        // => it is a tree rooted in the source: on the source's row a core's predecessor is its row neighbor
+        //    towards the source, elsewhere it is its column neighbor towards the source's row
+        // =>=> hence it traverses exactly |cores| - 1 links, and transit is deterministic (either 0 or 1)
+        uint32_t xyMulticastTree(
+            const Coord<2>& source,
+            const std::vector<Coord<2>>& destinations,
+            uint32_t cores_y,
+            XYColumnScratch& scratch,
+            std::vector<double>* congestion,
+            double weight
+        ) {
+            const int source_x = source[0];
+            const int source_y = source[1];
+
+            // the X spine runs along the source's row, spanning it and the extreme destination columns
+            int spine_low = source_x;
+            int spine_high = source_x;
+            scratch.touched_list.clear();
+
+            for (const Coord<2>& destination : destinations) {
+                const int x = destination[0];
+                const int y = destination[1];
+
+                spine_low = std::min(spine_low, x);
+                spine_high = std::max(spine_high, x);
+
+                // a Y branch always departs from the spine, hence its extent includes the source's row
+                if (!scratch.touched[x]) {
+                    scratch.touched[x] = 1u;
+                    scratch.touched_list.push_back(static_cast<uint32_t>(x));
+                    scratch.low[x] = std::min(source_y, y);
+                    scratch.high[x] = std::max(source_y, y);
+                } else {
+                    scratch.low[x] = std::min(scratch.low[x], y);
+                    scratch.high[x] = std::max(scratch.high[x], y);
+                }
+            }
+
+            uint32_t hops = static_cast<uint32_t>(spine_high - spine_low);
+            for (uint32_t x : scratch.touched_list)
+                hops += static_cast<uint32_t>(scratch.high[x] - scratch.low[x]);
+
+            if (congestion != nullptr) {
+                // spine: every core on the source's row between the extreme destination columns
+                for (int x = spine_low; x <= spine_high; ++x)
+                    (*congestion)[static_cast<uint32_t>(x) * cores_y + static_cast<uint32_t>(source_y)] += weight;
+
+                // branches: every core on a destination column, minus the spine core the branch departs from
+                // NOTE: destination columns always fall inside the spine's span, so no core is counted twice
+                for (uint32_t x : scratch.touched_list) {
+                    for (int y = scratch.low[x]; y <= scratch.high[x]; ++y) {
+                        if (y == source_y) continue;
+                        (*congestion)[x * cores_y + static_cast<uint32_t>(y)] += weight;
+                    }
+                }
+            }
+
+            for (uint32_t x : scratch.touched_list)
+                scratch.touched[x] = 0u;
+
+            return hops;
+        }
+
+        struct alignas(64) XYMulticastEvaluation {
+            double energy{0.0};
+            double weighted_latency{0.0};
+            double weight{0.0};
+            std::vector<double> congestion;
+        };
+
+        // evaluate every source-multicast once, accumulating the requested XY-derived metrics
+        // NOTE: unlike the Steiner solver, each tree is built in O(destinations) time, hence no state
+        // or time limit is needed and the whole hypergraph is always evaluated exactly
+        XYMulticastEvaluation evaluateXYMulticast(
+            const HyperGraph& part_hgraph,
+            const std::vector<Coord<2>>& placement,
+            const Lattice2D& lattice,
+            uint32_t cores_count,
+            uint32_t cores_x,
+            uint32_t cores_y,
+            double energy_per_routing,
+            double energy_per_wire,
+            double latency_per_routing,
+            double latency_per_wire,
+            bool need_energy,
+            bool need_latency,
+            bool need_congestion
+        ) {
+            const auto& hedges = part_hgraph.hedges();
+            const auto& hedges_flat = part_hgraph.hedgesFlat();
+            const size_t hedges_count = hedges.size();
+
+            size_t tasks_count = 0u;
+            for (const auto& he : hedges) {
+                if (!std::isfinite(he.weight()))
+                    throw std::invalid_argument("Multicast metrics require finite hyperedge weights.");
+                tasks_count += he.src_count();
+            }
+
+            std::vector<MulticastTask> tasks;
+            tasks.reserve(tasks_count);
+            for (uint32_t hedge = 0; hedge < hedges_count; ++hedge) {
+                const auto& he = hedges[hedge];
+                for (uint32_t source_idx = 0; source_idx < he.src_count(); ++source_idx)
+                    tasks.push_back({hedge, hedges_flat[he.offset() + source_idx]});
+            }
+
+            const bool need_tree = need_energy || need_congestion;
+            const int thread_count = std::max<int>(1, std::min<size_t>(static_cast<size_t>(omp_get_max_threads()), tasks.size()));
+            std::vector<XYMulticastEvaluation> locals(static_cast<size_t>(thread_count));
+
+            #pragma omp parallel num_threads(thread_count)
+            {
+                const int tid = omp_get_thread_num();
+                auto& local = locals[static_cast<size_t>(tid)];
+                if (need_congestion)
+                    local.congestion.assign(cores_count, 0.0);
+                XYColumnScratch scratch(cores_x);
+                std::vector<Coord<2>> destinations;
+
+                #pragma omp for schedule(dynamic, 64)
+                for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
+                    const auto& task = tasks[task_idx];
+                    const auto& he = hedges[task.hedge];
+                    const double weight = static_cast<double>(he.weight());
+                    const uint32_t destinations_begin = he.offset() + he.src_count();
+                    const uint32_t destinations_end = he.offset() + he.length();
+
+                    if (need_latency) {
+                        int max_distance = 0;
+                        for (uint32_t pin = destinations_begin; pin < destinations_end; ++pin) {
+                            uint32_t destination = hedges_flat[pin];
+                            max_distance = std::max<int>(max_distance, lattice.distance(placement[task.source], placement[destination]));
+                        }
+                        const double latency = static_cast<double>(max_distance) * (latency_per_routing + latency_per_wire) + latency_per_routing;
+                        local.weighted_latency += weight * latency;
+                        local.weight += weight;
+                    }
+
+                    if (need_tree) {
+                        destinations.clear();
+                        destinations.reserve(static_cast<size_t>(destinations_end - destinations_begin));
+                        for (uint32_t pin = destinations_begin; pin < destinations_end; ++pin)
+                            destinations.push_back(placement[hedges_flat[pin]]);
+
+                        const uint32_t hops = xyMulticastTree(
+                            placement[task.source], destinations, cores_y, scratch,
+                            need_congestion ? &local.congestion : nullptr,
+                            weight
+                        );
+                        if (need_energy)
+                            local.energy += weight * (static_cast<double>(hops) * (energy_per_routing + energy_per_wire) + energy_per_routing);
+                    }
+                }
+            }
+
+            XYMulticastEvaluation result;
+            if (need_congestion)
+                result.congestion.assign(cores_count, 0.0);
+            for (const auto& local : locals) {
+                result.energy += local.energy;
+                result.weighted_latency += local.weighted_latency;
+                result.weight += local.weight;
+            }
+            if (need_congestion) {
+                #pragma omp parallel for if(cores_count >= 65536u)
+                for (uint32_t core = 0; core < cores_count; ++core) {
+                    double congestion = 0.0;
+                    for (const auto& local : locals) {
+                        if (!local.congestion.empty())
+                            congestion += local.congestion[core];
+                    }
+                    result.congestion[core] = congestion;
+                }
+            }
+            return result;
+        }
+    }
+
+    // total spike-traffic energy under XY-multicast trees
+    template<Topology T>
+    double HardwareModel<T>::xyMulticastEnergyConsumption(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        if constexpr (!std::same_as<T, Lattice2D>) {
+            // TODO: dimension-order routing is generalizable, but is implemented here for rectangular 2D lattices only.
+            throw std::logic_error("XY-multicast energy is only implemented for Lattice2D.");
+        } else {
+            return evaluateXYMulticast(
+                part_hgraph, placement, topology_, coresCount(), coresAlongDim(0) /*x*/, coresAlongDim(1) /*y*/,
+                energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
+                true, false, false
+            ).energy;
+        }
+    }
+
+    // frequency-weighted delivery completion latency, with one multicast per source
+    // NOTE: XY routing is minimal, so the tree depth towards a destination equals their distance
+    // =>=> this matches the unicast and Steiner latency, all three being defined over shortest paths
+    template<Topology T>
+    double HardwareModel<T>::xyMulticastAverageLatency(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        double weighted_latency = 0.0;
+        double total_weight = 0.0;
+
+        for (const auto& hyperedge : part_hgraph.hedges()) {
+            const double weight = static_cast<double>(hyperedge.weight());
+            for (uint32_t source : hyperedge.sources()) {
+                uint32_t max_distance = 0;
+                for (uint32_t destination : hyperedge.destinations()) {
+                    max_distance = std::max(
+                        max_distance,
+                        topology_.distance(placement[source], placement[destination])
+                    );
+                }
+
+                const double latency = static_cast<double>(max_distance) *
+                    (latency_per_routing_ + latency_per_wire_) + latency_per_routing_;
+                weighted_latency += weight * latency;
+                total_weight += weight;
+            }
+        }
+
+        return total_weight > 0.0 ? weighted_latency / total_weight : 0.0;
+    }
+
+    // per-core traffic under XY-multicast trees, a core either carries a spike or it does not
+    template<Topology T>
+    std::vector<double> HardwareModel<T>::xyMulticastCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        if constexpr (!std::same_as<T, Lattice2D>) {
+            // TODO: congestion requires topology-wide coordinate indexing and a generic dimension-order walk.
+            throw std::logic_error("XY-multicast congestion is only implemented for Lattice2D.");
+        } else {
+            return evaluateXYMulticast(
+                part_hgraph, placement, topology_, coresCount(), coresAlongDim(0) /*x*/, coresAlongDim(1) /*y*/,
+                energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
+                false, false, true
+            ).congestion;
+        }
+    }
+
+    // mean per-core traffic under XY-multicast trees
+    // NOTE: matching the unicast definition, this is the total core-traversal weight spread over every core
+    template<Topology T>
+    double HardwareModel<T>::xyMulticastAverageCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        std::vector<double> congestion = xyMulticastCongestion(part_hgraph, placement);
+        if (congestion.empty() || coresCount() == 0)
+            return 0.0;
+        return std::accumulate(congestion.begin(), congestion.end(), 0.0) / static_cast<double>(coresCount());
+    }
+
+    // peak per-core traffic under XY-multicast trees
+    template<Topology T>
+    double HardwareModel<T>::xyMulticastMaximumCongestion(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        std::vector<double> congestion = xyMulticastCongestion(part_hgraph, placement);
+        return congestion.empty() ? 0.0 : *std::max_element(congestion.begin(), congestion.end());
+    }
+
+    // compute the three analytical XY-multicast placement metrics in one pass over the hypergraph
+    template<Topology T>
+    XYMulticastPlacementMetrics HardwareModel<T>::getAllXYMulticastMetrics(const HyperGraph& part_hgraph, const std::vector<Coord>& placement) const {
+        XYMulticastPlacementMetrics metrics;
+        metrics.valid = checkPlacementValidity(part_hgraph, placement);
+        if (!metrics.valid)
+            return metrics;
+
+        if constexpr (std::same_as<T, Lattice2D>) {
+            XYMulticastEvaluation result = evaluateXYMulticast(
+                part_hgraph, placement, topology_, coresCount(), coresAlongDim(0) /*x*/, coresAlongDim(1) /*y*/,
+                energy_per_routing_, energy_per_wire_, latency_per_routing_, latency_per_wire_,
+                true, true, true
+            );
+            metrics.energy = result.energy;
+            metrics.avg_latency = result.weight > 0.0 ? result.weighted_latency / result.weight : 0.0;
+            metrics.avg_congestion = (result.congestion.empty() || coresCount() == 0) ? 0.0 :
+                std::accumulate(result.congestion.begin(), result.congestion.end(), 0.0) / static_cast<double>(coresCount());
+            metrics.max_congestion = result.congestion.empty() ? 0.0 : *std::max_element(result.congestion.begin(), result.congestion.end());
+        } else {
+            // TODO: XY-multicast energy and congestion are still specialized for Lattice2D.
+            metrics.energy = std::nullopt;
+            metrics.avg_latency = xyMulticastAverageLatency(part_hgraph, placement);
+            metrics.avg_congestion = std::nullopt;
+            metrics.max_congestion = std::nullopt;
         }
         return metrics;
     }

@@ -74,8 +74,10 @@ namespace config_plc {
         TargetTopology topology; // target graph topology, how places are interconnected
         SpaceFillingCurve space_filling_curve; // space filling curve to use for the 1D-to-(N)D locality-preserving mapping
         bool feedforward_order; // if true, use the greedy sequential feedforward initial partitioning (runs on the host !!)
-        bool unicast_metrics; // if true, compute and log the unicast-based placement quality metrics
-        bool multicast_metrics; // if true, compute and log the multicast-based (Steiner tree involved!!) placement quality metrics
+        // ROUTING POLICIES: which cost models to evaluate the placement under (see -rp)
+        bool unicast_metrics; // if true, compute and log the unicast placement quality metrics
+        bool xy_multicast_metrics; // if true, compute and log the XY-multicast placement quality metrics
+        bool steiner_multicast_metrics; // if true, compute and log the Steiner-multicast placement quality metrics (very slow!!)
         bool device_touching_construction; // whether to construct touching/incidence sets on the device or the host
         uint64_t seed; // seed for the multi-start and recursive bisection methods
         bool verbose_logs; // whether to log what is happening inside the algorithms
@@ -106,6 +108,12 @@ namespace config_plc {
     const char* SFCtoString(SpaceFillingCurve curve);
 
     bool parseSFC(const std::string& name, SpaceFillingCurve& curve);
+
+    // parse a comma-separated list of routing policy names (unicast, xy, steiner) into the three flags
+    bool parseRoutingPolicies(const std::string& list, bool& unicast, bool& xy_multicast, bool& steiner_multicast);
+
+    // render the enabled routing policies back as a comma-separated list
+    std::string routingPoliciesToString(bool unicast, bool xy_multicast, bool steiner_multicast);
 
     bool validateTopologySFC(TargetTopology topology, SpaceFillingCurve curve);
 }

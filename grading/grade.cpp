@@ -46,9 +46,37 @@ void printHelp() {
         "  -c-plc <name>   Placement constraints set to use (valid ones: truenorth, loihi, loihi64, loihi84, loihi1024)\n"
         "  -t-plc <name>   Placement topology (valid ones: lat2d, tor6d)\n"
         "  -ff         Reorder the partitioned hypergraph's nodes with the greedy feedforward algorithm (use if '-ff' was used for placement)\n"
-        "  -noum       Disables the evaluation and logging of unicast-based placement quality metrics\n"
-        "  -nomm       Disables the evaluation and logging of multicast-based placement quality metrics (which can be very slow)\n"
+        "  -force-prt  Grade the placement even when the partitioning breaks a constraint (still reports it)\n"
+        "  -ff-prt     Read the partitioning in feedforward-order node space, rather than the hypergraph's own\n"
+        "              (AxonFlow reorders a hypergraph before partitioning it whenever it is not topologically\n"
+        "               sorted, so its '.part' files for such graphs are indexed in that reordered space)\n"
+        "  -rp <list>  Comma-separated routing policies to evaluate placement quality metrics under (default: unicast,xy):\n"
+        "      - unicast: one independent minimum path per destination (pessimistic bound)\n"
+        "      - xy: dimension-order multicast tree, X first and then Y (realistic reference)\n"
+        "      - steiner: minimum Steiner tree multicast (optimistic bound, can take hours!)\n"
+        "      - none: disables all placement quality metrics\n"
         "  -h          Show this help\n";
+}
+
+// a "-rp" list fully overrides the defaults, hence every flag is cleared before parsing
+bool parseRoutingPolicies(const std::string& list, bool& unicast, bool& xy_multicast, bool& steiner_multicast) {
+    unicast = false;
+    xy_multicast = false;
+    steiner_multicast = false;
+
+    std::stringstream stream(list);
+    std::string policy;
+    bool any = false;
+    while (std::getline(stream, policy, ',')) {
+        if (policy.empty()) continue;
+        any = true;
+        if (policy == "unicast") unicast = true;
+        else if (policy == "xy") xy_multicast = true;
+        else if (policy == "steiner") steiner_multicast = true;
+        else if (policy == "none") { /* leave every flag cleared */ }
+        else return false;
+    }
+    return any;
 }
 
 HyperGraph loadHgraph(std::string load_path) {
@@ -180,8 +208,11 @@ int main(int argc, char** argv) {
     std::string plac_constraints_name;
     std::string topology_name = "lat2d";
     bool feedforward_order = false;
+    bool feedforward_partitioning = false;
+    bool force_partitioning = false;
     bool unicast_metrics = true;
-    bool multicast_metrics = true;
+    bool xy_multicast_metrics = true;
+    bool steiner_multicast_metrics = false; // opt-in: solving minimum Steiner trees can take hours
 
     // CLI handling
     for (int i = 1; i < argc; ++i) {
@@ -220,10 +251,16 @@ int main(int argc, char** argv) {
             plac_constraints_name = argv[++i];
         }  else if (arg == "-ff") {
             feedforward_order = true;
-        } else if (arg == "-noum") {
-            unicast_metrics = false;
-        } else if (arg == "-nomm") {
-            multicast_metrics = false;
+        } else if (arg == "-ff-prt") {
+            feedforward_partitioning = true;
+        } else if (arg == "-force-prt") {
+            force_partitioning = true;
+        } else if (arg == "-rp") {
+            if (i + 1 >= argc) { std::cerr << "Error: -rp requires a comma-separated list of routing policies\n"; std::exit(1); }
+            std::string policies = argv[++i];
+            if (!parseRoutingPolicies(policies, unicast_metrics, xy_multicast_metrics, steiner_multicast_metrics)) {
+                std::cerr << "Error: -rp requested an invalid routing policy name (valid ones: unicast, xy, steiner, none)\n"; std::exit(1);
+            }
         } else { std::cerr << "Unknown option: " << arg << "\n"; std::exit(1); }
     }
 
@@ -288,8 +325,24 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // the partitioning may be indexed in feedforward-order node space rather than the hypergraph's own
+        // => new_id[n] is where node n lands in that order, so its partition sits at partitions[new_id[n]]
+        if (feedforward_partitioning) {
+            hg.buildIncidenceSets();
+            const std::vector<uint32_t> new_id = hg.feedForwardOrder();
+            std::vector<uint32_t> reindexed(partitions.size());
+            for (uint32_t node = 0; node < hg.nodes(); ++node)
+                reindexed[node] = partitions[new_id[node]];
+            partitions = std::move(reindexed);
+        }
+
         // apply and grade partitioning
-        if (part_constr.checkPartitionValidity(hg, partitions, true)) {
+        // NOTE: -force-prt keeps going on a constraint breach, so that a placement can still be graded
+        // when only the partitioning constraints disagree with whoever produced the mapping
+        const bool part_valid = part_constr.checkPartitionValidity(hg, partitions, true);
+        if (part_valid || force_partitioning) {
+            if (!part_valid)
+                std::cerr << "WARNING, grading a partitioning that breaks a constraint (-force-prt) !!\n";
             // log metrics
             partitioned_hg.emplace(hg.getPartitionsHypergraph(partitions, 2, true)); // remove the destination if self-cycles happen
             auto hedge_overlap = part_constr.hedgeOverlap(hg, partitions);
@@ -367,14 +420,29 @@ int main(int argc, char** argv) {
                     std::cout << "    Weighted: " << std::fixed << std::setprecision(3) << uc_metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << uc_metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
                 }
 
-                if (multicast_metrics) {
-                    auto mc_metrics = plac_constr.getAllMulticastMetrics(placement_hg, placement);
-                    std::cout << "Placement multicast metrics:\n";
+                if (xy_multicast_metrics) {
+                    auto xy_metrics = plac_constr.getAllXYMulticastMetrics(placement_hg, placement);
+                    std::cout << "Placement XY-multicast metrics:\n";
+                    if (xy_metrics.energy.has_value()) std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << xy_metrics.energy.value() << "\n";
+                    else std::cout << "  Energy:          N/A (not implemented for this topology)\n";
+                    std::cout << "  Avg. latency:    " << std::fixed << std::setprecision(3) << xy_metrics.avg_latency.value() << "\n";
+                    if (xy_metrics.avg_congestion.has_value()) std::cout << "  Avg. congestion: " << std::fixed << std::setprecision(3) << xy_metrics.avg_congestion.value() << "\n";
+                    else std::cout << "  Avg. congestion: N/A (not implemented for this topology)\n";
+                    if (xy_metrics.max_congestion.has_value()) std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << xy_metrics.max_congestion.value() << "\n";
+                    else std::cout << "  Max. congestion: N/A (not implemented for this topology)\n";
+                }
+
+                if (steiner_multicast_metrics) {
+                    auto mc_metrics = plac_constr.getAllSteinerMulticastMetrics(placement_hg, placement);
+                    std::cout << "Placement Steiner-multicast metrics:\n";
                     if (mc_metrics.energy.has_value()) std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << mc_metrics.energy.value() << "\n";
                     else std::cout << "  Energy:          N/A (not implemented for this topology)\n";
                     std::cout << "  Avg. latency:    " << std::fixed << std::setprecision(3) << mc_metrics.avg_latency.value() << "\n";
+                    if (mc_metrics.avg_congestion.has_value()) std::cout << "  Avg. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.avg_congestion.value() << "\n";
+                    else std::cout << "  Avg. congestion: N/A (not implemented for this topology)\n";
                     if (mc_metrics.max_congestion.has_value()) std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.max_congestion.value() << "\n";
                     else std::cout << "  Max. congestion: N/A (not implemented for this topology)\n";
+                    std::cout << "  Evaluation fraction: " << std::fixed << std::setprecision(3) << mc_metrics.evaluation_fraction << "\n";
                 }
             } else {
                 std::cerr << "WARNING, invalid placement !!\n";

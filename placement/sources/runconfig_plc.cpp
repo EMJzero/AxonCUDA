@@ -52,8 +52,11 @@ namespace config_plc {
             "      - hilb, snak, zord, quad: lattice, torus\n"
             "      - flat: arbitrary\n"
             "  -ff         Replaces the 1D ordering heuristic with host-side sequential feedforward ordering\n"
-            "  -noum       Disables the evaluation and logging of unicast-based placement quality metrics\n"
-            "  -nomm       Disables the evaluation and logging of multicast-based placement quality metrics (which can be very slow)\n"
+            "  -rp <list>  Comma-separated routing policies to evaluate placement quality metrics under (default: unicast,xy):\n"
+            "      - unicast: one independent minimum path per destination (pessimistic bound)\n"
+            "      - xy: dimension-order multicast tree, X first and then Y (realistic reference)\n"
+            "      - steiner: minimum Steiner tree multicast (optimistic bound, can take hours!)\n"
+            "      - none: disables all placement quality metrics\n"
             "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
             "  -seed <num> Set the algorithm's seed to <num> (default: " << SEED << ") (ignored when '-ff' is passed)\n"
             "  -v <lvl>    Set the verbosity level: 0 results only, 1 steps and phases, 2 kernel launches, 3 algorithm outputs, 4 debug \n"
@@ -76,7 +79,8 @@ namespace config_plc {
         bool space_filling_curve_explicit = false;
         bool feedforward_order = false; // NB: runs sequentially on the HOST!
         bool unicast_metrics = true;
-        bool multicast_metrics = true;
+        bool xy_multicast_metrics = true;
+        bool steiner_multicast_metrics = false; // opt-in: solving minimum Steiner trees can take hours
         bool device_touching_construction = false;
         uint64_t seed = SEED;
         bool verbose_logs = VERBOSE_LOGS;
@@ -130,10 +134,12 @@ namespace config_plc {
                 space_filling_curve_explicit = true;
             } else if (arg == "-ff") {
                 feedforward_order = true;
-            } else if (arg == "-noum") {
-                unicast_metrics = false;
-            } else if (arg == "-nomm") {
-                multicast_metrics = false;
+            } else if (arg == "-rp") {
+                if (i + 1 >= argc) { std::cerr << "Error: -rp requires a comma-separated list of routing policies\n"; std::exit(1); }
+                std::string policies = argv[++i];
+                if (!parseRoutingPolicies(policies, unicast_metrics, xy_multicast_metrics, steiner_multicast_metrics)) {
+                    std::cerr << "Error: -rp requested an invalid routing policy name (valid ones: unicast, xy, steiner, none)\n"; std::exit(1);
+                }
             } else if (arg == "-dtc") {
                 device_touching_construction = true;
             } else if (arg == "-seed") {
@@ -181,7 +187,8 @@ namespace config_plc {
             space_filling_curve,
             feedforward_order,
             unicast_metrics,
-            multicast_metrics,
+            xy_multicast_metrics,
+            steiner_multicast_metrics,
             device_touching_construction,
             seed,
             verbose_logs,
@@ -325,6 +332,37 @@ namespace config_plc {
                 return name;
         }
         return "unknown";
+    }
+
+    // a "-rp" list fully overrides the defaults, hence every flag is cleared before parsing
+    bool parseRoutingPolicies(const std::string& list, bool& unicast, bool& xy_multicast, bool& steiner_multicast) {
+        unicast = false;
+        xy_multicast = false;
+        steiner_multicast = false;
+
+        std::stringstream stream(list);
+        std::string policy;
+        bool any = false;
+        while (std::getline(stream, policy, ',')) {
+            if (policy.empty()) continue;
+            any = true;
+            if (policy == "unicast") unicast = true;
+            else if (policy == "xy") xy_multicast = true;
+            else if (policy == "steiner") steiner_multicast = true;
+            else if (policy == "none") { /* leave every flag cleared */ }
+            else return false;
+        }
+        return any;
+    }
+
+    std::string routingPoliciesToString(bool unicast, bool xy_multicast, bool steiner_multicast) {
+        std::string result;
+        if (unicast) result += "unicast,";
+        if (xy_multicast) result += "xy,";
+        if (steiner_multicast) result += "steiner,";
+        if (result.empty()) return "none";
+        result.pop_back(); // drop the trailing comma
+        return result;
     }
 
     bool parseSFC(const std::string& name, SpaceFillingCurve& curve) {

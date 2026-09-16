@@ -88,7 +88,8 @@ int main(int argc, char** argv) {
         else std::cout << cfg.num_host_threads << "\n";
         std::cout << "  Label propagation repeats:       " << cfg.labelprop_repeats << "\n";
         std::cout << "  Space-filling curve:             " << SFCtoString(cfg.space_filling_curve) << "\n";
-        std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc " : "") << (cfg.feedforward_order ? "ff " : "") << (!cfg.unicast_metrics ? "noum " : "") << (!cfg.multicast_metrics ? "nomm " : "") << "\n";
+        std::cout << "  Routing policies:                " << routingPoliciesToString(cfg.unicast_metrics, cfg.xy_multicast_metrics, cfg.steiner_multicast_metrics) << "\n";
+        std::cout << "  Flags: " << (cfg.device_touching_construction ? "dtc " : "") << (cfg.feedforward_order ? "ff " : "") << "\n";
 
         if (hg.nodes() > hw.coresCount()) {
             ERR(cfg) std::cerr << "ERROR, the hypergraph has more nodes (" << hg.nodes() << ") than the 2D lattice has points (" << hw.coresCount() << "), placement would fail !!\n";
@@ -568,13 +569,28 @@ int main(int argc, char** argv) {
                 std::cout << "    Weighted: " << std::fixed << std::setprecision(3) << uc_metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << uc_metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
             }
 
-            if (cfg.multicast_metrics) {
-                DBG(cfg) std::cout << "Computing placement multicast metrics...\n";
-                auto mc_metrics = hw.getAllMulticastMetrics(hg, h_placement);
-                std::cout << "Placement multicast metrics:\n";
+            if (cfg.xy_multicast_metrics) {
+                DBG(cfg) std::cout << "Computing placement XY-multicast metrics...\n";
+                auto xy_metrics = hw.getAllXYMulticastMetrics(hg, h_placement);
+                std::cout << "Placement XY-multicast metrics:\n";
+                if (xy_metrics.energy.has_value()) std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << xy_metrics.energy.value() << "\n";
+                else std::cout << "  Energy:          N/A (not implemented for this topology)\n";
+                std::cout << "  Avg. latency:    " << std::fixed << std::setprecision(3) << xy_metrics.avg_latency.value() << "\n";
+                if (xy_metrics.avg_congestion.has_value()) std::cout << "  Avg. congestion: " << std::fixed << std::setprecision(3) << xy_metrics.avg_congestion.value() << "\n";
+                else std::cout << "  Avg. congestion: N/A (not implemented for this topology)\n";
+                if (xy_metrics.max_congestion.has_value()) std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << xy_metrics.max_congestion.value() << "\n";
+                else std::cout << "  Max. congestion: N/A (not implemented for this topology)\n";
+            }
+
+            if (cfg.steiner_multicast_metrics) {
+                DBG(cfg) std::cout << "Computing placement Steiner-multicast metrics...\n";
+                auto mc_metrics = hw.getAllSteinerMulticastMetrics(hg, h_placement);
+                std::cout << "Placement Steiner-multicast metrics:\n";
                 if (mc_metrics.energy.has_value()) std::cout << "  Energy:          " << std::fixed << std::setprecision(3) << mc_metrics.energy.value() << "\n";
                 else std::cout << "  Energy:          N/A (not implemented for this topology)\n";
                 std::cout << "  Avg. latency:    " << std::fixed << std::setprecision(3) << mc_metrics.avg_latency.value() << "\n";
+                if (mc_metrics.avg_congestion.has_value()) std::cout << "  Avg. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.avg_congestion.value() << "\n";
+                else std::cout << "  Avg. congestion: N/A (not implemented for this topology)\n";
                 if (mc_metrics.max_congestion.has_value()) std::cout << "  Max. congestion: " << std::fixed << std::setprecision(3) << mc_metrics.max_congestion.value() << "\n";
                 else std::cout << "  Max. congestion: N/A (not implemented for this topology)\n";
                 std::cout << "  Evaluation fraction: " << std::fixed << std::setprecision(3) << mc_metrics.evaluation_fraction << "\n";

@@ -70,8 +70,8 @@ To prepare the input hypergraphs, go under [`hgraphs`](./hgraphs) and run:
 Let the input hypergraph be $G = (N, E, \eta)$, with $N$ nodes, $E$ edges, $src(e)$ and $dst(e)$ denoting the sources and destinations within each $e \in E$, and $\eta : E \rightarrow \mathbb{R}$ being the weight of each hyperedge.
 Let the target lattice be $H = \{(h_x, h_y) \in \mathbb{N}^2 : 0 \leq h_x < width, 0 \leq h_y < height\}$ and $\gamma : N \rightarrow H$ be the placement function assigning nodes to lattice points.
 
-The costs we consider here are presented through two communication models between lattice nodes (aka "compute nodes").
-> Refer to options `-noum` and `-nomm` to disable metrics evaluation for the unicast and multicast models respectively. The multicast model in particular requires solving several minimum Steiner trees and could require several hours to complete.
+The costs we consider here are presented through three communication models between lattice nodes (aka "compute nodes"), differing by the routing policy they assume.
+> Refer to option `-rp <list>` to select which routing policies to evaluate, among `unicast`, `xy`, `steiner` and `none` (default: `unicast,xy`). The Steiner model is opt-in as it requires solving several minimum Steiner trees and could require several hours to complete.
 
 In both cases, $E_R$, $E_T$, $L_R$, $L_T$ represent the energy and latency, respectively, for routing and transmitting information (e.g. spikes) between lattice points when these model a distributed system.
 
@@ -83,21 +83,20 @@ This can be interpreted as an **upper bound** on the traffic volume and congesti
 ```math
 \begin{align*}
     &\text{Energy} = \sum_{e \in E} \: \sum_{s \in src(e)} \sum_{d \in dst(e)} \eta(e) \cdot \left( dist(\gamma(s), \gamma(d)) \cdot (E_R + E_T) + E_R \right) \\
-    &\text{Avg. Latency} = \frac{1}{\sum_{e \in E} \eta(e) \cdot |src(e)| \cdot |dst(e)|} \cdot \sum_{e \in E} \: \sum_{s \in src(e)} \: \sum_{d \in dst(e)} \eta(e) \cdot \left( dist(\gamma(s), \gamma(d)) \cdot (L_R + L_T) + L_R \right) \\
+    &\text{Avg. Latency} = \frac{1}{\sum_{e \in E} \eta(e) \cdot |src(e)|} \cdot \sum_{e \in E} \: \sum_{s \in src(e)} \eta(e) \cdot \left( \max_{d \in dst(e)} dist(\gamma(s), \gamma(d)) \cdot (L_R + L_T) + L_R \right) \\
     &\text{Max. Latency} = \max_{e \in E} \: \max_{s \in src(e)} \: \max_{d \in dst(e)} \left( dist(\gamma(s), \gamma(d)) \cdot (L_R + L_T) + L_R \right) \\
     &\text{Avg. congestion} = \frac{1}{|H|} \sum_{e \in E} \: \sum_{s \in src(e)} \: \sum_{d \in dst(e)} \: \eta(e) \sum_{h \in Rect(\gamma(s), \gamma(d))} \tau(h, \gamma(s), \gamma(d)) \\
     &\text{Max. congestion} = \max_{h \in H} \sum_{e \in E} \: \sum_{s \in src(e)} \: \sum_{d \in dst(e)} \eta(e) \cdot \tau(h, \gamma(s), \gamma(d))
 \end{align*}
 ```
 
-Meanwhile, $\tau(h, h_s, h_d)$ is the probability of a spike being routed through core $h$ when going from core $h_s$ to $h_d$ (see [this function](./sources/nmhardware.cpp#L322) for details), $Rect(h_1, h_2)$ is the set of lattice points contained in the closed coordinate rectangle defined by the opposite corners $h_1$ and $h_2$, and $dist(\cdot, \cdot)$ indicates the Manhattan distance on the lattice.
+Latency is a delivery *completion* time, hence it takes the maximum over an hyperedge's destinations rather than their average; being defined over shortest paths, it is identical under all three routing policies.
+Meanwhile, $\tau(h, h_s, h_d)$ is the probability of a spike being routed through core $h$ when going from core $h_s$ to $h_d$ (see [this function](./sources/nmhardware.cpp#L271) for details), $Rect(h_1, h_2)$ is the set of lattice points contained in the closed coordinate rectangle defined by the opposite corners $h_1$ and $h_2$, and $dist(\cdot, \cdot)$ indicates the Manhattan distance on the lattice.
 
 ### Multicast Model Metrics
 
-In the ideal multicast model, every source is assumed to emit a single copy of any message, with it prograssively being multicasted, forking along the way to reach all destinations.
-In particular, we assume an ideal multicast fanout tree that thus follows any minimum-span Steiner tree connecting all hyperedge terminals.
-This provides us with an optimistic **lower bound** on the volume of traffic and congestion.
-It follows that this is better than what an actual multicast implementation typically achieves, but any improvement on this lower bound leaves less actually irreducible traffic for any real system to deal with.
+In the multicast models, every source is assumed to emit a single copy of any message, with it prograssively being multicasted, forking along the way to reach all destinations.
+The two models below share the local and global cost definitions that follow, and differ only in how $hops$ and $p\text{-}transit$ are resolved, i.e. in their routing policy.
 
 Local costs on every hyperedge $e \in E$ or core $h \in H$ are threefold:
 ```math
@@ -118,7 +117,33 @@ By aggregating these local costs, we define a global communication performance m
 \end{align*}
 ```
 
-The definition of $hops$ and $p\text{-}transit$ depends on routing policies, and are thereby subject to the optimal multicast Steiner tree model, formally:
+#### XY-Multicast Routing Policy
+
+Under XY-multicast, each spike is routed in dimension order, resolving X first and then Y, and the multicast tree emerges as the union of these deterministic routes from the source towards every destination.
+Shared route segments carry a single spike, and the router replicates it over the corresponding output links wherever the union branches.
+Being a concrete, commonly implemented policy, this is our realistic **reference** model.
+```math
+\begin{align*}
+    & T_{XY}(s, D) = \textstyle\bigcup_{d \in D} path_{XY}(s, d) \\
+    & hops(s, D) = |T_{XY}(s, D)| - 1 \\
+    & p\text{-}transit(h, s, D) = \mathbb{1}[h \in T_{XY}(s, D)]
+\end{align*}
+```
+Where $path_{XY}(s, d) \subseteq H$ denotes the set of cores on the unique dimension-order path from $s$ to $d$.
+Since every core in the union has a unique predecessor — its row neighbor towards the source on the source's row, its column neighbor towards the source's row elsewhere — $T_{XY}(s, D)$ is a tree rooted in $s$, hence it spans exactly $|T_{XY}(s, D)| - 1$ links.
+Routing being deterministic, transit is an indicator rather than a probability.
+
+Equivalently, and as actually evaluated in $O(|D|)$ time, the tree decomposes into an X spine along the source's row plus one Y branch per destination column:
+```math
+hops(s, D) = \left( \max(s_x, \max_{d \in D} d_x) - \min(s_x, \min_{d \in D} d_x) \right) + \sum_{x \in \{d_x \,:\, d \in D\}} \left( \max(s_y, \max_{d \in D \,:\, d_x = x} d_y) - \min(s_y, \min_{d \in D \,:\, d_x = x} d_y) \right)
+```
+
+#### Steiner-Multicast Routing Policy
+
+Under Steiner-multicast, we assume an ideal multicast fanout tree that follows any minimum-span Steiner tree connecting all hyperedge terminals.
+This provides us with an optimistic **lower bound** on the volume of traffic and congestion.
+It follows that this is better than what an actual multicast implementation typically achieves, but any improvement on this lower bound leaves less actually irreducible traffic for any real system to deal with.
+Formally:
 ```math
 \begin{align*}
     & T_H(hs) = \{ t \subseteq H : hs \subseteq t \text{ and } t \text{ spans a tree in } H \} \\

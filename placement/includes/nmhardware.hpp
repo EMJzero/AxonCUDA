@@ -41,13 +41,22 @@ namespace hwmodel {
         std::optional<ConnectionsLocalityMetrics> connections_locality;
     };
 
-    struct MulticastPlacementMetrics {
+    struct SteinerMulticastPlacementMetrics {
         bool valid{false};
         std::optional<double> energy;
         std::optional<double> avg_latency;
+        std::optional<double> avg_congestion;
         std::optional<double> max_congestion;
         // fraction of sourced-hyperedge weight for which every source's Steiner tree was solved
         float evaluation_fraction{0.0f};
+    };
+
+    struct XYMulticastPlacementMetrics {
+        bool valid{false};
+        std::optional<double> energy;
+        std::optional<double> avg_latency;
+        std::optional<double> avg_congestion;
+        std::optional<double> max_congestion;
     };
     
     struct HardwareModelConfig {
@@ -143,6 +152,20 @@ namespace hwmodel {
         std::unordered_map<Coord, double> expectedSpikeTransitProbability(
             const Coord& src, const Coord& dst) const;
 
+        // Feeds `sink(coord, weight * p)` for every coordinate a minimum src->dst path can traverse,
+        // p being the probability that a uniformly chosen minimum path goes through it.
+        // On a lattice every minimum path is monotone, so p has a closed form (a ratio of multinomials)
+        // and only the src-dst bounding box needs visiting. Other topologies enumerate paths explicitly,
+        // which is exponential in the distance and only viable on small instances.
+        template<typename Sink>
+        void accumulateMinimumPathTransit(const Coord& src, const Coord& dst, double weight, Sink&& sink) const;
+
+        // ------------------------------------------------------------------
+        // UNICAST ROUTING POLICY
+        // => each destination receives its own spike over an independent minimum path
+        // => a pessimistic upper bound on multicast cost
+        // ------------------------------------------------------------------
+
         double placementEnergyConsumption(
             const HyperGraph& part_hgraph,
             const std::vector<Coord>& placement) const;
@@ -168,23 +191,63 @@ namespace hwmodel {
             const HyperGraph& part_hgraph,
             const std::vector<Coord>& placement) const;
 
-        double multicastEnergyConsumption(
+        // ------------------------------------------------------------------
+        // STEINER-MULTICAST ROUTING POLICY
+        // => each spike follows a minimum Steiner tree spanning its terminals
+        // => an ideal, router-agnostic lower bound on multicast cost
+        // ------------------------------------------------------------------
+
+        double steinerMulticastEnergyConsumption(
             const HyperGraph& part_hgraph,
             const std::vector<Coord>& placement) const;
 
-        double multicastAverageLatency(
+        double steinerMulticastAverageLatency(
             const HyperGraph& part_hgraph,
             const std::vector<Coord>& placement) const;
 
-        std::vector<double> multicastCongestion(
+        std::vector<double> steinerMulticastCongestion(
             const HyperGraph& part_hgraph,
             const std::vector<Coord>& placement) const;
 
-        double multicastMaximumCongestion(
+        double steinerMulticastAverageCongestion(
             const HyperGraph& part_hgraph,
             const std::vector<Coord>& placement) const;
 
-        MulticastPlacementMetrics getAllMulticastMetrics(
+        double steinerMulticastMaximumCongestion(
+            const HyperGraph& part_hgraph,
+            const std::vector<Coord>& placement) const;
+
+        SteinerMulticastPlacementMetrics getAllSteinerMulticastMetrics(
+            const HyperGraph& part_hgraph,
+            const std::vector<Coord>& placement) const;
+
+        // ------------------------------------------------------------------
+        // XY-MULTICAST ROUTING POLICY
+        // => each spike is routed in dimension order, X first and then Y
+        // => the multicast tree is the union of the XY routes towards every destination
+        // ------------------------------------------------------------------
+
+        double xyMulticastEnergyConsumption(
+            const HyperGraph& part_hgraph,
+            const std::vector<Coord>& placement) const;
+
+        double xyMulticastAverageLatency(
+            const HyperGraph& part_hgraph,
+            const std::vector<Coord>& placement) const;
+
+        std::vector<double> xyMulticastCongestion(
+            const HyperGraph& part_hgraph,
+            const std::vector<Coord>& placement) const;
+
+        double xyMulticastAverageCongestion(
+            const HyperGraph& part_hgraph,
+            const std::vector<Coord>& placement) const;
+
+        double xyMulticastMaximumCongestion(
+            const HyperGraph& part_hgraph,
+            const std::vector<Coord>& placement) const;
+
+        XYMulticastPlacementMetrics getAllXYMulticastMetrics(
             const HyperGraph& part_hgraph,
             const std::vector<Coord>& placement) const;
 
