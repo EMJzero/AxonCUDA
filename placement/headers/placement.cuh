@@ -49,6 +49,8 @@ void forceDirectedRefinement(
     const dim_t* d_touching_offsets,
     const float* d_hedge_weights,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint32_t volume,
     Coord_t<T>* d_placement,
     uint32_t* d_inv_placement,
     const cudaStream_t stream,
@@ -56,7 +58,7 @@ void forceDirectedRefinement(
 );
 
 template<Topology T>
-std::tuple<float, float> getLocalityMetrics(
+void getLocalityMetrics(
     const runconfig &cfg,
     const Coord_t<T>* d_placement,
     const uint32_t* d_hedges,
@@ -64,6 +66,10 @@ std::tuple<float, float> getLocalityMetrics(
     const uint32_t* d_srcs_count,
     const float* d_hedge_weights,
     const uint32_t num_hedges,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
+    float* d_src_dst_distance, // src_dst_distance[start] -> weighted avg. hedge max src-dst manhattan distance of that multi-start
+    float* d_steiner_span, // steiner_span[start] -> weighted avg. hedge Steiner tree span of that multi-start
     const cudaStream_t stream,
     const int tid
 );
@@ -89,7 +95,6 @@ void logTensions(
 template<Topology T>
 void logSwapPairs(
     const slot *d_swap_slots,
-    const uint32_t *d_swap_flags,
     const uint32_t num_nodes,
     const cudaStream_t stream,
     const int tid
@@ -107,11 +112,18 @@ void logEvents(
 
 // KERNELS
 
+// NOTE: every kernel below runs a whole batch of multi-starts at once
+// => per-multi-start arrays are one flat allocation of "batch_size" equally-sized segments, multi-start "b" owning [b*size, (b+1)*size)
+// => node idxs stored in "pairs", "swap_slots", "ev_swaps" and "inv_placement" are batch-flat, hypergraph pin idxs are not
+// => "active[b]" retires a converged multi-start, and is always tested warp-uniformly
+
 template<Topology T>
 __global__
 void inverse_placement_kernel(
     const Coord_t<T>* __restrict__ placement,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint32_t volume,
     uint32_t* __restrict__ inv_placement
 );
 
@@ -125,6 +137,8 @@ void forces_kernel(
     const float* __restrict__ hedge_weights,
     const Coord_t<T>* __restrict__ placement,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     float* __restrict__ forces
 );
 
@@ -135,6 +149,9 @@ void tensions_kernel(
     const uint32_t* __restrict__ inv_placement,
     const float* __restrict__ forces,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint32_t volume,
+    const uint8_t* __restrict__ active,
     const uint32_t candidates_count,
     uint32_t* __restrict__ pairs,
     uint32_t* __restrict__ scores
@@ -146,17 +163,19 @@ void exclusive_swaps_kernel(
     const uint32_t* __restrict__ pairs,
     const uint32_t* __restrict__ scores,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     const uint32_t candidates_count,
-    slot* __restrict__ swap_slots,
-    uint32_t* __restrict__ swap_flags
+    slot* __restrict__ swap_slots
 );
 
 template<Topology T>
 __global__
 void swap_events_kernel(
     const slot* __restrict__ swap_slots,
-    const uint32_t* __restrict__ swap_flags,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     swap* __restrict__ ev_swaps,
     float* __restrict__ ev_scores
 );
@@ -165,7 +184,9 @@ template<Topology T>
 __global__
 void scatter_ranks_kernel(
     const swap* __restrict__ ev_swaps,
-    const uint32_t num_events,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     uint32_t* __restrict__ nodes_rank
 );
 
@@ -175,7 +196,10 @@ void resolve_empty_conflicts_kernel(
     const Coord_t<T>* __restrict__ placement,
     const uint32_t* __restrict__ inv_placement,
     const uint32_t* __restrict__ nodes_rank,
-    const uint32_t num_events,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint32_t volume,
+    const uint8_t* __restrict__ active,
     swap* __restrict__ ev_swaps
 );
 
@@ -190,15 +214,29 @@ void cascade_kernel(
     const Coord_t<T>* __restrict__ placement,
     const swap* __restrict__ ev_swaps,
     const uint32_t* __restrict__ nodes_rank,
-    const uint32_t num_events,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     float* __restrict__ scores
+);
+
+__global__
+void prefix_gain_kernel(
+    const float* __restrict__ ev_scores,
+    const uint32_t num_nodes,
+    uint32_t* __restrict__ num_good_swaps,
+    uint8_t* __restrict__ active
 );
 
 template<Topology T>
 __global__
 void apply_swaps_kernel(
     const swap* __restrict__ ev_swaps,
-    const uint32_t num_good_swaps,
+    const uint32_t* __restrict__ num_good_swaps,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint32_t volume,
+    const uint8_t* __restrict__ active,
     Coord_t<T>* __restrict__ placement,
     uint32_t* __restrict__ inv_placement
 );
@@ -224,6 +262,8 @@ void tot_src_dst_distance_kernel(
     const uint32_t* __restrict__ srcs_count,
     const float* __restrict__ hedge_weights,
     const uint32_t num_hedges,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
     float* __restrict__ result
 );
 
@@ -235,5 +275,7 @@ void min_spanning_tree_weight_kernel(
     const dim_t* __restrict__ hedges_offsets,
     const float* __restrict__ hedge_weights,
     const uint32_t num_hedges,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
     float* __restrict__ result
 );

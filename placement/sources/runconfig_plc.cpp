@@ -39,7 +39,7 @@ namespace config_plc {
             "  -fdi <num>  Set the number of force-directed refinement iterations\n"
             "  -cnc <num>  Set the count of candidate swaps proposed per node during force-directed refinement\n"
             "  -mso <num>  Overrides the number of multi-start attempts (default is chosen to maximally occupy the GPU)\n"
-            "  -thr <num>  Overrides the number of threads and streams to spawn (default equals multi-start attempts)\n"
+            "  -bs <num>   Overrides how many multi-start attempts are refined together in one batch (default equals multi-start attempts)\n"
             "  -t <name>   Set the topology of the target graph where to place hypergraph nodes, valid names are:\n"
             "      - lat2d: 2D lattice (default)    - tor6d: 6D torus\n"
             "      - hcube: N-D hypercube           - hx3d: 3D HyperX\n"
@@ -73,7 +73,7 @@ namespace config_plc {
         uint32_t fd_iterations = FD_ITERATIONS;
         uint32_t candidates_count = CANDIDATE_MOVES;
         uint32_t multi_start_override = MULTISTART_ATTEMPTS;
-        uint32_t num_host_threads = NUM_HOST_THREADS;
+        uint32_t batch_size = MULTISTART_BATCH_SIZE;
         TargetTopology topology = TargetTopology::LATTICE2D;
         SpaceFillingCurve space_filling_curve = SpaceFillingCurve::HILB;
         bool space_filling_curve_explicit = false;
@@ -115,10 +115,10 @@ namespace config_plc {
                 if (i + 1 >= argc) { std::cerr << "Error: -mso requires a positive integer value\n"; std::exit(1); }
                 multi_start_override = std::stoul(argv[++i]);
                 if (multi_start_override == 0) { std::cerr << "Error: -mso must greater than zero\n"; std::exit(1); }
-            } else if (arg == "-thr") {
-                if (i + 1 >= argc) { std::cerr << "Error: -thr requires a positive integer value\n"; std::exit(1); }
-                num_host_threads = std::stoul(argv[++i]);
-                if (num_host_threads == 0) { std::cerr << "Error: -thr must greater than zero\n"; std::exit(1); }
+            } else if (arg == "-bs") {
+                if (i + 1 >= argc) { std::cerr << "Error: -bs requires a positive integer value\n"; std::exit(1); }
+                batch_size = std::stoul(argv[++i]);
+                if (batch_size == 0) { std::cerr << "Error: -bs must greater than zero\n"; std::exit(1); }
             } else if (arg == "-cnc") {
                 if (i + 1 >= argc) { std::cerr << "Error: -cnc requires a positive integer value\n"; std::exit(1); }
                 candidates_count = std::stoul(argv[++i]);
@@ -182,7 +182,7 @@ namespace config_plc {
             fd_iterations,
             candidates_count,
             multi_start_override,
-            num_host_threads,
+            batch_size,
             topology,
             space_filling_curve,
             feedforward_order,

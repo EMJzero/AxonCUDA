@@ -17,8 +17,8 @@ SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
 DATA_DIR="$(cd -P "$SCRIPT_DIR/part_snns" && pwd)"
 TARGET_BIN="$(cd -P "$SCRIPT_DIR/.." && pwd)/hplace_gpu.exe"
-TARGET_ARGS=(-lpr 16 -fdi 256 -dtc -v 0 -mso 64 -thr 1 -sfc hilb) # can be later overriden per-run
-RESULTS_DIR="$DATA_DIR/results_lpr16_fdi256_mso64"
+TARGET_ARGS=(-lpr 16 -fdi 1024 -dtc -v 0 -mso 2 -bs 2 -sfc hilb) # can be later overriden per-run
+RESULTS_DIR="$DATA_DIR/results_lpr16_fdi1024_mso2"
 
 PROFILING=0
 NSIGHT=0
@@ -185,7 +185,7 @@ run_case_checked "8k"          "8k_model_part" -c loihi
 run_case_checked "64k"         "64k_model_part"
 run_case_checked "256k"        "256k_model_part" -c loihi84
 run_case_checked "1M"          "1M_model_part" -c loihi84
-run_case_checked "16M"         "16M_model_part" -c loihi1024
+#run_case_checked "16M"         "16M_model_part" -c loihi1024
 
 # -------------------------
 # Classic ANNs

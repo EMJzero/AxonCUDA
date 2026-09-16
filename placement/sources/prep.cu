@@ -1,5 +1,7 @@
 #include <tuple>
 
+#include <cub/cub.cuh>
+
 #include "thruster.cuh"
 
 #include "hgraph.hpp"
@@ -111,6 +113,31 @@ std::tuple<uint32_t*, dim_t*> buildTouching(
         DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
     }
     CUDA_CHECK(cudaFree(d_inserted_count));
+
+    // each node's hedges were claimed by racing atomics, so sort every set to pin down its order
+    // => that order decides which lane of a warp visits which pin later on, and with it the summation order of every touching-based float reduction
+    uint32_t *d_touching_buffer = nullptr; // CUB segmented sort buffer
+    CUDA_CHECK(cudaMalloc(&d_touching_buffer, touching_size * sizeof(uint32_t)));
+    cub::DoubleBuffer<uint32_t> c_touching_double_buffer(d_touching, d_touching_buffer);
+    void* c_touching_storage = nullptr;
+    size_t c_touching_storage_bytes = 0;
+    cub::DeviceSegmentedSort::SortKeys(
+        c_touching_storage, c_touching_storage_bytes, c_touching_double_buffer,
+        touching_size, num_nodes, d_touching_offsets, d_touching_offsets + 1
+    );
+    CUDA_CHECK(cudaMalloc(&c_touching_storage, c_touching_storage_bytes));
+    cub::DeviceSegmentedSort::SortKeys(
+        c_touching_storage, c_touching_storage_bytes, c_touching_double_buffer,
+        touching_size, num_nodes, d_touching_offsets, d_touching_offsets + 1
+    );
+    DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
+    if (c_touching_double_buffer.Current() != d_touching) {
+        uint32_t* tmp = d_touching_buffer;
+        d_touching_buffer = d_touching;
+        d_touching = tmp;
+    }
+    CUDA_CHECK(cudaFree(d_touching_buffer));
+    CUDA_CHECK(cudaFree(c_touching_storage));
 
     return std::make_tuple(d_touching, d_touching_offsets);
 }

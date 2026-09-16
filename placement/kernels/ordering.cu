@@ -9,11 +9,13 @@ __global__
 void split_partitions_kernel(
     const uint32_t* __restrict__ part_offsets,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
     uint32_t* __restrict__ partitions // output in sorted order
 ) {
     // STYLE: one node per thread!
+    // NOTE: partitions are composite, so the sort already grouped every multi-start's nodes apart - nothing else to decode here
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
+    if (tid >= batch_size * num_nodes) return;
 
     uint32_t part = partitions[tid];
     uint32_t part_start = part_offsets[part];
@@ -39,29 +41,37 @@ void flag_cutnet_events_kernel(
     const uint32_t* __restrict__ part_pins,
     const dim_t* __restrict__ hedges_offsets,
     const uint32_t num_hedges,
-    dim_t* __restrict__ flags
+    const uint32_t batch_size,
+    const dim_t hedges_size,
+    uint32_t* __restrict__ flags
 ) {
     // STYLE: one hedge per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
+    // global across blocks - coincides with the batch-flat hedge to handle
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_hedges) return;
+    if (warp_id >= batch_size * num_hedges) return;
 
-    const dim_t my_hedge_offset = hedges_offsets[warp_id];
-    const dim_t not_my_hedge_offset = hedges_offsets[warp_id + 1];
+    // the hypergraph is shared by every multi-start, only the partitioning its pins are mapped through differs
+    const uint32_t my_start = warp_id / num_hedges;
+    const uint32_t my_hedge = warp_id - my_start * num_hedges;
+    const uint32_t* my_part_pins = part_pins + my_start * hedges_size;
+    uint32_t* my_flags = flags + my_start * hedges_size;
+
+    const dim_t my_hedge_offset = hedges_offsets[my_hedge];
+    const dim_t not_my_hedge_offset = hedges_offsets[my_hedge + 1];
     if (not_my_hedge_offset <= my_hedge_offset + 1u) return; // empty hedge or singleton hedge cannot generate a cut event
     dim_t my_offset = my_hedge_offset + lane_id;
 
     // each thread in the warp reads one every WARP_SIZE pins
     for (; my_offset < not_my_hedge_offset; my_offset += WARP_SIZE) {
-        const uint32_t part_pin = part_pins[my_offset];
+        const uint32_t part_pin = my_part_pins[my_offset];
         if ((part_pin & 1u) == 1) continue; // odd partition
-        if (my_offset > my_hedge_offset && part_pins[my_offset - 1] == part_pin) continue; // not the start of the run
+        if (my_offset > my_hedge_offset && my_part_pins[my_offset - 1] == part_pin) continue; // not the start of the run
 
         dim_t run_end = my_offset + 1u;
-        while (run_end < not_my_hedge_offset && part_pins[run_end] == part_pin) run_end++;
-        if (run_end >= not_my_hedge_offset || part_pins[run_end] != part_pin + 1u) continue; // sibling partition absent
-        flags[my_offset] = 1u;
+        while (run_end < not_my_hedge_offset && my_part_pins[run_end] == part_pin) run_end++;
+        if (run_end >= not_my_hedge_offset || my_part_pins[run_end] != part_pin + 1u) continue; // sibling partition absent
+        my_flags[my_offset] = 1u;
     }
 }
 
@@ -74,37 +84,45 @@ void cutnet_event_generation_kernel(
     const uint32_t* __restrict__ part_pins,
     const dim_t* __restrict__ hedges_offsets,
     const float* __restrict__ hedge_weights,
-    const dim_t* __restrict__ flags,
+    const uint32_t* __restrict__ flags,
     const uint32_t num_hedges,
+    const uint32_t batch_size,
+    const dim_t hedges_size,
     float* __restrict__ event_weight,
     uint32_t* __restrict__ event_part
 ) {
     // STYLE: one hedge per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
+    // global across blocks - coincides with the batch-flat hedge to handle
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_hedges) return;
+    if (warp_id >= batch_size * num_hedges) return;
 
-    const dim_t my_hedge_offset = hedges_offsets[warp_id];
-    const dim_t not_my_hedge_offset = hedges_offsets[warp_id + 1];
+    // the hypergraph is shared by every multi-start, only the partitioning its pins are mapped through differs
+    const uint32_t my_start = warp_id / num_hedges;
+    const uint32_t my_hedge = warp_id - my_start * num_hedges;
+    const uint32_t* my_part_pins = part_pins + my_start * hedges_size;
+    const uint32_t* my_flags = flags + my_start * hedges_size;
+
+    const dim_t my_hedge_offset = hedges_offsets[my_hedge];
+    const dim_t not_my_hedge_offset = hedges_offsets[my_hedge + 1];
     if (not_my_hedge_offset <= my_hedge_offset + 1u) return; // empty hedge or singleton hedge cannot generate a cut event
     dim_t my_offset = my_hedge_offset + lane_id;
-    const float my_weight = hedge_weights[warp_id];
+    const float my_weight = hedge_weights[my_hedge];
 
     // each thread in the warp reads one every WARP_SIZE pins
     for (; my_offset < not_my_hedge_offset; my_offset += WARP_SIZE) {
-        const uint32_t part_pin = part_pins[my_offset];
+        const uint32_t part_pin = my_part_pins[my_offset];
         if ((part_pin & 1u) == 1) continue; // odd partition
-        if (my_offset > my_hedge_offset && part_pins[my_offset - 1] == part_pin) continue; // not the start of the run
+        if (my_offset > my_hedge_offset && my_part_pins[my_offset - 1] == part_pin) continue; // not the start of the run
 
         dim_t even_run_end = my_offset + 1u;
-        while (even_run_end < not_my_hedge_offset && part_pins[even_run_end] == part_pin) even_run_end++;
-        if (even_run_end >= not_my_hedge_offset || part_pins[even_run_end] != part_pin + 1u) continue; // sibling partition absent
+        while (even_run_end < not_my_hedge_offset && my_part_pins[even_run_end] == part_pin) even_run_end++;
+        if (even_run_end >= not_my_hedge_offset || my_part_pins[even_run_end] != part_pin + 1u) continue; // sibling partition absent
 
         dim_t odd_run_end = even_run_end + 1u;
-        while (odd_run_end < not_my_hedge_offset && part_pins[odd_run_end] == part_pin + 1u) odd_run_end++;
+        while (odd_run_end < not_my_hedge_offset && my_part_pins[odd_run_end] == part_pin + 1u) odd_run_end++;
 
-        const dim_t event_offset = flags[my_offset];
+        const uint32_t event_offset = my_flags[my_offset];
         const dim_t even_count = even_run_end - my_offset;
         const dim_t odd_count = odd_run_end - even_run_end;
         event_weight[event_offset] = my_weight * static_cast<float>(min(even_count, odd_count));
@@ -143,6 +161,7 @@ float warpTouchingSiblingGain(
     const float* __restrict__ hedge_weights,
     const uint32_t* __restrict__ my_touching,
     const uint32_t touching_count,
+    const uint32_t nodes_base, // offset of the multi-start owning these pins, 0 outside of batched kernels
     const uint32_t lane_id,
     uint32_t* __restrict__ sm_hedge_idx,
     uint32_t* __restrict__ sm_hedge_cum,
@@ -180,7 +199,7 @@ float warpTouchingSiblingGain(
                 if (sm_hedge_cum[mid] <= flat_pos) lo = mid; else hi = mid - 1u;
             }
             const uint32_t pin = hedges[hedges_offsets[sm_hedge_idx[lo]] + (flat_pos - sm_hedge_cum[lo])];
-            const uint32_t side = classify(pin);
+            const uint32_t side = classify(nodes_base + pin); // pins are node idxs local to a multi-start, rebase them
             if (side == 0u) atomicAdd(&sm_my_part_pins[lo], 1u);
             else if (side == 1u) atomicAdd(&sm_other_part_pins[lo], 1u);
         }
@@ -209,16 +228,22 @@ void label_propagation_kernel(
     const float* __restrict__ hedge_weights,
     const uint32_t* __restrict__ partitions, // partitions[idx] -> the partition node idx is part of
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     bool* __restrict__ moves, // moves[idx] -> true if the node would like to move to the other side of the bisection
-    uint32_t* __restrict__ even_event_idx, // event_idx[idx] -> 1u if the node would like to move and is in an even partition
-    uint32_t* __restrict__ odd_event_idx, // event_idx[idx] -> ... odd partition
     float* __restrict__ scores // scores[idx] -> gain for node idx's move
 ) {
     // STYLE: one node per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
+    // global across blocks - coincides with the batch-flat node to handle
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_nodes) return;
+    if (warp_id >= batch_size * num_nodes) return;
+
+    // NOTE: both early returns above and below are warp-uniform, the warp-collectives further down require it
+    const uint32_t my_start = warp_id / num_nodes; // multi-start owning this node
+    if (!active[my_start]) return; // this multi-start already converged
+    const uint32_t nodes_base = my_start * num_nodes;
+    const uint32_t my_node = warp_id - nodes_base; // node idx local to its own multi-start
 
     /*
     * Idea:
@@ -237,13 +262,14 @@ void label_propagation_kernel(
     const uint32_t my_partition = partitions[warp_id];
     const uint32_t other_partition = (my_partition & 1u) == 0 ? my_partition + 1 : my_partition - 1;
 
-    const uint32_t* my_touching = touching + touching_offsets[warp_id];
-    const uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
+    // the hypergraph is shared by every multi-start, index it with the local node idx
+    const uint32_t* my_touching = touching + touching_offsets[my_node];
+    const uint32_t touching_count = touching_offsets[my_node + 1] - touching_offsets[my_node];
 
     // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
     // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
     const float gain = warpTouchingSiblingGain(
-        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, nodes_base, lane_id,
         sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
         sm_my_part_pins[warp_in_block], sm_other_part_pins[warp_in_block],
         [&](uint32_t pin) -> uint32_t {
@@ -257,13 +283,9 @@ void label_propagation_kernel(
     if (lane_id == 0) {
         if (gain <= 0.0f) {
             moves[warp_id] = false;
-            even_event_idx[warp_id] = 0u;
-            odd_event_idx[warp_id] = 0u;
             scores[warp_id] = 0.0f;
         } else {
             moves[warp_id] = true;
-            even_event_idx[warp_id] = (my_partition & 1u) == 0;
-            odd_event_idx[warp_id] = (my_partition & 1u);
             scores[warp_id] = gain;
         }
     }
@@ -274,10 +296,10 @@ __global__
 void label_move_events_kernel(
     const bool* __restrict__ moves,
     const float* __restrict__ scores,
-    const uint32_t* __restrict__ even_ev_idx,
-    const uint32_t* __restrict__ odd_ev_idx,
     const uint32_t* __restrict__ partitions,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     uint32_t* __restrict__ even_ev_partition,
     float* __restrict__ even_ev_score,
     uint32_t* __restrict__ even_ev_node,
@@ -286,25 +308,33 @@ void label_move_events_kernel(
     uint32_t* __restrict__ odd_ev_node
 ) {
     // STYLE: one node (move) per thread!
+    // NOTE: events are not compacted, node "tid" owns event slot "tid" in one of the two lists
+    // => the slots it does not own carry UINT32_MAX as partition, so they sort behind every real event of their own multi-start
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
+    const uint32_t batch_nodes = batch_size * num_nodes;
+    if (tid >= batch_nodes) return;
 
-    const bool move = moves[tid];
+    even_ev_partition[tid] = UINT32_MAX;
+    even_ev_score[tid] = 0.0f;
+    even_ev_node[tid] = batch_nodes; // the one slot past the nodes is the reverse-map's scratch bin
+    odd_ev_partition[tid] = UINT32_MAX;
+    odd_ev_score[tid] = 0.0f;
+    odd_ev_node[tid] = batch_nodes;
+
+    if (!active[tid / num_nodes]) return; // this multi-start already converged
+    if (!moves[tid]) return;
+
     const float score = scores[tid];
     const uint32_t part = partitions[tid];
-    
-    if (move) {
-        if ((part & 1u) == 0) {
-            const uint32_t offset = even_ev_idx[tid];
-            even_ev_partition[offset] = part >> 1; // stored as p/2
-            even_ev_score[offset] = -score; // temporarily negative, to use an ascending sort as if it were descending
-            even_ev_node[offset] = tid;
-        } else {
-            const uint32_t offset = odd_ev_idx[tid];
-            odd_ev_partition[offset] = part >> 1; // stored as (p-1)/2
-            odd_ev_score[offset] = -score; // temporarily negative, to use an ascending sort as if it were descending
-            odd_ev_node[offset] = tid;
-        }
+
+    if ((part & 1u) == 0) {
+        even_ev_partition[tid] = part >> 1; // stored as p/2
+        even_ev_score[tid] = -score; // temporarily negative, to use an ascending sort as if it were descending
+        even_ev_node[tid] = tid;
+    } else {
+        odd_ev_partition[tid] = part >> 1; // stored as (p-1)/2
+        odd_ev_score[tid] = -score; // temporarily negative, to use an ascending sort as if it were descending
+        odd_ev_node[tid] = tid;
     }
 }
 
@@ -326,15 +356,16 @@ void label_cascade_kernel(
     const uint32_t* __restrict__ odd_ranks, // ranks[node idx] -> ...
     const uint32_t* __restrict__ even_event_node,
     const uint32_t* __restrict__ odd_event_node,
-    const uint32_t even_events_count,
-    const uint32_t odd_events_count,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
     float* __restrict__ even_event_score
 ) { 
     // STYLE: one event per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
+    // global across blocks - coincides with the batch-flat event slot to handle
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= even_events_count + odd_events_count) return;
+    const uint32_t batch_nodes = batch_size * num_nodes;
+    if (warp_id >= 2u * batch_nodes) return;
 
     /*
     * Idea:
@@ -342,7 +373,8 @@ void label_cascade_kernel(
     * - moreover, now we need to shuffle between the two lists of even/odd events and their relative ranks
     */
 
-    const bool even = warp_id < even_events_count;
+    // NOTE: every early return here is warp-uniform, the warp-collectives further down require it
+    const bool even = warp_id < batch_nodes;
     uint32_t event_id;
     // |
     const uint32_t* my_part_event_offsets;
@@ -355,6 +387,7 @@ void label_cascade_kernel(
     if (even) {
         event_id = warp_id;
         // |
+        // |
         my_part_event_offsets = part_even_event_offsets;
         my_ranks = even_ranks;
         my_event_node = even_event_node;
@@ -363,7 +396,7 @@ void label_cascade_kernel(
         other_ranks = odd_ranks;
         //other_event_node = odd_event_node;
     } else {
-        event_id = warp_id - even_events_count;
+        event_id = warp_id - batch_nodes;
         // |
         my_part_event_offsets = part_odd_event_offsets;
         my_ranks = odd_ranks;
@@ -375,6 +408,9 @@ void label_cascade_kernel(
     }
 
     uint32_t my_node = my_event_node[event_id];
+    if (my_node >= batch_nodes) return; // empty slot, no event here
+
+    const uint32_t nodes_base = (my_node / num_nodes) * num_nodes; // multi-start owning this event
 
     const uint32_t my_partition = partitions[my_node];
     const uint32_t other_partition = (my_partition & 1u) == 0 ? my_partition + 1 : my_partition - 1;
@@ -392,13 +428,15 @@ void label_cascade_kernel(
     __shared__ uint32_t sm_other_part_pins[MAX_WARPS_PER_BLOCK][WARP_SIZE];
     const uint32_t warp_in_block = threadIdx.x / WARP_SIZE;
 
-    const uint32_t* my_touching = touching + touching_offsets[my_node];
-    const uint32_t touching_count = touching_offsets[my_node + 1] - touching_offsets[my_node];
+    // the hypergraph is shared by every multi-start, index it with the local node idx
+    const uint32_t my_local_node = my_node - nodes_base;
+    const uint32_t* my_touching = touching + touching_offsets[my_local_node];
+    const uint32_t touching_count = touching_offsets[my_local_node + 1] - touching_offsets[my_local_node];
 
     // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
     // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
     const float gain = warpTouchingSiblingGain(
-        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, nodes_base, lane_id,
         sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
         sm_my_part_pins[warp_in_block], sm_other_part_pins[warp_in_block],
         [&](uint32_t pin) -> uint32_t {
@@ -431,15 +469,17 @@ void apply_move_events_kernel(
     const uint32_t* __restrict__ part_even_event_offsets, // part_even_event_offsets[p/2] -> first event idx among even events for part p
     const uint32_t* __restrict__ part_odd_event_offsets, // part_odd_event_offsets[p/2] -> first event idx among odd events for part p
     const uint32_t* __restrict__ odd_event_node, // odd_event_node[event idx] -> node of the event
-    const uint32_t even_events_count,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
     uint32_t* __restrict__ partitions
 ) {
     // STYLE: one event per thread!
     const uint32_t my_event = blockIdx.x * blockDim.x + threadIdx.x;
-    if (my_event >= even_events_count) return;
+    if (my_event >= batch_size * num_nodes) return;
 
     // check if the move is to apply
     const uint32_t my_part_half = even_event_part[my_event];
+    if (my_part_half == UINT32_MAX) return; // empty slot, no event here
     const uint32_t apply_idx = apply_up_to[my_part_half];
     if (my_event > apply_idx || apply_idx == UINT32_MAX) return;
 
@@ -464,11 +504,13 @@ void update_best_partitions_kernel(
     const float* __restrict__ cutnet,
     const float* __restrict__ last_best_cutnet,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
     uint32_t* __restrict__ last_best_partitions
 ) {
     // STYLE: one node per thread!
+    // NOTE: partitions and cutnet are both composite-indexed, so nothing needs decoding here
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
+    if (tid >= batch_size * num_nodes) return;
 
     // TODO: could be ran only for nodes that actually switched sides...
 
@@ -500,13 +542,17 @@ void sibling_tree_connection_strength_kernel(
     const uint32_t* __restrict__ ord_part, // ord_part[idx] -> partition of node in order[idx]
     const uint32_t* __restrict__ partitions, // partitions[node idx] -> the partition node idx is part of
     const uint32_t num_nodes,
-    float* __restrict__ scores // scores[p] -> score in favor of p being near the sibling of partition floor(p/2)
+    const uint32_t batch_size,
+    float* __restrict__ slot_scores // slot_scores[idx] -> strength contributed by the node in ordering slot idx, towards its partition
 ) {
     // STYLE: one node per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
+    // global across blocks - coincides with the batch-flat ordering slot to handle
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_nodes) return;
+    if (warp_id >= batch_size * num_nodes) return;
+
+    // NOTE: this early return is warp-uniform, which the warp-collectives further down require
+    const uint32_t nodes_base = (warp_id / num_nodes) * num_nodes; // multi-start owning this ordering slot
     
     /*
     * Idea:
@@ -525,14 +571,16 @@ void sibling_tree_connection_strength_kernel(
     const uint32_t my_part_half = my_part >> 1;
     const uint32_t sibling_part_half = (my_part_half & 1u) == 0 ? my_part_half + 1 : my_part_half - 1;
 
-    const uint32_t* my_touching = touching + touching_offsets[my_node];
-    const uint32_t touching_count = touching_offsets[my_node + 1] - touching_offsets[my_node];
+    // the hypergraph is shared by every multi-start, index it with the local node idx
+    const uint32_t my_local_node = my_node - nodes_base;
+    const uint32_t* my_touching = touching + touching_offsets[my_local_node];
+    const uint32_t touching_count = touching_offsets[my_local_node + 1] - touching_offsets[my_local_node];
     float score = 0.0f;
 
     // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
     // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
     warpForEachTouchingPin(
-        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, nodes_base, lane_id,
         sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
         [&](uint32_t pin, float my_hedge_weight) {
             uint32_t pin_part_half = partitions[pin] >> 1;
@@ -543,8 +591,10 @@ void sibling_tree_connection_strength_kernel(
 
     score = warpReduceSumLN0<float>(score);
 
+    // NOTE: one score per slot, summed per partition by a segmented reduce on the host side
+    // => ord_part is sorted, so a partition's slots are contiguous, and the summation order does not depend on how warps are scheduled
     if (lane_id == 0) {
-        atomicAdd(&scores[my_part], score);
+        slot_scores[warp_id] = score;
     }
 }
 
@@ -553,11 +603,13 @@ __global__
 void flag_reversals_kernel(
     const float* __restrict__ sibling_score,
     const uint32_t num_parts,
+    const uint32_t batch_size,
     bool* __restrict__ reverse
 ) {
     // STYLE: one (half) partition per thread!
+    // NOTE: tid is a composite "b*num_parts + p", whose parity matches p's since num_parts is always even
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_parts) return;
+    if (tid >= batch_size * num_parts) return;
 
     const float left_score = sibling_score[tid*2];
     const float right_score = sibling_score[tid*2 + 1];
@@ -565,6 +617,32 @@ void flag_reversals_kernel(
     const bool is_sibling_to_the_left = (tid & 1u) == 1;
 
     reverse[tid] = (is_sibling_to_the_left && left_score < right_score) || (!is_sibling_to_the_left && left_score > right_score);
+}
+
+// retire the multi-starts left with no strictly improving balanced prefix
+// SEQUENTIAL COMPLEXITY: p
+// PARALLEL OVER: batch_size
+__global__
+void labelprop_activity_kernel(
+    const uint32_t* __restrict__ apply_up_to, // apply_up_to[p/2] -> last absolute event idx to apply for partition p or p+1
+    const uint32_t num_part_pairs, // partition pairs per multi-start, that is num_parts/2
+    uint8_t* __restrict__ active // active[start] -> 0 once that multi-start converged
+) {
+    // STYLE: one multi-start per block!
+    const uint32_t my_start = blockIdx.x;
+    if (!active[my_start]) return; // this multi-start already converged
+
+    const uint32_t* my_apply_up_to = apply_up_to + my_start * num_part_pairs;
+
+    __shared__ uint32_t sm_improving;
+    if (threadIdx.x == 0) sm_improving = 0u;
+    __syncthreads();
+
+    for (uint32_t pair = threadIdx.x; pair < num_part_pairs; pair += blockDim.x)
+        if (my_apply_up_to[pair] != UINT32_MAX) { atomicOr(&sm_improving, 1u); break; }
+    __syncthreads();
+
+    if (threadIdx.x == 0 && sm_improving == 0u) active[my_start] = 0u;
 }
 
 // reverse elements in each flagged segment

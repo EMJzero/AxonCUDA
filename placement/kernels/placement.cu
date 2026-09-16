@@ -1,3 +1,7 @@
+#include <cfloat>
+
+#include <cub/cub.cuh>
+
 #include "placement.cuh"
 #include "utils_plc.cuh"
 #include "utils.cuh"
@@ -19,14 +23,19 @@ __global__
 void inverse_placement_kernel(
     const Coord_t<T>* __restrict__ placement,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint32_t volume,
     uint32_t* __restrict__ inv_placement
 ) {
     // STYLE: one node per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
+    if (tid >= batch_size * num_nodes) return;
+
+    // NOTE: node idxs are batch-flat everywhere downstream, inv_placement stores them as such too
+    const uint32_t my_start = tid / num_nodes;
 
     const Coord_t<T> my_place = placement[tid];
-    inv_placement[c_topo<T>.flattenedIdx(my_place)] = tid;
+    inv_placement[my_start*volume + c_topo<T>.flattenedIdx(my_place)] = tid;
 }
 
 // compute the forces pulling each node in the four cardinal directions
@@ -43,13 +52,21 @@ void forces_kernel(
     const float* __restrict__ hedge_weights,
     const Coord_t<T>* __restrict__ placement,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     float* __restrict__ forces
 ) {
     // STYLE: one node per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
+    // global across blocks - coincides with the batch-flat node to handle
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_nodes) return;
+    if (warp_id >= batch_size * num_nodes) return;
+
+    // NOTE: both early returns below are warp-uniform, the warp-collectives further down require it
+    const uint32_t my_start = warp_id / num_nodes; // multi-start owning this node
+    if (!active[my_start]) return; // this multi-start already converged
+    const uint32_t nodes_base = my_start * num_nodes;
+    const uint32_t my_node = warp_id - nodes_base; // node idx local to its own multi-start
 
     /*
     * Idea:
@@ -63,8 +80,9 @@ void forces_kernel(
     const uint32_t warp_in_block = threadIdx.x / WARP_SIZE;
 
     const Coord_t<T> my_place = placement[warp_id];
-    const uint32_t* my_touching = touching + touching_offsets[warp_id];
-    const uint32_t touching_count = touching_offsets[warp_id + 1] - touching_offsets[warp_id];
+    // NOTE: the hypergraph is shared by every multi-start, index it with the local node idx
+    const uint32_t* my_touching = touching + touching_offsets[my_node];
+    const uint32_t touching_count = touching_offsets[my_node + 1] - touching_offsets[my_node];
 
     float my_base_potential = 0.0f;
     float my_forces[T::neighborsCount()];
@@ -73,7 +91,7 @@ void forces_kernel(
     // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
     // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
     warpForEachTouchingPin(
-        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, nodes_base, lane_id,
         sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
         [&](uint32_t pin, float my_hedge_weight) {
             if (pin == warp_id) return;
@@ -112,13 +130,20 @@ void tensions_kernel(
     const uint32_t* __restrict__ inv_placement,
     const float* __restrict__ forces,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint32_t volume,
+    const uint8_t* __restrict__ active,
     const uint32_t candidates_count,
     uint32_t* __restrict__ pairs,
     uint32_t* __restrict__ scores
 ) {
     // STYLE: one node per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
+    if (tid >= batch_size * num_nodes) return;
+
+    const uint32_t my_start = tid / num_nodes; // multi-start owning this node
+    if (!active[my_start]) return; // this multi-start already converged
+    const uint32_t* my_inv_placement = inv_placement + my_start * volume;
 
     uint32_t my_pairs[T::neighborsCount()];
     float my_scores[T::neighborsCount()];
@@ -129,7 +154,7 @@ void tensions_kernel(
     for (uint32_t neigh_idx = 0; neigh_idx < T::neighborsCount(); neigh_idx++) {
         const Coord_t<T> neigh_place = c_topo<T>.neighbor(my_place, neigh_idx);
         if (c_topo<T>.contains(neigh_place)) { // valid neighbor
-            const uint32_t neighbor = inv_placement[c_topo<T>.flattenedIdx(neigh_place)];
+            const uint32_t neighbor = my_inv_placement[c_topo<T>.flattenedIdx(neigh_place)];
             if (neighbor != UINT32_MAX) { // there is a node placed on the neighboring spot
                 my_pairs[neigh_idx] = neighbor;
                 // tension = sum of opposing forces = my gain for moving towards the neighbor + the neighbor's gain for moving back towards me
@@ -177,9 +202,10 @@ void exclusive_swaps_kernel(
     const uint32_t* __restrict__ pairs, // pairs[idx] is the partner idx wants to be swapped with
     const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be swapped with pairs[idx]
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     const uint32_t candidates_count,
-    slot* __restrict__ swap_slots, // initialized with -1 on the id
-    uint32_t* __restrict__ swap_flags // initialized to 0, set to 1 for the lower-id node of a swap-pair
+    slot* __restrict__ swap_slots // initialized with -1 on the id
 ) {
     // SETUP FOR GLOBAL SYNC
     cg::grid_group grid = cg::this_grid();
@@ -188,8 +214,13 @@ void exclusive_swaps_kernel(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t tcount = gridDim.x * blockDim.x;
 
-    //const uint32_t num_repeats = (num_nodes + tcount - 1) / tcount;
-    const uint32_t actual_repeats = tid < num_nodes ? 1u + (num_nodes - 1u - tid) / tcount : 0u;
+    // NOTE: the whole batch is matched by a single grid, node idxs in "pairs" are already batch-flat
+    // => grid.sync() below is a batch-wide barrier, stronger than needed but correct, multi-starts never interact
+    const uint32_t batch_nodes = batch_size * num_nodes;
+
+    //const uint32_t num_repeats = (batch_nodes + tcount - 1) / tcount;
+    const uint32_t actual_repeats = tid < batch_nodes ? 1u + (batch_nodes - 1u - tid) / tcount : 0u;
+    // NOTE: the launch sizes the grid off the item count, so no block is ever entirely empty and grid.sync() cannot hang
     if (actual_repeats == 0) return;
 
     /*
@@ -212,6 +243,7 @@ void exclusive_swaps_kernel(
 
     for (int32_t repeat = 0; repeat < actual_repeats; repeat++) {
         const uint32_t curr_tid = tid + repeat * tcount;
+        if (!active[curr_tid / num_nodes]) continue; // this multi-start already converged
         // initialize yourself to a one-node swap (no-swap), unless someone already claimed you
         atomicCAS(&reinterpret_cast<unsigned long long*>(swap_slots)[curr_tid], pack_slot(0u, UINT32_MAX), pack_slot(0u, curr_tid));
     }
@@ -220,6 +252,7 @@ void exclusive_swaps_kernel(
         // repeat for every node that you need to handle
         for (int32_t repeat = 0; repeat < actual_repeats; repeat++) {
             const uint32_t curr_tid = tid + repeat * tcount;
+            if (!active[curr_tid / num_nodes]) continue; // this multi-start already converged
 
             // if you formed a pair, stop
             if (completed_repeats & (1ull << repeat)) continue;
@@ -269,6 +302,7 @@ void exclusive_swaps_kernel(
         // NOTE: do these backward as to unfold the path from the rear
         for (int32_t repeat = actual_repeats - 1; repeat >= 0; repeat--) {
             const uint32_t curr_tid = tid + repeat * tcount;
+            if (!active[curr_tid / num_nodes]) continue; // this multi-start already converged
 
             // if you formed a pair, stop
             if (completed_repeats & (1ull << repeat)) continue;
@@ -308,6 +342,7 @@ void exclusive_swaps_kernel(
 
         for (uint32_t repeat = 0; repeat < actual_repeats; repeat++) {
             const uint32_t curr_tid = tid + repeat * tcount;
+            if (!active[curr_tid / num_nodes]) continue; // this multi-start already converged
             // if you formed a pair, stop
             if (completed_repeats & (1ull << repeat)) continue;
             if (swap_slots[curr_tid].score > UINT32_MAX - candidates_count) {
@@ -324,10 +359,10 @@ void exclusive_swaps_kernel(
     // write inside "swaps" the id of the node you are thus entitled to swap with
     for (uint32_t repeat = 0; repeat < actual_repeats; repeat++) {
         const uint32_t curr_tid = tid + repeat * tcount;
+        if (!active[curr_tid / num_nodes]) continue; // this multi-start already converged
         // lowest-id node sets the create-event flag
         if (swap_slots[curr_tid].score > UINT32_MAX - candidates_count) {
             const uint32_t other_tid = swap_slots[curr_tid].id;
-            if (other_tid > curr_tid) swap_flags[curr_tid] = 1;
             // TODO: we could encode in the score "who locked who" in order not to need the maximum!
             // TODO: only the lower-id node actually needs to right score to generate the event!
             const uint32_t i_of_pair_formation = UINT32_MAX - swap_slots[curr_tid].score; // reconstruct the 'i' of the pair that caused the swap-pair
@@ -346,14 +381,25 @@ template<Topology T>
 __global__
 void swap_events_kernel(
     const slot* __restrict__ swap_slots,
-    const uint32_t* __restrict__ swap_flags,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     swap* __restrict__ ev_swaps,
     float* __restrict__ ev_scores
 ) {
     // STYLE: one node per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_nodes) return;
+    if (tid >= batch_size * num_nodes) return;
+
+    // STYLE: events are not compacted, node "tid" owns event slot "tid"
+    // => empty slots carry -FLT_MAX and sort behind every real event of their own multi-start
+    swap* my_ev_swap = ev_swaps + tid;
+    float* my_ev_score = ev_scores + tid;
+    (*my_ev_swap).lo = UINT32_MAX;
+    (*my_ev_swap).hi = UINT32_MAX;
+    *my_ev_score = -FLT_MAX;
+
+    if (!active[tid / num_nodes]) return; // this multi-start already converged
 
     const slot my_swap_slot = swap_slots[tid];
     // only the lower-id node spawns an event
@@ -369,9 +415,6 @@ void swap_events_kernel(
     }
 
     // nodes in a pair, or paired with an empty cell, generate events
-    const uint32_t ev_idx = swap_flags[tid];
-    swap* my_ev_swap = ev_swaps + ev_idx;
-    float* my_ev_score = ev_scores + ev_idx;
     (*my_ev_swap).lo = tid;
     (*my_ev_swap).hi = my_swap_slot.id; // this could be 'UINT32_MAX - 1..neighborsCount' for empty cells!
     *my_ev_score = ((float)my_swap_slot.score)/FORCE_FIXED_POINT_SCALE;
@@ -384,17 +427,26 @@ template<Topology T>
 __global__
 void scatter_ranks_kernel(
     const swap* __restrict__ ev_swaps,
-    const uint32_t num_events,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     uint32_t* __restrict__ nodes_rank
 ) {
     // STYLE: one event per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_events) return;
+    if (tid >= batch_size * num_nodes) return;
+
+    const uint32_t my_start = tid / num_nodes;
+    if (!active[my_start]) return; // this multi-start already converged
 
     const swap my_ev_swap = ev_swaps[tid];
-    nodes_rank[my_ev_swap.lo] = tid;
+    if (my_ev_swap.lo == UINT32_MAX) return; // empty slot, no event here
+
+    // NOTE: ranks are local to a multi-start, so they can be compared against one another in 'cascade_kernel'
+    const uint32_t my_rank = tid - my_start * num_nodes;
+    nodes_rank[my_ev_swap.lo] = my_rank;
     if (my_ev_swap.hi < UINT32_MAX - T::neighborsCount()) // be wary of empty cells
-        nodes_rank[my_ev_swap.hi] = tid;
+        nodes_rank[my_ev_swap.hi] = my_rank;
 }
 
 // deterministically cancel duplicate claims on the same empty cell, keeping only the best-scoring (lowest event idx) one
@@ -406,36 +458,46 @@ void resolve_empty_conflicts_kernel(
     const Coord_t<T>* __restrict__ placement,
     const uint32_t* __restrict__ inv_placement,
     const uint32_t* __restrict__ nodes_rank,
-    const uint32_t num_events,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint32_t volume,
+    const uint8_t* __restrict__ active,
     swap* __restrict__ ev_swaps
 ) {
     // STYLE: one event per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_events) return;
+    if (tid >= batch_size * num_nodes) return;
+
+    const uint32_t my_start = tid / num_nodes;
+    if (!active[my_start]) return; // this multi-start already converged
+    const uint32_t nodes_base = my_start * num_nodes;
+    const uint32_t my_rank = tid - nodes_base; // rank local to the multi-start
+    const uint32_t* my_inv_placement = inv_placement + my_start * volume;
 
     const swap my_ev_swap = ev_swaps[tid];
+    if (my_ev_swap.lo == UINT32_MAX) return; // empty slot, no event here
     if (my_ev_swap.hi < UINT32_MAX - T::neighborsCount()) return; // not an empty-cell move
 
     const uint32_t direction = UINT32_MAX - my_ev_swap.hi - 1;
     const Coord_t<T> target = c_topo<T>.neighbor(placement[my_ev_swap.lo], direction);
 
     // scan the target cell's neighbors: only they could possibly be contending for it too
-    uint32_t best_event = tid;
+    uint32_t best_event = my_rank;
     for (uint32_t neigh_idx = 0; neigh_idx < T::neighborsCount(); neigh_idx++) {
         const Coord_t<T> nb_coord = c_topo<T>.neighbor(target, neigh_idx);
         if (!c_topo<T>.contains(nb_coord)) continue;
-        const uint32_t nb_node = inv_placement[c_topo<T>.flattenedIdx(nb_coord)];
+        const uint32_t nb_node = my_inv_placement[c_topo<T>.flattenedIdx(nb_coord)];
         if (nb_node == UINT32_MAX) continue;
         const uint32_t nb_event = nodes_rank[nb_node];
-        if (nb_event == UINT32_MAX || nb_event == tid) continue;
-        const swap nb_ev_swap = ev_swaps[nb_event];
+        if (nb_event == UINT32_MAX || nb_event == my_rank) continue;
+        const swap nb_ev_swap = ev_swaps[nodes_base + nb_event];
         if (nb_ev_swap.lo != nb_node || nb_ev_swap.hi < UINT32_MAX - T::neighborsCount()) continue; // not an empty move
         const uint32_t nb_direction = UINT32_MAX - nb_ev_swap.hi - 1;
         if (c_topo<T>.neighbor(placement[nb_node], nb_direction) == target)
             best_event = min(best_event, nb_event);
     }
 
-    if (best_event != tid)
+    if (best_event != my_rank)
         ev_swaps[tid].hi = UINT32_MAX; // event cancelled, lost the cell to a better-scoring neighbor
 }
 
@@ -455,14 +517,22 @@ void cascade_kernel(
     const Coord_t<T>* __restrict__ placement,
     const swap* __restrict__ ev_swaps,
     const uint32_t* __restrict__ nodes_rank,
-    const uint32_t num_events,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     float* __restrict__ scores
 ) {
     // STYLE: one event per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
+    // global across blocks - coincides with the batch-flat event slot to handle
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_events) return;
+    if (warp_id >= batch_size * num_nodes) return;
+
+    // NOTE: every early return here is warp-uniform, the warp-collectives further down require it
+    const uint32_t my_start = warp_id / num_nodes; // multi-start owning this event slot
+    if (!active[my_start]) return; // this multi-start already converged
+    const uint32_t nodes_base = my_start * num_nodes;
+    const uint32_t my_rank = warp_id - nodes_base; // rank local to the multi-start
 
     /*
     * Idea:
@@ -470,7 +540,10 @@ void cascade_kernel(
     */
 
     const swap my_ev_swaps = ev_swaps[warp_id];
-    // NOTE: current rank == tid
+    // NOTE: current rank == my_rank
+
+    // empty slot, leave its -FLT_MAX score in place so it stays behind every real event
+    if (my_ev_swaps.lo == UINT32_MAX) return;
 
     // cancelled by conflict resolution
     if (my_ev_swaps.hi == UINT32_MAX) {
@@ -499,8 +572,9 @@ void cascade_kernel(
         direction = c_topo<T>.neighborIdx(my_place, other_place);
     }
 
-    const uint32_t* my_touching = touching + touching_offsets[curr_node];
-    const uint32_t touching_count = touching_offsets[curr_node + 1] - touching_offsets[curr_node];
+    const uint32_t curr_local = curr_node - nodes_base; // the hypergraph is shared by every multi-start
+    const uint32_t* my_touching = touching + touching_offsets[curr_local];
+    const uint32_t touching_count = touching_offsets[curr_local + 1] - touching_offsets[curr_local];
 
     float base_potential = 0.0f;
     float force = 0.0f;
@@ -508,15 +582,15 @@ void cascade_kernel(
     // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
     // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
     warpForEachTouchingPin(
-        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+        hedges, hedges_offsets, hedge_weights, my_touching, touching_count, nodes_base, lane_id,
         sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
         [&](uint32_t pin, float my_hedge_weight) {
             if (pin == curr_node) return;
             Coord_t<T> pin_place;
             uint32_t pin_event_idx = nodes_rank[pin];
             // reconstruct the pin's placement w.r.t. the sequence of events
-            if (pin_event_idx < warp_id) {
-                const swap pin_ev_swaps = ev_swaps[pin_event_idx];
+            if (pin_event_idx < my_rank) {
+                const swap pin_ev_swaps = ev_swaps[nodes_base + pin_event_idx];
                 if (pin == pin_ev_swaps.hi) pin_place = placement[pin_ev_swaps.lo];
                 else if (pin_ev_swaps.hi == UINT32_MAX) pin_place = placement[pin]; // cancelled empty move, pin never moved
                 else {
@@ -553,8 +627,9 @@ void cascade_kernel(
         const Coord_t<T> other_place = placement[my_ev_swaps.lo];
         direction = c_topo<T>.neighborIdx(my_place, other_place);
 
-        const uint32_t* my_touching = touching + touching_offsets[curr_node];
-        const uint32_t touching_count = touching_offsets[curr_node + 1] - touching_offsets[curr_node];
+        const uint32_t curr_local = curr_node - nodes_base; // the hypergraph is shared by every multi-start
+        const uint32_t* my_touching = touching + touching_offsets[curr_local];
+        const uint32_t touching_count = touching_offsets[curr_local + 1] - touching_offsets[curr_local];
 
         base_potential = 0.0f;
         force = 0.0f;
@@ -562,15 +637,15 @@ void cascade_kernel(
         // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
         // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
         warpForEachTouchingPin(
-            hedges, hedges_offsets, hedge_weights, my_touching, touching_count, lane_id,
+            hedges, hedges_offsets, hedge_weights, my_touching, touching_count, nodes_base, lane_id,
             sm_hedge_idx[warp_in_block], sm_hedge_cum[warp_in_block], sm_hedge_weight[warp_in_block],
             [&](uint32_t pin, float my_hedge_weight) {
                 if (pin == curr_node) return;
                 Coord_t<T> pin_place;
                 uint32_t pin_event_idx = nodes_rank[pin];
                 // reconstruct the pin's placement w.r.t. the sequence of events
-                if (pin_event_idx < warp_id) {
-                    const swap pin_ev_swaps = ev_swaps[pin_event_idx];
+                if (pin_event_idx < my_rank) {
+                    const swap pin_ev_swaps = ev_swaps[nodes_base + pin_event_idx];
                     if (pin == pin_ev_swaps.hi) pin_place = placement[pin_ev_swaps.lo];
                     else if (pin_ev_swaps.hi == UINT32_MAX) pin_place = placement[pin]; // cancelled empty move, pin never moved
                     else {
@@ -610,13 +685,22 @@ template<Topology T>
 __global__
 void apply_swaps_kernel(
     const swap* __restrict__ ev_swaps,
-    const uint32_t num_good_swaps,
+    const uint32_t* __restrict__ num_good_swaps, // num_good_swaps[start] -> length of that multi-start's improving event prefix
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint32_t volume,
+    const uint8_t* __restrict__ active,
     Coord_t<T>* __restrict__ placement,
     uint32_t* __restrict__ inv_placement
 ) {
-    // STYLE: one node per thread!
+    // STYLE: one event per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_good_swaps) return;
+    if (tid >= batch_size * num_nodes) return;
+
+    const uint32_t my_start = tid / num_nodes;
+    if (!active[my_start]) return; // this multi-start already converged
+    if (tid - my_start * num_nodes >= num_good_swaps[my_start]) return; // past the improving prefix
+    uint32_t* my_inv_placement = inv_placement + my_start * volume;
 
     /*
     * Notes:
@@ -633,15 +717,79 @@ void apply_swaps_kernel(
         const Coord_t<T> plac_hi = placement[my_swap.hi];
         placement[my_swap.lo] = plac_hi;
         placement[my_swap.hi] = plac_lo;
-        inv_placement[c_topo<T>.flattenedIdx(plac_lo)] = my_swap.hi;
-        inv_placement[c_topo<T>.flattenedIdx(plac_hi)] = my_swap.lo;
+        my_inv_placement[c_topo<T>.flattenedIdx(plac_lo)] = my_swap.hi;
+        my_inv_placement[c_topo<T>.flattenedIdx(plac_hi)] = my_swap.lo;
     } else {
         const Coord_t<T> plac_lo = placement[my_swap.lo];
         uint32_t direction = UINT32_MAX - my_swap.hi - 1;
         const Coord_t<T> plac_hi = c_topo<T>.neighbor(plac_lo, direction);
         placement[my_swap.lo] = plac_hi;
-        inv_placement[c_topo<T>.flattenedIdx(plac_hi)] = my_swap.lo;
-        inv_placement[c_topo<T>.flattenedIdx(plac_lo)] = UINT32_MAX;
+        my_inv_placement[c_topo<T>.flattenedIdx(plac_hi)] = my_swap.lo;
+        my_inv_placement[c_topo<T>.flattenedIdx(plac_lo)] = UINT32_MAX;
+    }
+}
+
+// per multi-start, scan the in-sequence event gains and keep the highest-gain prefix, retiring converged multi-starts
+// SEQUENTIAL COMPLEXITY: n
+// PARALLEL OVER: batch_size
+__global__
+void prefix_gain_kernel(
+    const float* __restrict__ ev_scores,
+    const uint32_t num_nodes,
+    uint32_t* __restrict__ num_good_swaps, // num_good_swaps[start] -> length of that multi-start's improving event prefix
+    uint8_t* __restrict__ active
+) {
+    // STYLE: one multi-start per block!
+    // NOTE: the scan is per multi-start, and not batch-wide, so that its tiling - and thus its float rounding -
+    //       never depends on the batch size: a multi-start must reach the same result whatever it is batched with
+    const uint32_t my_start = blockIdx.x;
+    if (!active[my_start]) return; // this multi-start already converged
+
+    typedef cub::BlockScan<float, PREFIX_GAIN_THREADS> BlockScan;
+    typedef cub::BlockReduce<cub::KeyValuePair<int32_t, float>, PREFIX_GAIN_THREADS> BlockReduce;
+
+    __shared__ typename BlockScan::TempStorage sm_scan;
+    __shared__ typename BlockReduce::TempStorage sm_reduce;
+    __shared__ float sm_carry; // gain accumulated over the tiles scanned so far
+    __shared__ cub::KeyValuePair<int32_t, float> sm_best; // best prefix end so far, and its gain
+
+    if (threadIdx.x == 0) {
+        sm_carry = 0.0f;
+        sm_best.key = -1;
+        sm_best.value = -FLT_MAX;
+    }
+    __syncthreads();
+
+    const float* my_ev_scores = ev_scores + my_start * num_nodes;
+
+    for (uint32_t tile = 0; tile < num_nodes; tile += PREFIX_GAIN_THREADS) {
+        const uint32_t my_rank = tile + threadIdx.x;
+        const float my_score = my_rank < num_nodes ? my_ev_scores[my_rank] : -FLT_MAX;
+        // empty slots must neither move the running prefix nor ever win the argmax
+        const bool is_event = my_score != -FLT_MAX;
+
+        float my_prefix, tile_gain;
+        BlockScan(sm_scan).InclusiveSum(is_event ? my_score : 0.0f, my_prefix, tile_gain);
+        my_prefix += sm_carry;
+
+        const cub::KeyValuePair<int32_t, float> my_bin(is_event ? (int32_t)my_rank : -1, is_event ? my_prefix : -FLT_MAX);
+        const cub::KeyValuePair<int32_t, float> tile_best = BlockReduce(sm_reduce).Reduce(my_bin, cub::ArgMax());
+
+        __syncthreads(); // every thread must be done with the scratch before the next tile overwrites it
+        if (threadIdx.x == 0) {
+            sm_carry += tile_gain;
+            if (tile_best.key >= 0 && tile_best.value > sm_best.value) sm_best = tile_best;
+        }
+        __syncthreads();
+    }
+
+    // retire this multi-start if no improving prefix is left
+    if (threadIdx.x == 0) {
+        if (sm_best.key < 0 || sm_best.value < FD_MIN_GAIN) {
+            num_good_swaps[my_start] = 0u;
+            active[my_start] = 0u;
+        } else
+            num_good_swaps[my_start] = (uint32_t)sm_best.key + 1u;
     }
 }
 
@@ -706,24 +854,31 @@ void tot_src_dst_distance_kernel(
     const uint32_t* __restrict__ srcs_count,
     const float* __restrict__ hedge_weights,
     const uint32_t num_hedges,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
     float* __restrict__ result
 ) {
     // STYLE: one hedge per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
+    // global across blocks - coincides with the batch-flat hedge to handle
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_hedges) return;
+    if (warp_id >= batch_size * num_hedges) return;
 
-    const uint32_t* srcs_start = hedges + hedges_offsets[warp_id];
-    const uint32_t* dsts_start = srcs_start + srcs_count[warp_id];
-    const uint32_t* dsts_end = hedges + hedges_offsets[warp_id + 1];
+    // the hypergraph is shared by every multi-start, only the placement it is graded against differs
+    const uint32_t my_start = warp_id / num_hedges;
+    const uint32_t my_hedge = warp_id - my_start * num_hedges;
+    const Coord_t<T>* my_placement = placement + my_start * num_nodes;
+
+    const uint32_t* srcs_start = hedges + hedges_offsets[my_hedge];
+    const uint32_t* dsts_start = srcs_start + srcs_count[my_hedge];
+    const uint32_t* dsts_end = hedges + hedges_offsets[my_hedge + 1];
 
     uint32_t tot_distance = 0u;
 
     for (const uint32_t* src_ptr = srcs_start; src_ptr < dsts_start; src_ptr++) {
-        const Coord_t<T> src_plc = placement[*src_ptr];
+        const Coord_t<T> src_plc = my_placement[*src_ptr];
         for (const uint32_t* dst_ptr = dsts_start + lane_id; dst_ptr < dsts_end; dst_ptr += WARP_SIZE) {
-            const Coord_t<T> dst_plc = placement[*dst_ptr];
+            const Coord_t<T> dst_plc = my_placement[*dst_ptr];
             tot_distance += c_topo<T>.distance(src_plc, dst_plc);
         }
     }
@@ -731,7 +886,7 @@ void tot_src_dst_distance_kernel(
     tot_distance = warpReduceSumLN0(tot_distance);
 
     if (lane_id == 0)
-        result[warp_id] = tot_distance * hedge_weights[warp_id];
+        result[warp_id] = tot_distance * hedge_weights[my_hedge];
 }
 
 // compute the min spanning tree weight between pins per hedge
@@ -746,13 +901,20 @@ void min_spanning_tree_weight_kernel(
     const dim_t* __restrict__ hedges_offsets,
     const float* __restrict__ hedge_weights,
     const uint32_t num_hedges,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
     float* __restrict__ result
 ) {
     // STYLE: one hedge per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
-    // global across blocks - coincides with the node to handle
+    // global across blocks - coincides with the batch-flat hedge to handle
     const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    if (warp_id >= num_hedges) return;
+    if (warp_id >= batch_size * num_hedges) return;
+
+    // the hypergraph is shared by every multi-start, only the placement it is graded against differs
+    const uint32_t my_start = warp_id / num_hedges;
+    const uint32_t my_hedge = warp_id - my_start * num_hedges;
+    const Coord_t<T>* my_placement = placement + my_start * num_nodes;
 
     /*
     * Spanning tree algorithm (Prim-style):
@@ -766,8 +928,8 @@ void min_spanning_tree_weight_kernel(
     * - no need to track which edges were used for the MST, we just need to accumulate the total weight used when adding pins to it
     */
 
-    const uint32_t* hedge_start = hedges + hedges_offsets[warp_id];
-    const uint32_t hedge_size = hedges_offsets[warp_id + 1] - hedges_offsets[warp_id] - 1;
+    const uint32_t* hedge_start = hedges + hedges_offsets[my_hedge];
+    const uint32_t hedge_size = hedges_offsets[my_hedge + 1] - hedges_offsets[my_hedge] - 1;
     if (hedge_size + 1 <= 1) {
         if (lane_id == 0) result[warp_id] = 0.0f;
         return;
@@ -780,11 +942,11 @@ void min_spanning_tree_weight_kernel(
 
     uint32_t tot_span = 0u;
 
-    Coord_t<T> new_mst_pin_plc = placement[hedge_start[hedge_size]]; // last pin in the hedge
+    Coord_t<T> new_mst_pin_plc = my_placement[hedge_start[hedge_size]]; // last pin in the hedge
 
     // initialize distance to the first MST pin (last one)
     for (uint32_t pin_idx = 0u; pin_idx < lane_pins_count; pin_idx++) {
-        const Coord_t<T> pin_plc = placement[hedge_start[pin_idx * WARP_SIZE + lane_id]];
+        const Coord_t<T> pin_plc = my_placement[hedge_start[pin_idx * WARP_SIZE + lane_id]];
         mst_distance[pin_idx] = c_topo<T>.distance(new_mst_pin_plc, pin_plc);
     }
 
@@ -809,9 +971,9 @@ void min_spanning_tree_weight_kernel(
 
         // update each node's min distance from the MST
         // TODO: could optimize by skipping already flagged pins
-        new_mst_pin_plc = placement[hedge_start[min_pin]];
+        new_mst_pin_plc = my_placement[hedge_start[min_pin]];
         for (uint32_t pin_idx = 0u; pin_idx < lane_pins_count; pin_idx++) {
-            const Coord_t<T> pin_plc = placement[hedge_start[pin_idx * WARP_SIZE + lane_id]];
+            const Coord_t<T> pin_plc = my_placement[hedge_start[pin_idx * WARP_SIZE + lane_id]];
             mst_distance[pin_idx] = min(mst_distance[pin_idx], c_topo<T>.distance(new_mst_pin_plc, pin_plc));
         }
         
@@ -819,45 +981,46 @@ void min_spanning_tree_weight_kernel(
     }
 
     if (lane_id == 0)
-        result[warp_id] = tot_span * hedge_weights[warp_id];
+        result[warp_id] = tot_span * hedge_weights[my_hedge];
 }
 
 // TEMPLATE INSTANTIATIONS
 
 #define INSTANTIATE_PLACEMENT_KERNELS(T) \
     template __global__ void inverse_placement_kernel<T>( \
-        const Coord_t<T>*, uint32_t, uint32_t*); \
+        const Coord_t<T>*, uint32_t, uint32_t, uint32_t, uint32_t*); \
      \
     template __global__ void forces_kernel<T>( \
         const uint32_t*, const dim_t*, \
         const uint32_t*, const dim_t*, \
-        const float*, const Coord_t<T>*, uint32_t, float*); \
+        const float*, const Coord_t<T>*, uint32_t, uint32_t, const uint8_t*, float*); \
      \
     template __global__ void tensions_kernel<T>( \
         const Coord_t<T>*, const uint32_t*, const float*, \
-        uint32_t, uint32_t, uint32_t*, uint32_t*); \
+        uint32_t, uint32_t, uint32_t, const uint8_t*, uint32_t, uint32_t*, uint32_t*); \
      \
     template __global__ void exclusive_swaps_kernel<T>( \
-        const uint32_t*, const uint32_t*, uint32_t, uint32_t, \
-        slot*, uint32_t*); \
+        const uint32_t*, const uint32_t*, uint32_t, uint32_t, const uint8_t*, uint32_t, slot*); \
      \
     template __global__ void swap_events_kernel<T>( \
-        const slot*, const uint32_t*, uint32_t, swap*, float*); \
+        const slot*, uint32_t, uint32_t, const uint8_t*, swap*, float*); \
      \
     template __global__ void scatter_ranks_kernel<T>( \
-        const swap*, uint32_t, uint32_t*); \
+        const swap*, uint32_t, uint32_t, const uint8_t*, uint32_t*); \
      \
     template __global__ void resolve_empty_conflicts_kernel<T>( \
-        const Coord_t<T>*, const uint32_t*, const uint32_t*, uint32_t, swap*); \
+        const Coord_t<T>*, const uint32_t*, const uint32_t*, \
+        uint32_t, uint32_t, uint32_t, const uint8_t*, swap*); \
      \
     template __global__ void cascade_kernel<T>( \
         const uint32_t*, const dim_t*, \
         const uint32_t*, const dim_t*, \
         const float*, const Coord_t<T>*, \
-        const swap*, const uint32_t*, uint32_t, float*); \
+        const swap*, const uint32_t*, uint32_t, uint32_t, const uint8_t*, float*); \
      \
     template __global__ void apply_swaps_kernel<T>( \
-        const swap*, uint32_t, Coord_t<T>*, uint32_t*); \
+        const swap*, const uint32_t*, uint32_t, uint32_t, uint32_t, const uint8_t*, \
+        Coord_t<T>*, uint32_t*); \
      \
     template __global__ void max_src_dst_distance_kernel<T>( \
         const Coord_t<T>*, const uint32_t*, const dim_t*, \
@@ -865,11 +1028,11 @@ void min_spanning_tree_weight_kernel(
      \
     template __global__ void tot_src_dst_distance_kernel<T>( \
         const Coord_t<T>*, const uint32_t*, const dim_t*, \
-        const uint32_t*, const float*, uint32_t, float*); \
+        const uint32_t*, const float*, uint32_t, uint32_t, uint32_t, float*); \
      \
     template __global__ void min_spanning_tree_weight_kernel<T>( \
         const Coord_t<T>*, const uint32_t*, const dim_t*, \
-        const float*, uint32_t, float*);
+        const float*, uint32_t, uint32_t, uint32_t, float*);
 
 INSTANTIATE_PLACEMENT_KERNELS(Lattice2D)
 INSTANTIATE_PLACEMENT_KERNELS(Torus6D)

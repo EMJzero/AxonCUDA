@@ -25,7 +25,7 @@
 #define FORCE_FIXED_POINT_SCALE 131072u
 
 #define MULTISTART_ATTEMPTS -1u // -1 -> decide at runtime based on parallel resource
-#define NUM_HOST_THREADS -1u // -1 -> decide at runtime based cores count
+#define MULTISTART_BATCH_SIZE -1u // -1 -> refine every multi-start attempt in one single batch
 
 
 // USED BY: recursive bipartitioning
@@ -41,6 +41,9 @@
 // USED BY: force-directed refinement
 
 #define FD_ITERATIONS 64 // 1024
+#define FD_MIN_GAIN 0.001f // below this, a multi-start's best improving prefix is not worth applying
+#define PREFIX_GAIN_THREADS 256u // threads per block of 'prefix_gain_kernel' - one block handles one multi-start
+#define FD_ACTIVE_CHECK_PERIOD 16u // iterations between two host-side checks of whether the whole batch converged
 
 
 // USED BY: warp-cooperative touching-hedge pin flattening (forces / cascade / label kernels)

@@ -16,7 +16,6 @@
 
 #include <cub/cub.cuh>
 
-#include <omp.h>
 
 #include "hgraph.hpp"
 #include "curves.hpp"
@@ -38,6 +37,14 @@ using namespace hwmodel;
 using namespace topology;
 using namespace config_plc;
 
+
+// rebase a winning multi-start's batch-flat node idxs back to idxs local to it
+struct rebase_node_idx {
+    const uint32_t nodes_base;
+    __host__ __device__ uint32_t operator()(const uint32_t node) const {
+        return node == UINT32_MAX ? UINT32_MAX : node - nodes_base;
+    }
+};
 
 int main(int argc, char** argv) {
     if (argc == 1) {
@@ -83,9 +90,9 @@ int main(int argc, char** argv) {
         std::cout << "  Multi-start attempts:            ";
         if (cfg.multi_start_override == UINT32_MAX) std::cout << "<max-occupancy>\n";
         else std::cout << cfg.multi_start_override << "\n";
-        std::cout << "  Host threads count:              ";
-        if (cfg.num_host_threads == UINT32_MAX) std::cout << "<max-occupancy>\n";
-        else std::cout << cfg.num_host_threads << "\n";
+        std::cout << "  Multi-start batch size:          ";
+        if (cfg.batch_size == UINT32_MAX) std::cout << "<multi-start count>\n";
+        else std::cout << cfg.batch_size << "\n";
         std::cout << "  Label propagation repeats:       " << cfg.labelprop_repeats << "\n";
         std::cout << "  Space-filling curve:             " << SFCtoString(cfg.space_filling_curve) << "\n";
         std::cout << "  Routing policies:                " << routingPoliciesToString(cfg.unicast_metrics, cfg.xy_multicast_metrics, cfg.steiner_multicast_metrics) << "\n";
@@ -262,21 +269,41 @@ int main(int argc, char** argv) {
             multi_start_count = std::max(1u, total_warp_capacity / num_nodes);
             INFO(cfg) std::cout << "Setting multi-start count for maximum occupancy to: " << multi_start_count << " (" << active_warps_per_SM << " warps per SM * " << props.multiProcessorCount << " SMs / " << num_nodes << " nodes)\n";
         }
-        uint32_t num_threads = cfg.num_host_threads;
-        if (num_threads == UINT32_MAX) {
-            num_threads = multi_start_count;
-            INFO(cfg) std::cout << "Setting num-threads equal to multi-start count: " << multi_start_count << "\n";
+        // refine multi-start attempts in batches: one attempt is far too small to fill the GPU, so every kernel handles a whole batch at once
+        uint32_t batch_size = cfg.batch_size;
+        if (batch_size == UINT32_MAX) {
+            batch_size = multi_start_count;
+            INFO(cfg) std::cout << "Setting batch size equal to multi-start count: " << batch_size << "\n";
         }
-        if (multi_start_count > 2u * omp_get_max_threads()) {
-            ERR(cfg) std::cout << "WARNING, it is suggested to decrease num-threads from " << num_threads << " to " << 2 * omp_get_max_threads() << ", as not to exceed 2x the number of available CPUs (" <<  omp_get_max_threads() << ") !!\n";
+        batch_size = std::min(batch_size, multi_start_count);
+        // node idxs are batch-flat inside every refinement structure, they must stay clear of the empty-cell sentinels
+        if (static_cast<uint64_t>(batch_size) * num_nodes >= UINT32_MAX - T::neighborsCount()) {
+            ERR(cfg) std::cerr << "ABORTING: batch size " << batch_size << " over " << num_nodes << " nodes overflows the batch-flat node idx space !!\n";
+            abort();
         }
 
-        // setup a stream per thread
-        INFO(cfg) std::cout << "Spawning " << num_threads << " OpenMP threads and matching CUDA streams ...\n";
-        std::vector<cudaStream_t> streams(num_threads);
-        for (uint32_t i = 0; i < num_threads; ++i) {
-            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking));
-        }
+        const uint32_t volume = static_cast<uint32_t>(topo.extent().volume());
+
+        // setup the single stream carrying the whole run
+        INFO(cfg) std::cout << "Refining " << multi_start_count << " multi-start attempts in batches of " << batch_size << " ...\n";
+        cudaStream_t stream;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        auto thrust_exec = thrust::cuda::par.on(stream);
+        const int tid = 0;
+
+        // batch solutions
+        Coord *d_placement = nullptr; // placement[batch-flat node idx] -> placement coordinates of the node
+        uint32_t *d_inv_placement = nullptr; // inv_placement[start*volume + flat coord idx] -> batch-flat idx of the node occupying such place, or UINT32_MAX
+        CUDA_CHECK(cudaMalloc(&d_placement, static_cast<size_t>(batch_size) * num_nodes * sizeof(Coord)));
+        CUDA_CHECK(cudaMalloc(&d_inv_placement, static_cast<size_t>(batch_size) * volume * sizeof(uint32_t)));
+        // |
+        // batch scores
+        float *d_src_dst_distance = nullptr; // src_dst_distance[start] -> weighted avg. hedge max src-dst manhattan distance of that attempt
+        float *d_steiner_span = nullptr; // steiner_span[start] -> weighted avg. hedge Steiner tree span of that attempt
+        CUDA_CHECK(cudaMalloc(&d_src_dst_distance, batch_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_steiner_span, batch_size * sizeof(float)));
+        std::vector<float> h_src_dst_distance(batch_size);
+        std::vector<float> h_steiner_span(batch_size);
 
         INFO(cfg) std::cout << "Starting core timer...\n";
         cudaEvent_t d_time_core_start, d_time_core_stop;
@@ -286,32 +313,21 @@ int main(int argc, char** argv) {
 
         float avg_attempt_time = 0.0f;
 
-        #pragma omp parallel for default(shared) reduction(+:avg_attempt_time) num_threads(num_threads)
-        for (uint32_t start = 0; start < multi_start_count; start++) {
-            // recover your stream
-            int tid = omp_get_thread_num();
-            cudaStream_t stream = streams[tid];
-            auto thrust_exec = thrust::cuda::par.on(stream);
+        for (uint32_t batch_begin = 0; batch_begin < multi_start_count; batch_begin += batch_size) {
+            const uint32_t curr_batch = std::min(batch_size, multi_start_count - batch_begin);
 
-            const uint32_t seed = cfg.seed + start;
+            INFO(cfg) std::cout TID(tid) << "Beginning attempts [" << batch_begin << ", " << batch_begin + curr_batch << ") ...\n";
 
-            INFO(cfg) std::cout TID(tid) << "Beginning attempt " << start << " ...\n";
-
-            // prepare thread-local solution
-            Coord *d_placement = nullptr; // placement[node idx] -> x and y placement coordinates of node
-            uint32_t *d_inv_placement = nullptr; // inv_placement[flat coord idx] -> idx of the node occupying such place, or UINT32_MAX
-            CUDA_CHECK(cudaMallocAsync(&d_placement, num_nodes * sizeof(Coord), stream));
-            CUDA_CHECK(cudaMallocAsync(&d_inv_placement, topo.extent().volume() * sizeof(uint32_t), stream));
-
-            INFO(cfg) std::cout TID(tid) << "Starting attempt timer...\n";
-            cudaEvent_t d_time_attempt_start, d_time_attempt_stop;
-            CUDA_CHECK(cudaEventCreate(&d_time_attempt_start));
-            CUDA_CHECK(cudaEventCreate(&d_time_attempt_stop));
-            CUDA_CHECK(cudaEventRecord(d_time_attempt_start, stream));
+            INFO(cfg) std::cout TID(tid) << "Starting batch timer...\n";
+            cudaEvent_t d_time_batch_start, d_time_batch_stop;
+            CUDA_CHECK(cudaEventCreate(&d_time_batch_start));
+            CUDA_CHECK(cudaEventCreate(&d_time_batch_stop));
+            CUDA_CHECK(cudaEventRecord(d_time_batch_start, stream));
 
             // initial placement
-            uint32_t* d_order_idx = nullptr; // order_idx[node] -> position in the 1D ordering for node
+            uint32_t* d_order_idx = nullptr; // order_idx[node] -> position in its multi-start's 1D ordering for node
             if (cfg.feedforward_order) {
+                // NOTE: feed-forward ordering is deterministic, so it forces the multi-start count - and thus the batch - down to 1
                 CUDA_CHECK(cudaMallocAsync(&d_order_idx, num_nodes * sizeof(uint32_t), stream));
                 INFO(cfg) std::cout TID(tid) << "Ordering nodes (sequential - might take a while) ...\n";
                 std::vector<uint32_t> nodes_order_idx = hg.feedForwardOrder();
@@ -321,6 +337,7 @@ int main(int argc, char** argv) {
                 d_order_idx = locality_ordering(
                     cfg,
                     num_nodes,
+                    curr_batch,
                     num_hedges,
                     hg.hedgesFlat().size(),
                     d_hedges,
@@ -328,65 +345,74 @@ int main(int argc, char** argv) {
                     d_hedge_weights,
                     d_touching,
                     d_touching_offsets,
-                    seed,
+                    cfg.seed + batch_begin,
                     stream,
                     tid
                 );
             }
 
             // assign to each node its respective placement following both 1D orders (from ordered nodes to the lattice points map)
-            thrust::device_ptr<Coord> t_placement(d_placement);
-            thrust::device_ptr<uint32_t> t_order_idx(d_order_idx);
-            thrust::gather(thrust_exec, t_order_idx, t_order_idx + num_nodes, t_1dto2d_placement, t_placement);
-            CUDA_CHECK(cudaFreeAsync(d_order_idx, stream));
-
-            // =============================
-            // print some temporary results
-            LOG(cfg) {
-                std::vector<Coord> h_init_placement(num_nodes);
-                CUDA_CHECK(cudaMemcpyAsync(h_init_placement.data(), d_placement, num_nodes * sizeof(Coord), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-
-                if (hw.checkPlacementValidity(hg, h_init_placement, true)) {
-                    if (cfg.unicast_metrics) {
-                        DBG(cfg) std::cout TID(tid) << "Computing initial placement unicast metrics...\n";
-                        auto metrics = hw.getAllUnicastMetrics(hg, h_init_placement);
-                        std::cout TID(tid) << "Initial placement unicast metrics:\n";
-                        std::cout TID(tid) << "  Energy:        " << std::fixed << std::setprecision(3) << metrics.energy.value() << "\n";
-                        std::cout TID(tid) << "  Avg. latency:  " << std::fixed << std::setprecision(3) << metrics.avg_latency.value() << "\n";
-                        std::cout TID(tid) << "  Max. latency:  " << std::fixed << std::setprecision(3) << metrics.max_latency.value() << "\n";
-                        std::cout TID(tid) << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << metrics.avg_congestion.value() << "\n";
-                        std::cout TID(tid) << "  Max. congestion:  " << std::fixed << std::setprecision(3) << metrics.max_congestion.value() << "\n";
-                        std::cout TID(tid) << "  Connections locality:\n";
-                        std::cout TID(tid) << "    Flat:     " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean << " ar. mean, " << metrics.connections_locality.value().geo_mean << " geo. mean\n";
-                        std::cout TID(tid) << "    Weighted: " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
-                    }
-                } else {
-                    std::cerr TID(tid) << "ERROR, invalid initial placement !!\n";
-                    abort(); // should never happen
-                }
-
-                std::cout TID(tid) << "Initial placement:\n";
-                for (uint32_t i = 0; i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH); ++i) {
-                    const Coord place = h_init_placement[i];
-                    std::cout TID(tid) << "  node " << i << " -> " << place.toString() << "\n";
-                }
-                std::vector<Coord>().swap(h_init_placement);
+            // => order_idx holds positions local to each multi-start, so the shared 1D-to-(N)D map serves the whole batch
+            {
+                thrust::device_ptr<Coord> t_placement(d_placement);
+                thrust::device_ptr<uint32_t> t_order_idx(d_order_idx);
+                thrust::gather(thrust_exec, t_order_idx, t_order_idx + curr_batch * num_nodes, t_1dto2d_placement, t_placement);
+                CUDA_CHECK(cudaFreeAsync(d_order_idx, stream));
             }
-            // =============================
+
+            for (uint32_t start = 0; start < curr_batch; start++) {
+                Coord *d_start_placement = d_placement + start * num_nodes;
+
+                // =============================
+                // print some temporary results
+                LOG(cfg) {
+                    std::vector<Coord> h_init_placement(num_nodes);
+                    CUDA_CHECK(cudaMemcpyAsync(h_init_placement.data(), d_start_placement, num_nodes * sizeof(Coord), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                    if (hw.checkPlacementValidity(hg, h_init_placement, true)) {
+                        if (cfg.unicast_metrics) {
+                            DBG(cfg) std::cout TID(tid) << "Computing initial placement unicast metrics...\n";
+                            auto metrics = hw.getAllUnicastMetrics(hg, h_init_placement);
+                            std::cout TID(tid) << "Initial placement unicast metrics:\n";
+                            std::cout TID(tid) << "  Energy:        " << std::fixed << std::setprecision(3) << metrics.energy.value() << "\n";
+                            std::cout TID(tid) << "  Avg. latency:  " << std::fixed << std::setprecision(3) << metrics.avg_latency.value() << "\n";
+                            std::cout TID(tid) << "  Max. latency:  " << std::fixed << std::setprecision(3) << metrics.max_latency.value() << "\n";
+                            std::cout TID(tid) << "  Avg. congestion:  " << std::fixed << std::setprecision(3) << metrics.avg_congestion.value() << "\n";
+                            std::cout TID(tid) << "  Max. congestion:  " << std::fixed << std::setprecision(3) << metrics.max_congestion.value() << "\n";
+                            std::cout TID(tid) << "  Connections locality:\n";
+                            std::cout TID(tid) << "    Flat:     " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean << " ar. mean, " << metrics.connections_locality.value().geo_mean << " geo. mean\n";
+                            std::cout TID(tid) << "    Weighted: " << std::fixed << std::setprecision(3) << metrics.connections_locality.value().ar_mean_weighted << " ar. mean, " << metrics.connections_locality.value().geo_mean_weighted << " geo. mean\n";
+                        }
+                    } else {
+                        std::cerr TID(tid) << "ERROR, invalid initial placement !!\n";
+                        abort(); // should never happen
+                    }
+
+                    std::cout TID(tid) << "Initial placement:\n";
+                    for (uint32_t i = 0; i < std::min<uint32_t>(num_nodes, VERBOSE_LENGTH); ++i) {
+                        const Coord place = h_init_placement[i];
+                        std::cout TID(tid) << "  node " << i << " -> " << place.toString() << "\n";
+                    }
+                    std::vector<Coord>().swap(h_init_placement);
+                }
+                // =============================
+            }
 
             // initialize inverse placement
-            CUDA_CHECK(cudaMemsetAsync(d_inv_placement, 0xFF, topo.extent().volume() * sizeof(uint32_t), stream));
+            CUDA_CHECK(cudaMemsetAsync(d_inv_placement, 0xFF, static_cast<size_t>(curr_batch) * volume * sizeof(uint32_t), stream));
             {
                 // launch configuration - inverse placement kernel
                 int threads_per_block = 128;
-                int num_threads_needed = num_nodes; // 1 thread per node
+                int num_threads_needed = curr_batch * num_nodes; // 1 thread per node
                 int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - inverse placement kernel
                 LAUNCH(cfg) TID(tid) RUN << "inverse placement kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
                 inverse_placement_kernel<T><<<blocks, threads_per_block, 0, stream>>>(
                     d_placement,
                     num_nodes,
+                    curr_batch,
+                    volume,
                     d_inv_placement
                 );
                 DBG(cfg) CUDA_CHECK(cudaGetLastError());
@@ -396,14 +422,14 @@ int main(int argc, char** argv) {
             // =============================
             // print some temporary results
             LOG(cfg) {
-                std::vector<uint32_t> inv_place_tmp(topo.extent().volume());
-                CUDA_CHECK(cudaMemcpyAsync(inv_place_tmp.data(), d_inv_placement, topo.extent().volume() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+                std::vector<uint32_t> inv_place_tmp(volume);
+                CUDA_CHECK(cudaMemcpyAsync(inv_place_tmp.data(), d_inv_placement, volume * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
-                std::cout TID(tid) << "Initial inverse placement:\n";
+                std::cout TID(tid) << "Initial inverse placement (attempt " << batch_begin << "):\n";
                 uint32_t neigh_rotator = 0u;
                 Coord place;
                 place.setAll(0);
-                for (uint32_t i = 0; i < std::min<uint32_t>(topo.extent().volume(), VERBOSE_LENGTH); ++i) {
+                for (uint32_t i = 0; i < std::min<uint32_t>(volume, VERBOSE_LENGTH); ++i) {
                     std::cout TID(tid) << "  plc " << place.toString() << " -> " << inv_place_tmp[topo.flattenedIdx(place)] << "\n";
                     while (!topo.contains(topo.neighbor(place, neigh_rotator)))
                         neigh_rotator = (neigh_rotator + 1) % T::neighborsCount();
@@ -414,7 +440,7 @@ int main(int argc, char** argv) {
             }
             // =============================
 
-            // run force-directed refinement
+            // run force-directed refinement over the whole batch
             forceDirectedRefinement<T>(
                 cfg,
                 props,
@@ -424,16 +450,16 @@ int main(int argc, char** argv) {
                 d_touching_offsets,
                 d_hedge_weights,
                 num_nodes,
+                curr_batch,
+                volume,
                 d_placement,
                 d_inv_placement,
                 stream,
                 tid
             );
 
-            // grade present solution
-            float src_dst_distance;
-            float steiner_span;
-            std::tie(src_dst_distance, steiner_span) = getLocalityMetrics<T>(
+            // grade every solution in the batch
+            getLocalityMetrics<T>(
                 cfg,
                 d_placement,
                 d_hedges,
@@ -441,38 +467,55 @@ int main(int argc, char** argv) {
                 d_srcs_count,
                 d_hedge_weights,
                 num_hedges,
+                num_nodes,
+                curr_batch,
+                d_src_dst_distance,
+                d_steiner_span,
                 stream,
                 tid
             );
-            // TODO: tune these two coefficients
-            float curr_whops = 0.4 * src_dst_distance + 0.6 * steiner_span; // lower is better
+
+            CUDA_CHECK(cudaMemcpyAsync(h_src_dst_distance.data(), d_src_dst_distance, curr_batch * sizeof(float), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(h_steiner_span.data(), d_steiner_span, curr_batch * sizeof(float), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
 
             // update current best solution
-            #pragma omp critical
-            {
+            for (uint32_t start = 0; start < curr_batch; start++) {
+                // TODO: tune these two coefficients
+                const float curr_whops = 0.4 * h_src_dst_distance[start] + 0.6 * h_steiner_span[start]; // lower is better
+
                 if (curr_whops < best_whops) {
                     best_whops = curr_whops;
-                    CUDA_CHECK(cudaMemcpyAsync(d_best_placement, d_placement, num_nodes * sizeof(Coord), cudaMemcpyDeviceToDevice, stream));
-                    CUDA_CHECK(cudaMemcpyAsync(d_best_inv_placement, d_inv_placement, topo.extent().volume() * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(d_best_placement, d_placement + start * num_nodes, num_nodes * sizeof(Coord), cudaMemcpyDeviceToDevice, stream));
+                    // the winner's node idxs are batch-flat, rebase them - this is the result the rest of the tool reads
+                    thrust::device_ptr<const uint32_t> t_start_inv_placement(d_inv_placement + static_cast<size_t>(start) * volume);
+                    thrust::device_ptr<uint32_t> t_best_inv_placement(d_best_inv_placement);
+                    thrust::transform(
+                        thrust_exec,
+                        t_start_inv_placement, t_start_inv_placement + volume,
+                        t_best_inv_placement,
+                        rebase_node_idx{start * num_nodes}
+                    );
                     CUDA_CHECK(cudaStreamSynchronize(stream));
-                    INFO(cfg) std::cout TID(tid) << "Updated best placement: whops=" << std::fixed << std::setprecision(3) << curr_whops << "\n";
+                    INFO(cfg) std::cout TID(tid) << "Updated best placement: attempt=" << batch_begin + start << " whops=" << std::fixed << std::setprecision(3) << curr_whops << "\n";
                 } else {
-                    INFO(cfg) std::cout TID(tid) << "Discarded placement: whops=" << std::fixed << std::setprecision(3) << curr_whops << " < " << best_whops << "\n";
+                    INFO(cfg) std::cout TID(tid) << "Discarded placement: attempt=" << batch_begin + start << " whops=" << std::fixed << std::setprecision(3) << curr_whops << " > " << best_whops << "\n";
                 }
             }
 
-            CUDA_CHECK(cudaFreeAsync(d_placement, stream));
-            CUDA_CHECK(cudaFreeAsync(d_inv_placement, stream));
-            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
-
-            CUDA_CHECK(cudaEventRecord(d_time_attempt_stop, stream));
-            CUDA_CHECK(cudaEventSynchronize(d_time_attempt_stop));
-            float d_attempt_ms = 0.0f;
-            CUDA_CHECK(cudaEventElapsedTime(&d_attempt_ms, d_time_attempt_start, d_time_attempt_stop));
-            CUDA_CHECK(cudaEventDestroy(d_time_attempt_start));
-            CUDA_CHECK(cudaEventDestroy(d_time_attempt_stop));
-            avg_attempt_time += d_attempt_ms;
+            CUDA_CHECK(cudaEventRecord(d_time_batch_stop, stream));
+            CUDA_CHECK(cudaEventSynchronize(d_time_batch_stop));
+            float d_batch_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&d_batch_ms, d_time_batch_start, d_time_batch_stop));
+            CUDA_CHECK(cudaEventDestroy(d_time_batch_start));
+            CUDA_CHECK(cudaEventDestroy(d_time_batch_stop));
+            avg_attempt_time += d_batch_ms;
         }
+
+        CUDA_CHECK(cudaFree(d_placement));
+        CUDA_CHECK(cudaFree(d_inv_placement));
+        CUDA_CHECK(cudaFree(d_src_dst_distance));
+        CUDA_CHECK(cudaFree(d_steiner_span));
 
         // copy back results
         std::vector<Coord> h_placement(num_nodes);
@@ -521,8 +564,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        for (uint32_t i = 0; i < num_threads; ++i)
-            CUDA_CHECK(cudaStreamDestroy(streams[i]));
+        CUDA_CHECK(cudaStreamDestroy(stream));
 
         CUDA_CHECK(cudaEventRecord(d_time_stop));
         CUDA_CHECK(cudaEventSynchronize(d_time_stop));

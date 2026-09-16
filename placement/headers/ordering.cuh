@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
@@ -21,6 +22,7 @@ using namespace config_plc;
 uint32_t* locality_ordering(
     const runconfig &cfg,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
     const uint32_t num_hedges,
     const dim_t hedges_size,
     const uint32_t* d_hedges,
@@ -38,7 +40,8 @@ void split_partitions_rand(
     uint32_t* d_partitions,
     uint32_t num_nodes,
     uint32_t num_parts,
-    curandGenerator_t gen,
+    uint32_t batch_size,
+    const std::vector<curandGenerator_t> &gens,
     const cudaStream_t stream,
     const int tid
 );
@@ -46,10 +49,16 @@ void split_partitions_rand(
 
 // KERNELS
 
+// NOTE: every kernel below runs a whole batch of multi-starts at once
+// => per-multi-start arrays are one flat allocation of "batch_size" equally-sized segments, multi-start "b" owning [b*size, (b+1)*size)
+// => partition ids are composite, "b*num_parts + p", which survives both the "*2" of a bisection and the ">>1" of a fold
+// => node idxs are batch-flat, hypergraph pin idxs are not
+
 __global__
 void split_partitions_kernel(
     const uint32_t* __restrict__ part_offsets,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
     uint32_t* __restrict__ partitions
 );
 
@@ -58,7 +67,9 @@ void flag_cutnet_events_kernel(
     const uint32_t* __restrict__ part_pins,
     const dim_t* __restrict__ hedges_offsets,
     const uint32_t num_hedges,
-    dim_t* __restrict__ flags
+    const uint32_t batch_size,
+    const dim_t hedges_size,
+    uint32_t* __restrict__ flags
 );
 
 __global__
@@ -66,8 +77,10 @@ void cutnet_event_generation_kernel(
     const uint32_t* __restrict__ part_pins,
     const dim_t* __restrict__ hedges_offsets,
     const float* __restrict__ hedge_weights,
-    const dim_t* __restrict__ flags,
+    const uint32_t* __restrict__ flags,
     const uint32_t num_hedges,
+    const uint32_t batch_size,
+    const dim_t hedges_size,
     float* __restrict__ event_weight,
     uint32_t* __restrict__ event_part
 );
@@ -81,9 +94,9 @@ void label_propagation_kernel(
     const float* __restrict__ hedge_weights,
     const uint32_t* __restrict__ partitions,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     bool* __restrict__ moves,
-    uint32_t* __restrict__ even_event_idx,
-    uint32_t* __restrict__ odd_event_idx,
     float* __restrict__ scores
 );
 
@@ -91,10 +104,10 @@ __global__
 void label_move_events_kernel(
     const bool* __restrict__ moves,
     const float* __restrict__ scores,
-    const uint32_t* __restrict__ even_ev_idx,
-    const uint32_t* __restrict__ odd_ev_idx,
     const uint32_t* __restrict__ partitions,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
+    const uint8_t* __restrict__ active,
     uint32_t* __restrict__ even_ev_partition,
     float* __restrict__ even_ev_score,
     uint32_t* __restrict__ even_ev_node,
@@ -117,8 +130,8 @@ void label_cascade_kernel(
     const uint32_t* __restrict__ odd_ranks,
     const uint32_t* __restrict__ even_event_node,
     const uint32_t* __restrict__ odd_event_node,
-    const uint32_t even_events_count,
-    const uint32_t odd_events_count,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
     float* __restrict__ even_event_score
 );
 
@@ -130,7 +143,8 @@ void apply_move_events_kernel(
     const uint32_t* __restrict__ part_even_event_offsets,
     const uint32_t* __restrict__ part_odd_event_offsets,
     const uint32_t* __restrict__ odd_event_node,
-    const uint32_t even_events_count,
+    const uint32_t num_nodes,
+    const uint32_t batch_size,
     uint32_t* __restrict__ partitions
 );
 
@@ -140,6 +154,7 @@ void update_best_partitions_kernel(
     const float* __restrict__ cutnet,
     const float* __restrict__ last_best_cutnet,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
     uint32_t* __restrict__ last_best_partitions
 );
 
@@ -154,14 +169,23 @@ void sibling_tree_connection_strength_kernel(
     const uint32_t* __restrict__ ord_part,
     const uint32_t* __restrict__ partitions,
     const uint32_t num_nodes,
-    float* __restrict__ scores
+    const uint32_t batch_size,
+    float* __restrict__ slot_scores
 );
 
 __global__
 void flag_reversals_kernel(
     const float* __restrict__ sibling_score,
     const uint32_t num_parts,
+    const uint32_t batch_size,
     bool* __restrict__ reverse
+);
+
+__global__
+void labelprop_activity_kernel(
+    const uint32_t* __restrict__ apply_up_to,
+    const uint32_t num_part_pairs,
+    uint8_t* __restrict__ active
 );
 
 __global__

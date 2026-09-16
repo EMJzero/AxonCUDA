@@ -36,6 +36,7 @@ void warpForEachTouchingPin(
     const float* __restrict__ hedge_weights,
     const uint32_t* __restrict__ my_touching,
     const uint32_t touching_count,
+    const uint32_t nodes_base, // offset of the multi-start owning these pins, 0 outside of batched kernels
     const uint32_t lane_id,
     uint32_t* __restrict__ sm_hedge_idx,
     uint32_t* __restrict__ sm_hedge_cum,
@@ -67,7 +68,7 @@ void warpForEachTouchingPin(
                 if (sm_hedge_cum[mid] <= flat_pos) lo = mid; else hi = mid - 1u;
             }
             const uint32_t pin = hedges[hedges_offsets[sm_hedge_idx[lo]] + (flat_pos - sm_hedge_cum[lo])];
-            fn(pin, sm_hedge_weight[lo]);
+            fn(nodes_base + pin, sm_hedge_weight[lo]); // pins are node idxs local to a multi-start, rebase them
         }
         __syncwarp(); // every lane must be done reading this group's scratch before the next group overwrites it
     }
