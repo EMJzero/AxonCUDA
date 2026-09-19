@@ -15,12 +15,13 @@
 
 namespace constraints {
 
-    std::vector<uint32_t> partitionSequential(const hgraph::HyperGraph& hg, uint32_t N, uint32_t M, uint32_t K) {
+    std::vector<uint32_t> partitionSequential(const hgraph::HyperGraph& hg, uint32_t N, uint32_t M, uint32_t Q, uint32_t K) {
         std::vector<uint32_t> partitioning;
         partitioning.reserve(hg.nodes());
 
         std::unordered_set<uint32_t> inbound_edges;
         uint32_t assigned_nodes = 0;
+        uint32_t assigned_pins = 0;
         uint32_t current_partition = 0;
 
         for (std::uint32_t node = 0; node < hg.nodes(); ++node) {
@@ -28,12 +29,15 @@ namespace constraints {
 
             const auto& current_inbound = hg.inboundIds(node);
             inbound_edges.insert(current_inbound.begin(), current_inbound.end());
+            // a node contributes one pin per inbound hedge, no matter how many of them the partition already holds
+            assigned_pins += (uint32_t)current_inbound.size();
 
-            if (assigned_nodes > N || inbound_edges.size() > M) {
+            if (assigned_nodes > N || inbound_edges.size() > M || assigned_pins > Q) {
                 // start a new partition
                 assigned_nodes = 1;
                 inbound_edges.clear();
                 inbound_edges.insert(current_inbound.begin(), current_inbound.end());
+                assigned_pins = (uint32_t)current_inbound.size();
                 ++current_partition;
                 if (current_partition >= K) {
                     throw std::runtime_error("Exceeded maximum number of partitions K = " + std::to_string(K) + ".");
@@ -59,6 +63,11 @@ namespace constraints {
                         std::cout << "HG CAN'T FIT CONSTRAINTS: more inbound hedges on a partition than allowed\n";
                     return false;
                 }
+                if (hg.inboundIds(n).size() > pins_per_part_) {
+                    if (verbose)
+                        std::cout << "HG CAN'T FIT CONSTRAINTS: more pins on a partition than allowed\n";
+                    return false;
+                }
             }
             return true;
         }
@@ -75,10 +84,15 @@ namespace constraints {
                     std::cout << "HG CAN'T FIT CONSTRAINTS: more inbound hedges on a single node than one partition can handle\n";
                 return false;
             }
+            if (hg.inboundIds(n).size() > pins_per_part_) {
+                if (verbose)
+                    std::cout << "HG CAN'T FIT CONSTRAINTS: more pins on a single node than one partition can handle\n";
+                return false;
+            }
         }
 
         try {
-            (void)partitionSequential(hg, nodes_per_part_, inbound_per_part_, max_parts_);
+            (void)partitionSequential(hg, nodes_per_part_, inbound_per_part_, pins_per_part_, max_parts_);
         } catch (...) {
             if (verbose)
                 std::cout << "HG WON'T LIKELY FIT CONSTRAINTS: no valid way to greedily split nodes among partitions\n";
@@ -120,9 +134,10 @@ namespace constraints {
                 throw std::runtime_error("Partitions must be incrementally indexed from 0 onward.");
         }
 
-        std::vector<uint32_t> synapses_per_partition(partitions_count, 0);
+        std::vector<uint32_t> inbound_per_partition(partitions_count, 0);
+        std::vector<uint32_t> pins_per_partition(partitions_count, 0);
 
-        // for each hyperedge, count distinct inbound connections per partition
+        // for each hyperedge, count distinct inbound connections per partition, and every pin it lands there
         for (const auto& he : snn.hedges()) {
             std::unordered_set<uint32_t> already_seen;
             already_seen.reserve(he.length());
@@ -130,16 +145,22 @@ namespace constraints {
             for (auto node : he.destinations()) {
                 uint32_t partition = partitions[node];
                 if (!already_seen.count(partition)) {
-                    ++synapses_per_partition[partition];
+                    ++inbound_per_partition[partition];
                     already_seen.insert(partition);
                 }
+                ++pins_per_partition[partition];
             }
         }
 
         for (uint32_t i = 0; i < partitions_count; ++i) {
-            if (synapses_per_partition[i] > inbound_per_part_) {
+            if (inbound_per_partition[i] > inbound_per_part_) {
                 if (verbose)
-                    std::cout << "INVALID PARTITIONING: more inbound hedges per partition (" << synapses_per_partition[i] << ") than allowed (" << inbound_per_part_ << ")\n";
+                    std::cout << "INVALID PARTITIONING: more inbound hedges per partition (" << inbound_per_partition[i] << ") than allowed (" << inbound_per_part_ << ")\n";
+                return false;
+            }
+            if (pins_per_partition[i] > pins_per_part_) {
+                if (verbose)
+                    std::cout << "INVALID PARTITIONING: more pins per partition (" << pins_per_partition[i] << ") than allowed (" << pins_per_part_ << ")\n";
                 return false;
             }
         }
@@ -197,6 +218,7 @@ namespace constraints {
         cfg_loihi_large.name = "Loihi Large";
         cfg_loihi_large.nodes_per_part = 1024;
         cfg_loihi_large.inbound_per_part = 4096;
+        cfg_loihi_large.pins_per_part = 16384;
         cfg_loihi_large.max_parts = 4096;
         return Constraints(cfg_loihi_large);
     }
@@ -206,6 +228,7 @@ namespace constraints {
         cfg_loihi_jin_84.name = "Loihi Jin 84";
         cfg_loihi_jin_84.nodes_per_part = 4096;
         cfg_loihi_jin_84.inbound_per_part = 1024*64;
+        cfg_loihi_jin_84.pins_per_part = 1024*256;
         cfg_loihi_jin_84.max_parts = 7056;
         return Constraints(cfg_loihi_jin_84);
     }
@@ -215,6 +238,7 @@ namespace constraints {
         cfg_loihi_jin_1024.name = "Loihi Jin 1024";
         cfg_loihi_jin_1024.nodes_per_part = 4096;
         cfg_loihi_jin_1024.inbound_per_part = 1024*64;
+        cfg_loihi_jin_1024.pins_per_part = 1024*256;
         cfg_loihi_jin_1024.max_parts = 1048576;
         return Constraints(cfg_loihi_jin_1024);
     }
@@ -224,6 +248,7 @@ namespace constraints {
         cfg_truenorth.name = "TrueNorth";
         cfg_truenorth.nodes_per_part = 256;
         cfg_truenorth.inbound_per_part = 256;
+        cfg_truenorth.pins_per_part = 16384;
         cfg_truenorth.max_parts = 4096;
         return Constraints(cfg_truenorth);
     }

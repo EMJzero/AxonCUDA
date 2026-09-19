@@ -25,17 +25,21 @@ void refinementRepeats(
     const uint32_t *d_inbound_count,
     const float *d_hedge_weights,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t level_idx,
     const uint32_t curr_num_nodes,
     const uint32_t num_hedges,
     const uint32_t num_partitions,
     const dim_t touching_size,
     const bool update_final_inbound_counts,
+    const uint32_t h_max_nodes_per_part,
+    const uint32_t h_max_pins_per_part,
     uint32_t *d_pairs,
     float *d_f_scores,
     uint32_t *d_partitions,
     uint32_t *d_partitions_sizes,
-    uint32_t *d_partitions_inbound_sizes
+    uint32_t *d_partitions_inbound_sizes,
+    uint32_t *d_partitions_pins
 ) {
     // prepare this level's pins per partition
     // NOTE: the inbound counters per partition are just the transposed of pins per partition! No need to compute them separately!
@@ -58,17 +62,21 @@ void refinementRepeats(
             d_inbound_count,
             d_hedge_weights,
             d_nodes_sizes,
+            d_nodes_pins,
             level_idx,
             curr_num_nodes,
             num_hedges,
             num_partitions,
             touching_size,
             update_final_inbound_counts,
+            h_max_nodes_per_part,
+            h_max_pins_per_part,
             d_pairs,
             d_f_scores,
             d_partitions,
             d_partitions_sizes,
-            d_partitions_inbound_sizes
+            d_partitions_inbound_sizes,
+            d_partitions_pins
         );
     }
     // |
@@ -233,19 +241,24 @@ void refinementRepeats(
         thrust::inclusive_scan(t_scores, t_scores + curr_num_nodes, t_scores); // in-place (we don't need scores anymore anyway)
         // Remember: moves never get re-ranked (re-sorted) after the first time with in-isolation gains. Keep them like that and just find the valid sequence of maximum gain! This is an heuristics!
         // ======================================
-        // extra step: compute moves validity by size (same HP as the kernel above: all previous higher-gain moves will be applied)
+        // extra step: compute moves validity by size and by inbound pins (same HP as the kernel above: all previous higher-gain moves will be applied)
         // explode each move into two events, one decrementing and incrementing the size of the src and dst partition respectively
         // => seeing each move as two distinct events makes us able to identify sequences of useful events first, then moves
+        // NOTE: an event's (partition, rank) key does not depend on the quantity it carries, and inbound pins are additive
+        //       exactly like sizes, hence both quantities ride the same events, the same key array, and the same sort
         uint32_t *d_size_events_partition = nullptr; // size_events_partition[ev] -> partition affected by the event
         uint32_t *d_size_events_index = nullptr; // size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
         int32_t *d_size_events_delta = nullptr; // size_events_delta[ev] -> size variation brought by the event
+        int32_t *d_pins_events_delta = nullptr; // pins_events_delta[ev] -> inbound pins variation brought by the event
         const uint32_t num_size_events = 2 * curr_num_nodes;
         CUDA_CHECK(cudaMalloc(&d_size_events_partition, num_size_events * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&d_size_events_index, num_size_events * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&d_size_events_delta, num_size_events * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_pins_events_delta, num_size_events * sizeof(int32_t)));
         thrust::device_ptr<uint32_t> t_size_events_partition(d_size_events_partition);
         thrust::device_ptr<uint32_t> t_size_events_index(d_size_events_index);
         thrust::device_ptr<int32_t> t_size_events_delta(d_size_events_delta);
+        thrust::device_ptr<int32_t> t_pins_events_delta(d_pins_events_delta);
         {
             // launch configuration - build size events kernel
             int threads_per_block = 128;
@@ -259,26 +272,34 @@ void refinementRepeats(
                 d_ranks,
                 d_partitions,
                 d_nodes_sizes,
+                d_nodes_pins,
                 curr_num_nodes,
                 d_size_events_partition,
                 d_size_events_index,
-                d_size_events_delta
+                d_size_events_delta,
+                d_pins_events_delta
             );
             DBG(cfg) CUDA_CHECK(cudaGetLastError());
             DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
 
-        // sort events by (partition, rank) [in lexicographical order for the tuple] and carry size_events_delta along
+        // sort events by (partition, rank) [in lexicographical order for the tuple] and carry both deltas along
         auto size_events_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_size_events_partition, t_size_events_index));
         auto size_events_key_end = size_events_key_begin + num_size_events;
-        thrust::sort_by_key(size_events_key_begin, size_events_key_end, t_size_events_delta);
-        // inclusive scan inside each key (= partition) on the event deltas => for each event we get the cumulative size delta for that partition at that point in the sequence
+        auto size_events_deltas_begin = thrust::make_zip_iterator(thrust::make_tuple(t_size_events_delta, t_pins_events_delta));
+        thrust::sort_by_key(size_events_key_begin, size_events_key_end, size_events_deltas_begin);
+        // inclusive scan inside each key (= partition) on the event deltas => for each event we get the cumulative size and pins deltas for that partition at that point in the sequence
         thrust::inclusive_scan_by_key(t_size_events_partition, t_size_events_partition + num_size_events, t_size_events_delta, t_size_events_delta);
-        // now mark moves that would violate size constraint if the sequence were to end on them
+        thrust::inclusive_scan_by_key(t_size_events_partition, t_size_events_partition + num_size_events, t_pins_events_delta, t_pins_events_delta);
+        // now mark moves that would violate the size or the pins constraint if the sequence were to end on them
         int32_t *d_valid_moves = nullptr;
+        int32_t *d_pins_valid_moves = nullptr;
         CUDA_CHECK(cudaMalloc(&d_valid_moves, curr_num_nodes * sizeof(int32_t))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
+        CUDA_CHECK(cudaMalloc(&d_pins_valid_moves, curr_num_nodes * sizeof(int32_t))); // pins_valid_move[rank idx] -> same, w.r.t. the inbound pins constraint
         CUDA_CHECK(cudaMemset(d_valid_moves, 0x00, curr_num_nodes * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_pins_valid_moves, 0x00, curr_num_nodes * sizeof(int32_t)));
         thrust::device_ptr<int32_t> t_valid_moves(d_valid_moves);
+        thrust::device_ptr<int32_t> t_pins_valid_moves(d_pins_valid_moves);
         
         {
             // launch configuration - flag size events kernel
@@ -293,7 +314,20 @@ void refinementRepeats(
                 d_size_events_delta,
                 d_partitions_sizes,
                 num_size_events,
+                h_max_nodes_per_part,
                 d_valid_moves
+            );
+            // launch - flag pins events kernel
+            // NOTE: same kernel over the same events, it only cares that the per-node quantity is additive
+            LAUNCH(cfg) RUN << "flag pins events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            flag_size_events_kernel<<<blocks, threads_per_block>>>(
+                d_size_events_partition,
+                d_size_events_index,
+                d_pins_events_delta,
+                d_partitions_pins,
+                num_size_events,
+                h_max_pins_per_part,
+                d_pins_valid_moves
             );
             DBG(cfg) CUDA_CHECK(cudaGetLastError());
             DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
@@ -301,9 +335,11 @@ void refinementRepeats(
         CUDA_CHECK(cudaFree(d_size_events_partition));
         CUDA_CHECK(cudaFree(d_size_events_index));
         CUDA_CHECK(cudaFree(d_size_events_delta));
+        CUDA_CHECK(cudaFree(d_pins_events_delta));
         // compute, as of each event, the cumulative number of partitions that are invalid by summing the count of those made/unmade invalid at each event
         thrust::inclusive_scan(t_valid_moves, t_valid_moves + curr_num_nodes, t_valid_moves);
-        
+        thrust::inclusive_scan(t_pins_valid_moves, t_pins_valid_moves + curr_num_nodes, t_pins_valid_moves);
+
         // ======================================
         // preparatory step: update pins per partition into inbound (only) pins partition
         // simultaneously, also correct the calculation for partitions_inbound_sizes by removing outbounds
@@ -500,20 +536,26 @@ void refinementRepeats(
         // find the move in the sequence that yields both the highest gain and a valid state (when all moves before it are applied)
         // index space 0..curr_num_nodes - 1
         auto idx_begin = thrust::make_counting_iterator<uint32_t>(0);
-        // functor comparing sequence entries, skipping invalid ones by inbound size (only 0 allowed), prioritizing size events (zero or negative), and then picking the highest score
-        best_move_functor best_scores { thrust::raw_pointer_cast(t_scores), thrust::raw_pointer_cast(t_valid_moves), thrust::raw_pointer_cast(t_inbound_valid_moves) };
+        // functor comparing sequence entries, skipping invalid ones by inbound size (only 0 allowed), prioritizing size and pins events (zero or negative), and then picking the highest score
+        best_move_functor best_scores { thrust::raw_pointer_cast(t_scores), thrust::raw_pointer_cast(t_valid_moves), thrust::raw_pointer_cast(t_inbound_valid_moves), thrust::raw_pointer_cast(t_pins_valid_moves) };
         // max over valid endpoints only, find the point in the sequence of moves where applying them further never nets a higher gain in a valid state
         auto best_iterator_entry = thrust::max_element(idx_begin, idx_begin + curr_num_nodes, best_scores);
-        const uint32_t best_rank = *best_iterator_entry;
+        uint32_t best_rank = *best_iterator_entry;
+#ifdef ABLATE_ONE_MOVE_PER_ROUND
+        // Ablation (evaluation.md 4.10): conservative one-move-per-round apply --
+        // take only the single highest-gain move instead of the best improving valid prefix.
+        best_rank = 0u;
+#endif
         const uint32_t num_good_moves = best_rank + 1; // "+1" to make this the improving moves count, rather than the last improving move's idx
         // validity double-check
-        int32_t size_validity, inbounds_validity;
+        int32_t size_validity, inbounds_validity, pins_validity;
         float acquired_gain;
         CUDA_CHECK(cudaMemcpy(&size_validity, d_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(&inbounds_validity, d_inbound_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&pins_validity, d_pins_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(&acquired_gain, d_f_scores + best_rank, sizeof(float), cudaMemcpyDeviceToHost));
         INFO(cfg) std::cout << "Best fm-ref move:\n  Move rank: " << best_rank << ", Acquired gain: " << acquired_gain << "\n";
-        if (size_validity <= 0 && inbounds_validity <= 0 && acquired_gain >= 0) {
+        if (size_validity <= 0 && inbounds_validity <= 0 && pins_validity <= 0 && acquired_gain >= 0) {
             // launch configuration - fm-ref apply kernel
             int threads_per_block = 128;
             int num_threads_needed = curr_num_nodes; // 1 thread per move to apply
@@ -526,12 +568,14 @@ void refinementRepeats(
                 d_pairs,
                 d_ranks,
                 d_nodes_sizes,
+                d_nodes_pins,
                 num_hedges,
                 curr_num_nodes,
                 num_partitions,
                 num_good_moves,
                 d_partitions,
-                d_partitions_sizes
+                d_partitions_sizes,
+                d_partitions_pins
                 //d_pins_per_partitions
             );
             DBG(cfg) CUDA_CHECK(cudaGetLastError());
@@ -539,9 +583,10 @@ void refinementRepeats(
         } else {
             INFO(cfg) {
                 std::cout << "No valid refinement move found on level " << level_idx << " - reason: "
-                    << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : "negative gain")) << "\n";
+                    << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : (pins_validity > 0 ? "pins validity" : "negative gain"))) << "\n";
                 if (size_validity > 0) std::cout << "  Size constraint violations variation amount (in nodes above the limit): " << size_validity << "\n";
                 if (inbounds_validity > 0) std::cout << "  Inbound constraint violations variation (in invalid partitions): " << inbounds_validity << "\n";
+                if (pins_validity > 0) std::cout << "  Pins constraint violations variation amount (in pins above the limit): " << pins_validity << "\n";
             }
             if (size_validity > 0 && !chainup) chainup = true; // enable chaining when no moves are available via greedy sorting because of size constraints
             else if (fm_repeat < cfg.refine_repeats / 3) fm_repeat = cfg.refine_repeats / 2;
@@ -551,6 +596,7 @@ void refinementRepeats(
         CUDA_CHECK(cudaFree(d_ranks));
         CUDA_CHECK(cudaFree(d_valid_moves));
         CUDA_CHECK(cudaFree(d_inbound_valid_moves));
+        CUDA_CHECK(cudaFree(d_pins_valid_moves));
     }
 
     // recompute inbound set sizes
@@ -601,17 +647,21 @@ void refinementSparseRepeats(
     const uint32_t *d_inbound_count,
     const float *d_hedge_weights,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t level_idx,
     const uint32_t curr_num_nodes,
     const uint32_t num_hedges,
     const uint32_t num_partitions,
     const dim_t touching_size,
     const bool update_final_inbound_counts,
+    const uint32_t h_max_nodes_per_part,
+    const uint32_t h_max_pins_per_part,
     uint32_t *d_pairs,
     float *d_f_scores,
     uint32_t *d_partitions,
     uint32_t *d_partitions_sizes,
-    uint32_t *d_partitions_inbound_sizes
+    uint32_t *d_partitions_inbound_sizes,
+    uint32_t *d_partitions_pins
 ) {
     /*
     * IDEA for the pins-per-partition sparse data structure:
@@ -909,18 +959,23 @@ void refinementSparseRepeats(
         INFO(cfg) std::cout << "Refinement sparse events construction: " << num_size_events << " size events, " << num_inbound_events << " inbound events\n";
 
         // ======================================
-        // extra step: compute moves validity by size (same HP as the kernel above: all previous higher-gain moves will be applied)
+        // extra step: compute moves validity by size and by inbound pins (same HP as the kernel above: all previous higher-gain moves will be applied)
         // explode each move into two events, one decrementing and incrementing the size of the src and dst partition respectively
         // => seeing each move as two distinct events makes us able to identify sequences of useful events first, then moves
+        // NOTE: an event's (partition, rank) key does not depend on the quantity it carries, and inbound pins are additive
+        //       exactly like sizes, hence both quantities ride the same events, the same key array, and the same sort
         uint32_t *d_size_events_partition = nullptr; // size_events_partition[ev] -> partition affected by the event
         uint32_t *d_size_events_index = nullptr; // size_events_index[ev] -> sequence position / idx of the move (w.r.t. d_ranks) that originated the event
         int32_t *d_size_events_delta = nullptr; // size_events_delta[ev] -> size variation brought by the event
+        int32_t *d_pins_events_delta = nullptr; // pins_events_delta[ev] -> inbound pins variation brought by the event
         CUDA_CHECK(cudaMalloc(&d_size_events_partition, num_size_events * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&d_size_events_index, num_size_events * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&d_size_events_delta, num_size_events * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_pins_events_delta, num_size_events * sizeof(int32_t)));
         thrust::device_ptr<uint32_t> t_size_events_partition(d_size_events_partition);
         thrust::device_ptr<uint32_t> t_size_events_index(d_size_events_index);
         thrust::device_ptr<int32_t> t_size_events_delta(d_size_events_delta);
+        thrust::device_ptr<int32_t> t_pins_events_delta(d_pins_events_delta);
         {
             // launch configuration - build size events sparse kernel
             int threads_per_block = 128;
@@ -934,28 +989,36 @@ void refinementSparseRepeats(
                 d_ranks,
                 d_partitions,
                 d_nodes_sizes,
+                d_nodes_pins,
                 d_size_events_offsets,
                 curr_num_nodes,
                 d_size_events_partition,
                 d_size_events_index,
-                d_size_events_delta
+                d_size_events_delta,
+                d_pins_events_delta
             );
             DBG(cfg) CUDA_CHECK(cudaGetLastError());
             DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
         }
         CUDA_CHECK(cudaFree(d_size_events_offsets));
 
-        // sort events by (partition, rank) [in lexicographical order for the tuple] and carry size_events_delta along
+        // sort events by (partition, rank) [in lexicographical order for the tuple] and carry both deltas along
         auto size_events_key_begin = thrust::make_zip_iterator(thrust::make_tuple(t_size_events_partition, t_size_events_index));
         auto size_events_key_end = size_events_key_begin + num_size_events;
-        thrust::sort_by_key(size_events_key_begin, size_events_key_end, t_size_events_delta);
-        // inclusive scan inside each key (= partition) on the event deltas => for each event we get the cumulative size delta for that partition at that point in the sequence
+        auto size_events_deltas_begin = thrust::make_zip_iterator(thrust::make_tuple(t_size_events_delta, t_pins_events_delta));
+        thrust::sort_by_key(size_events_key_begin, size_events_key_end, size_events_deltas_begin);
+        // inclusive scan inside each key (= partition) on the event deltas => for each event we get the cumulative size and pins deltas for that partition at that point in the sequence
         thrust::inclusive_scan_by_key(t_size_events_partition, t_size_events_partition + num_size_events, t_size_events_delta, t_size_events_delta);
-        // now mark moves that would violate size constraint if the sequence were to end on them
+        thrust::inclusive_scan_by_key(t_size_events_partition, t_size_events_partition + num_size_events, t_pins_events_delta, t_pins_events_delta);
+        // now mark moves that would violate the size or the pins constraint if the sequence were to end on them
         int32_t *d_valid_moves = nullptr;
+        int32_t *d_pins_valid_moves = nullptr;
         CUDA_CHECK(cudaMalloc(&d_valid_moves, curr_num_nodes * sizeof(int32_t))); // valid_move[rank idx] -> 1 if applying all moves up to the idx one in the ordered sequence gives a valid state
+        CUDA_CHECK(cudaMalloc(&d_pins_valid_moves, curr_num_nodes * sizeof(int32_t))); // pins_valid_move[rank idx] -> same, w.r.t. the inbound pins constraint
         CUDA_CHECK(cudaMemset(d_valid_moves, 0x00, curr_num_nodes * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_pins_valid_moves, 0x00, curr_num_nodes * sizeof(int32_t)));
         thrust::device_ptr<int32_t> t_valid_moves(d_valid_moves);
+        thrust::device_ptr<int32_t> t_pins_valid_moves(d_pins_valid_moves);
         
         {
             // launch configuration - flag size events kernel
@@ -970,7 +1033,20 @@ void refinementSparseRepeats(
                 d_size_events_delta,
                 d_partitions_sizes,
                 num_size_events,
+                h_max_nodes_per_part,
                 d_valid_moves
+            );
+            // launch - flag pins events kernel
+            // NOTE: same kernel over the same events, it only cares that the per-node quantity is additive
+            LAUNCH(cfg) RUN << "flag pins events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            flag_size_events_kernel<<<blocks, threads_per_block>>>(
+                d_size_events_partition,
+                d_size_events_index,
+                d_pins_events_delta,
+                d_partitions_pins,
+                num_size_events,
+                h_max_pins_per_part,
+                d_pins_valid_moves
             );
             DBG(cfg) CUDA_CHECK(cudaGetLastError());
             DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
@@ -978,9 +1054,12 @@ void refinementSparseRepeats(
         CUDA_CHECK(cudaFree(d_size_events_partition));
         CUDA_CHECK(cudaFree(d_size_events_index));
         CUDA_CHECK(cudaFree(d_size_events_delta));
+        CUDA_CHECK(cudaFree(d_pins_events_delta));
         // compute, as of each event, the cumulative number of partitions that are invalid by summing the count of those made/unmade invalid at each event
         thrust::inclusive_scan(t_valid_moves, t_valid_moves + curr_num_nodes, t_valid_moves);
+        thrust::inclusive_scan(t_pins_valid_moves, t_pins_valid_moves + curr_num_nodes, t_pins_valid_moves);
 
+        // ======================================
         // ======================================
         // preparatory step: update pins per partition into inbound (only) pins partition
         // simultaneously, also correct the calculation for partitions_inbound_sizes by removing outbounds
@@ -1295,20 +1374,26 @@ void refinementSparseRepeats(
         // find the move in the sequence that yields both the highest gain and a valid state (when all moves before it are applied)
         // index space 0..curr_num_nodes - 1
         auto idx_begin = thrust::make_counting_iterator<uint32_t>(0);
-        // functor comparing sequence entries, skipping invalid ones by inbound size (only 0 allowed), prioritizing size events (zero or negative), and then picking the highest score
-        best_move_functor best_scores { thrust::raw_pointer_cast(t_scores), thrust::raw_pointer_cast(t_valid_moves), thrust::raw_pointer_cast(t_inbound_valid_moves) };
+        // functor comparing sequence entries, skipping invalid ones by inbound size (only 0 allowed), prioritizing size and pins events (zero or negative), and then picking the highest score
+        best_move_functor best_scores { thrust::raw_pointer_cast(t_scores), thrust::raw_pointer_cast(t_valid_moves), thrust::raw_pointer_cast(t_inbound_valid_moves), thrust::raw_pointer_cast(t_pins_valid_moves) };
         // max over valid endpoints only, find the point in the sequence of moves where applying them further never nets a higher gain in a valid state
         auto best_iterator_entry = thrust::max_element(idx_begin, idx_begin + curr_num_nodes, best_scores);
-        const uint32_t best_rank = *best_iterator_entry;
+        uint32_t best_rank = *best_iterator_entry;
+#ifdef ABLATE_ONE_MOVE_PER_ROUND
+        // Ablation (evaluation.md 4.10): conservative one-move-per-round apply --
+        // take only the single highest-gain move instead of the best improving valid prefix.
+        best_rank = 0u;
+#endif
         const uint32_t num_good_moves = best_rank + 1; // "+1" to make this the improving moves count, rather than the last improving move's idx
         // validity double-check
-        int32_t size_validity, inbounds_validity;
+        int32_t size_validity, inbounds_validity, pins_validity;
         float acquired_gain;
         CUDA_CHECK(cudaMemcpy(&size_validity, d_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(&inbounds_validity, d_inbound_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&pins_validity, d_pins_valid_moves + best_rank, sizeof(int32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(&acquired_gain, d_f_scores + best_rank, sizeof(float), cudaMemcpyDeviceToHost));
         INFO(cfg) std::cout << "Best fm-ref move:\n  Move rank: " << best_rank << ", Acquired gain: " << acquired_gain << "\n";
-        if (size_validity <= 0 && inbounds_validity <= 0 && acquired_gain >= 0) {
+        if (size_validity <= 0 && inbounds_validity <= 0 && pins_validity <= 0 && acquired_gain >= 0) {
             // launch configuration - fm-ref apply kernel
             int threads_per_block = 128;
             int num_threads_needed = curr_num_nodes; // 1 thread per move to apply
@@ -1321,12 +1406,14 @@ void refinementSparseRepeats(
                 d_pairs,
                 d_ranks,
                 d_nodes_sizes,
+                d_nodes_pins,
                 num_hedges,
                 curr_num_nodes,
                 num_partitions,
                 num_good_moves,
                 d_partitions,
-                d_partitions_sizes
+                d_partitions_sizes,
+                d_partitions_pins
                 //d_pins_per_partitions
             );
             DBG(cfg) CUDA_CHECK(cudaGetLastError());
@@ -1334,9 +1421,10 @@ void refinementSparseRepeats(
         } else {
             INFO(cfg) {
                 std::cout << "No valid refinement move found on level " << level_idx << " - reason: "
-                    << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : "negative gain")) << "\n";
+                    << (size_validity > 0 ? (inbounds_validity > 0 ? "both size and inbounds validities" : "size validity") : (inbounds_validity > 0 ? "inbounds validity" : (pins_validity > 0 ? "pins validity" : "negative gain"))) << "\n";
                 if (size_validity > 0) std::cout << "  Size constraint violations variation amount (in nodes above the limit): " << size_validity << "\n";
                 if (inbounds_validity > 0) std::cout << "  Inbound constraint violations variation (in invalid partitions): " << inbounds_validity << "\n";
+                if (pins_validity > 0) std::cout << "  Pins constraint violations variation amount (in pins above the limit): " << pins_validity << "\n";
             }
             if (size_validity > 0 && !chainup) chainup = true; // enable chaining when no moves are available via greedy sorting because of size constraints
             else if (fm_repeat < cfg.refine_repeats / 3) fm_repeat = cfg.refine_repeats / 2;
@@ -1346,6 +1434,7 @@ void refinementSparseRepeats(
         CUDA_CHECK(cudaFree(d_ranks));
         CUDA_CHECK(cudaFree(d_valid_moves));
         CUDA_CHECK(cudaFree(d_inbound_valid_moves));
+        CUDA_CHECK(cudaFree(d_pins_valid_moves));
     }
 
     CUDA_CHECK(cudaFree(d_ppp_offsets));
@@ -1391,10 +1480,12 @@ void logPartitions(
     const uint32_t *d_partitions,
     const uint32_t *d_partitions_sizes,
     const uint32_t *d_partitions_inbound_sizes,
+    const uint32_t *d_partitions_pins,
     const uint32_t curr_num_nodes,
     const uint32_t num_partitions,
     const uint32_t h_max_nodes_per_part,
-    const uint32_t h_max_inbound_per_part
+    const uint32_t h_max_inbound_per_part,
+    const uint32_t h_max_pins_per_part
 ) {
     std::vector<uint32_t> partitions_tmp(curr_num_nodes);
     CUDA_CHECK(cudaMemcpy(partitions_tmp.data(), d_partitions, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -1402,6 +1493,8 @@ void logPartitions(
     CUDA_CHECK(cudaMemcpy(partitions_sizes_tmp.data(), d_partitions_sizes, num_partitions * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     std::vector<uint32_t> partitions_inbound_sizes_tmp(num_partitions);
     CUDA_CHECK(cudaMemcpy(partitions_inbound_sizes_tmp.data(), d_partitions_inbound_sizes, num_partitions * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    std::vector<uint32_t> partitions_pins_tmp(num_partitions);
+    CUDA_CHECK(cudaMemcpy(partitions_pins_tmp.data(), d_partitions_pins, num_partitions * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     std::unordered_map<uint32_t, int> part_count;
     std::cout << "Partitioning results:\n";
     for (uint32_t i = 0; i < curr_num_nodes; ++i) {
@@ -1416,10 +1509,13 @@ void logPartitions(
     for (uint32_t i = 0; i < num_partitions; ++i) {
         uint32_t part_size = partitions_sizes_tmp[i];
         uint32_t part_inbound_size = partitions_inbound_sizes_tmp[i];
+        uint32_t part_pins = partitions_pins_tmp[i];
         if (part_size > h_max_nodes_per_part)
            std::cerr << "  WARNING, max partition size constraint (" << h_max_nodes_per_part << ") violated by part=" << i << " with part_size=" << part_size << " !!\n";
         if (part_inbound_size > h_max_inbound_per_part)
             std::cerr << "  WARNING, max partition inbound size constraint (" << h_max_inbound_per_part << ") violated by part=" << i << " with part_inbound_size=" << part_inbound_size << " !!\n";
+        if (part_pins > h_max_pins_per_part)
+            std::cerr << "  WARNING, max partition pins constraint (" << h_max_pins_per_part << ") violated by part=" << i << " with part_pins=" << part_pins << " !!\n";
     }
     int max_ps = part_count.empty() ? 0 : std::max_element(part_count.begin(), part_count.end(), [](auto &a, auto &b){ return a.second < b.second; })->second;
     std::cout << "Non-empty partitions count: " << part_count.size() << ", Max partition size: " << max_ps << "\n";

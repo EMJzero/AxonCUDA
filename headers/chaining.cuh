@@ -60,11 +60,13 @@ void chaining(
 void build_orphan_pairs(
     const runconfig &cfg,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t *d_inbound_count,
     const uint32_t *d_pairs,
     const uint32_t curr_num_nodes,
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
+    const uint32_t h_max_pins_per_part,
     const uint32_t candidates_count,
     uint32_t* d_groups
 );
@@ -143,8 +145,10 @@ void pair_kth_smallest_with_kth_largest(
     const uint32_t* __restrict__ sorted_indices,
     const uint32_t num_free,
     const uint32_t* __restrict__ d_nodes_sizes,
+    const uint32_t* __restrict__ d_nodes_pins,
     const uint32_t* __restrict__ d_inbound_count,
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
+    const uint32_t h_max_pins_per_part,
     uint32_t* __restrict__ d_groups
 );

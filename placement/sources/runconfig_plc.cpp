@@ -252,11 +252,12 @@ namespace config_plc {
             // topologies built from an explicit graph file (-g), e.g. Arbitrary: costs are still picked by
             // name (-c), reusing the same named profiles as the grid-based topologies, minus their grid extent
             static const std::unordered_map<std::string, HardwareModelConfig> profiles {
-                { "loihi", { "Loihi", 1024, 4096, 1.7, 3.5, 2.1, 5.3 } },
-                { "loihi64", { "Loihi Large", 1024, 4096, 1.7, 3.5, 2.1, 5.3 } },
-                { "loihi84", { "Loihi Jin 84", 4096, 1024*64, 1.0, 0.1, 1.0, 0.01 } },
-                { "loihi1024", { "Loihi Jin 1024", 4096, 1024*64, 1.0, 0.1, 1.0, 0.01 } },
-                { "truenorth", { "TrueNorth", 256, 256, 1.7, 3.5, 2.1, 5.3 } }
+                // { name, nodes_per_core, inbound_per_core, pins_per_core, costs... }
+                { "loihi", { "Loihi", 1024, 4096, 16384, 1.7, 3.5, 2.1, 5.3 } },
+                { "loihi64", { "Loihi Large", 1024, 4096, 16384, 1.7, 3.5, 2.1, 5.3 } },
+                { "loihi84", { "Loihi Jin 84", 4096, 1024*64, 1024*256, 1.0, 0.1, 1.0, 0.01 } },
+                { "loihi1024", { "Loihi Jin 1024", 4096, 1024*64, 1024*256, 1.0, 0.1, 1.0, 0.01 } },
+                { "truenorth", { "TrueNorth", 256, 256, 16384, 1.7, 3.5, 2.1, 5.3 } }
             };
             auto cfg_it = profiles.find(cfg.constraints);
             HardwareModelConfig hwcfg;

@@ -33,7 +33,7 @@ namespace config {
             "  -s <file>   Save partitioned hypergraph to file\n"
             "  -p <file>   Save the partitioning to file (one line per node, containing its partition id)\n"
             "  -c <name>   Preconfigured constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024 - default is loihi64)\n"
-            "  -m <> <> <> Constraints set to use, in order: max part. size, max part. distinct inbound hedges, max num. of part.s (overrides '-c')\n"
+            "  -m <>x4     Constraints set to use, in order: max part. size, max part. distinct inbound hedges, max part. pins, max num. of part.s (overrides '-c')\n"
             "  -k <k> <ε>  K-way balanced constraints set to use (overrides '-c' and '-m')\n"
             "  -om <mult>  Set the deduplication oversized segment size multiplier (increase to avoid the 'GM hash-set full!' assert)\n"
             "  -cnc <num>  Set the count of candidates proposed per node during coarsening\n"
@@ -41,6 +41,7 @@ namespace config {
             "  -smh <lvl>  Recover device memory by migrating to the host the pre-coarsening hypergraph up the provided level\n"
             "  -dtc        When set, construct touching sets on the device, rather than on the host (faster - uses more device memory)\n"
             "  -ipm        When set, initial partitions are greedily merged to reduce their number (and save memory - minor quality loss)\n"
+            "  -np         When set, disables the pins per partition constraint\n"
             "  -v <lvl>    Set the verbosity level: 0 results only, 1 steps and phases, 2 kernel launches, 3 algorithm outputs, 4 debug \n"
             "  -h          Show this help message\n";
     }
@@ -61,6 +62,7 @@ namespace config {
         uint32_t save_memory_up_to_level = SAVE_MEMORY_UP_TO_LEVEL;
         bool device_touching_construction = false;
         bool initial_partitions_merge = false;
+        bool no_pins_constraint = false;
         bool verbose_logs = VERBOSE_LOGS;
         bool verbose_info = VERBOSE_INFO;
         bool verbose_errs_and_warns = VERBOSE_ERRS;
@@ -86,11 +88,12 @@ namespace config {
                 constr_config.name = argv[++i];
                 mode = Mode::INCC;
             } else if (arg == "-m") {
-                if (i + 3 >= argc) { std::cerr << "Error: -m requires integer values for the three constraints\n"; std::exit(1); }
+                if (i + 4 >= argc) { std::cerr << "Error: -m requires integer values for the four constraints\n"; std::exit(1); }
                 constr_type = ConstrType::MANL;
                 constr_config.name = "manual";
                 constr_config.nodes_per_part = std::stoul(argv[++i]);
                 constr_config.inbound_per_part = std::stoul(argv[++i]);
+                constr_config.pins_per_part = std::stoul(argv[++i]);
                 constr_config.max_parts = std::stoul(argv[++i]);
                 mode = Mode::INCC;
             } else if (arg == "-k") {
@@ -118,6 +121,8 @@ namespace config {
                 device_touching_construction = true;
             } else if (arg == "-ipm") {
                 initial_partitions_merge = true;
+            } else if (arg == "-np") {
+                no_pins_constraint = true;
             } else if (arg == "-v") {
                 if (i + 1 >= argc) { std::cerr << "Error: -v requires a positive value between 0 and 4\n"; std::exit(1); }
                 int verbosity = std::stoul(argv[++i]);
@@ -147,6 +152,7 @@ namespace config {
             save_memory_up_to_level,
             device_touching_construction,
             initial_partitions_merge,
+            no_pins_constraint,
             verbose_logs,
             verbose_info,
             verbose_errs_and_warns,
@@ -188,37 +194,55 @@ namespace config {
         return hg;
     }
 
+    // rebuild a constraints set with its pins per partition constraint maxed out ('-np')
+    // NOTE: INT32_MAX, not UINT32_MAX, because the refinement event kernels accumulate deltas in int32
+    static Constraints dropPinsConstraint(const Constraints &constr) {
+        ConstraintsConfig relaxed;
+        relaxed.name = constr.name();
+        relaxed.nodes_per_part = constr.nodesPerPart();
+        relaxed.inbound_per_part = constr.inboundPerPart();
+        relaxed.pins_per_part = INT32_MAX;
+        relaxed.max_parts = constr.maxParts();
+        return Constraints(relaxed);
+    }
+
     Constraints setupConstr(runconfig &cfg, HyperGraph hg) {
-        if (cfg.constr_type == ConstrType::KWAY) { // k-way mode ('-k')
-            std::ostringstream epsistr;
-            epsistr << std::fixed << std::setprecision(3) << cfg.epsi;
-            cfg.constr_config.name = std::to_string(cfg.kway) + "-way " + epsistr.str() + " balanced";
-            cfg.constr_config.nodes_per_part = (uint32_t)std::ceil((1 + cfg.epsi)*(float)hg.nodes()/cfg.kway);
-            cfg.constr_config.inbound_per_part = INT32_MAX;
-            cfg.constr_config.max_parts = cfg.kway;
-            return Constraints(cfg.constr_config);
-        } else if (cfg.constr_type == ConstrType::MANL) { // manual constraints ('-m')
-            if (cfg.constr_config.nodes_per_part == 0) { std::cerr << "Error: the 1st constraint (max partition size) must be a positive integer \n"; std::exit(1); }
-            if (cfg.constr_config.inbound_per_part == 0) { std::cerr << "Error: the 2nd constraint (max distinct inbound hedge per partition) must be a positive integer \n"; std::exit(1); }
-            if (cfg.constr_config.max_parts == 0) { std::cerr << "Error: the 3rd constraint (max number of partitions) must be a positive integer \n"; std::exit(1); }
-            return Constraints(cfg.constr_config);
-        } else if (cfg.constr_type == ConstrType::NAME) { // preconfigured constraints ('-c')
-            std::unordered_map<std::string, Constraints (*)()> configurations {
-                { "loihi64", Constraints::createLoihiLarge },
-                { "loihi84", Constraints::createLoihiJin84 },
-                { "loihi1024", Constraints::createLoihiJin1024 },
-                { "truenorth", Constraints::createTrueNorth }
-            };
-            auto constr_it = configurations.find(cfg.constr_config.name);
-            if (constr_it == configurations.end()) {
-                std::cerr << "WARNING, constraints name (-c " << cfg.constr_config.name << ") not recognized, using loihi64 !!\n";
+        Constraints constr = [&]() -> Constraints {
+            if (cfg.constr_type == ConstrType::KWAY) { // k-way mode ('-k')
+                std::ostringstream epsistr;
+                epsistr << std::fixed << std::setprecision(3) << cfg.epsi;
+                cfg.constr_config.name = std::to_string(cfg.kway) + "-way " + epsistr.str() + " balanced";
+                cfg.constr_config.nodes_per_part = (uint32_t)std::ceil((1 + cfg.epsi)*(float)hg.nodes()/cfg.kway);
+                cfg.constr_config.inbound_per_part = INT32_MAX;
+                cfg.constr_config.pins_per_part = INT32_MAX;
+                cfg.constr_config.max_parts = cfg.kway;
+                return Constraints(cfg.constr_config);
+            } else if (cfg.constr_type == ConstrType::MANL) { // manual constraints ('-m')
+                if (cfg.constr_config.nodes_per_part == 0) { std::cerr << "Error: the 1st constraint (max partition size) must be a positive integer \n"; std::exit(1); }
+                if (cfg.constr_config.inbound_per_part == 0) { std::cerr << "Error: the 2nd constraint (max distinct inbound hedge per partition) must be a positive integer \n"; std::exit(1); }
+                if (cfg.constr_config.pins_per_part == 0) { std::cerr << "Error: the 3rd constraint (max pins per partition) must be a positive integer \n"; std::exit(1); }
+                if (cfg.constr_config.max_parts == 0) { std::cerr << "Error: the 4th constraint (max number of partitions) must be a positive integer \n"; std::exit(1); }
+                return Constraints(cfg.constr_config);
+            } else if (cfg.constr_type == ConstrType::NAME) { // preconfigured constraints ('-c')
+                std::unordered_map<std::string, Constraints (*)()> configurations {
+                    { "loihi64", Constraints::createLoihiLarge },
+                    { "loihi84", Constraints::createLoihiJin84 },
+                    { "loihi1024", Constraints::createLoihiJin1024 },
+                    { "truenorth", Constraints::createTrueNorth }
+                };
+                auto constr_it = configurations.find(cfg.constr_config.name);
+                if (constr_it == configurations.end()) {
+                    std::cerr << "WARNING, constraints name (-c " << cfg.constr_config.name << ") not recognized, using loihi64 !!\n";
+                    return Constraints::createLoihiLarge();
+                }
+                return constr_it->second();
+            } else { // no (valid) constraints provided
+                std::cerr << "WARNING, no constraints provided (-c, -m, -k), using loihi64 !!\n";
                 return Constraints::createLoihiLarge();
             }
-            return constr_it->second();
-        } else { // no (valid) constraints provided
-            std::cerr << "WARNING, no constraints provided (-c, -m, -k), using loihi64 !!\n";
-            return Constraints::createLoihiLarge();
-        }
+        }();
+
+        return cfg.no_pins_constraint ? dropPinsConstraint(constr) : constr;
     }
 
     void saveResult(runconfig &cfg, HyperGraph partitioned_hg, std::vector<uint32_t> partitions) {

@@ -16,6 +16,7 @@ using namespace config;
 uint32_t greedyMergeGroups(
     const runconfig &cfg,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t *d_inbound_count,
     const uint32_t *d_ungroups,
     const dim_t *d_ungroups_offsets,
@@ -23,15 +24,17 @@ uint32_t greedyMergeGroups(
     const uint32_t new_num_nodes,
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
+    const uint32_t h_max_pins_per_part,
     uint32_t *d_groups,
-    uint32_t *d_groups_sizes
+    uint32_t *d_groups_sizes,
+    uint32_t *d_groups_pins
 ) {
     /*
     * IDEA:
     * - merge together as many groups as possible (an heuristic is good enough) within constraints
     * - no need for costly exact constraint checks (e.g. with the exact inbound set intersection),
-    *   just add together sizes and inbound counts between groups to get an upper-bound on constraints
-    * - update "d_groups" and "d_groups_sizes" accordingly
+    *   just add together sizes, inbound counts, and pins between groups to get an upper-bound on constraints
+    * - update "d_groups", "d_groups_sizes" and "d_groups_pins" accordingly
     * - return the new number number of groups
     *
     * NOTE: group inbound set sizes are not available, infer them from the inbound count of each node in the group
@@ -44,7 +47,9 @@ uint32_t greedyMergeGroups(
     // prepare device views over the current groups data
     thrust::device_ptr<uint32_t> t_groups(d_groups);
     thrust::device_ptr<uint32_t> t_groups_sizes(d_groups_sizes);
+    thrust::device_ptr<uint32_t> t_groups_pins(d_groups_pins);
     thrust::device_ptr<const uint32_t> t_nodes_sizes(d_nodes_sizes);
+    thrust::device_ptr<const uint32_t> t_nodes_pins(d_nodes_pins);
     thrust::device_ptr<const uint32_t> t_inbound_count(d_inbound_count);
     thrust::device_ptr<const uint32_t> t_ungroups(d_ungroups);
     thrust::device_ptr<const dim_t> t_ungroups_offsets(d_ungroups_offsets);
@@ -71,7 +76,7 @@ uint32_t greedyMergeGroups(
     );
     uint32_t *d_groups_inbound_ptr = thrust::raw_pointer_cast(t_groups_inbound.data());
 
-    // sort groups by increasing (size, inbound, id) to greedily consume the smallest ones first
+    // sort groups by increasing (size, inbound, pins, id) to greedily consume the smallest ones first
     thrust::stable_sort(
         t_group_index.begin(), t_group_index.end(),
         [=] __host__ __device__ (uint32_t a, uint32_t b) {
@@ -81,29 +86,39 @@ uint32_t greedyMergeGroups(
             uint32_t ia = d_groups_inbound_ptr[a];
             uint32_t ib = d_groups_inbound_ptr[b];
             if (ia != ib) return ia < ib;
+            uint32_t pa = d_groups_pins[a];
+            uint32_t pb = d_groups_pins[b];
+            if (pa != pb) return pa < pb;
             return a < b;
         }
     );
 
-    // gather the sorted sizes and inbound bounds that drive the greedy packing
+    // gather the sorted sizes, inbound bounds, and pins that drive the greedy packing
     thrust::device_vector<dim_t> t_sorted_sizes(new_num_nodes); // sorted_sizes[pos] -> size of the group at sorted position pos
     thrust::device_vector<dim_t> t_sorted_inbound(new_num_nodes); // sorted_inbound[pos] -> inbound upper-bound of the group at sorted position pos
+    thrust::device_vector<dim_t> t_sorted_pins(new_num_nodes); // sorted_pins[pos] -> pins of the group at sorted position pos
     thrust::gather(t_group_index.begin(), t_group_index.end(), t_groups_sizes, t_sorted_sizes.begin());
     thrust::gather(t_group_index.begin(), t_group_index.end(), t_groups_inbound.begin(), t_sorted_inbound.begin());
+    thrust::gather(t_group_index.begin(), t_group_index.end(), t_groups_pins, t_sorted_pins.begin());
 
     // build exclusive-prefix buffers to query any greedy segment sum
     thrust::device_vector<dim_t> t_prefix_sizes(1 + new_num_nodes); // prefix_sizes[pos] -> sum of sorted_sizes in [0, pos)
     thrust::device_vector<dim_t> t_prefix_inbound(1 + new_num_nodes); // prefix_inbound[pos] -> sum of sorted_inbound in [0, pos)
+    thrust::device_vector<dim_t> t_prefix_pins(1 + new_num_nodes); // prefix_pins[pos] -> sum of sorted_pins in [0, pos)
     t_prefix_sizes[0] = 0;
     t_prefix_inbound[0] = 0;
+    t_prefix_pins[0] = 0;
     thrust::inclusive_scan(t_sorted_sizes.begin(), t_sorted_sizes.end(), t_prefix_sizes.begin() + 1);
     thrust::inclusive_scan(t_sorted_inbound.begin(), t_sorted_inbound.end(), t_prefix_inbound.begin() + 1);
+    thrust::inclusive_scan(t_sorted_pins.begin(), t_sorted_pins.end(), t_prefix_pins.begin() + 1);
     dim_t *d_prefix_sizes_ptr = thrust::raw_pointer_cast(t_prefix_sizes.data());
     dim_t *d_prefix_inbound_ptr = thrust::raw_pointer_cast(t_prefix_inbound.data());
+    dim_t *d_prefix_pins_ptr = thrust::raw_pointer_cast(t_prefix_pins.data());
 
     // compute the largest prefix values each greedy segment may reach from every start position
     thrust::device_vector<dim_t> t_size_targets(new_num_nodes); // size_targets[pos] -> max allowed prefix size for a segment starting at pos
     thrust::device_vector<dim_t> t_inbound_targets(new_num_nodes); // inbound_targets[pos] -> max allowed prefix inbound for a segment starting at pos
+    thrust::device_vector<dim_t> t_pins_targets(new_num_nodes); // pins_targets[pos] -> max allowed prefix pins for a segment starting at pos
     thrust::transform(
         thrust::make_counting_iterator<uint32_t>(0), thrust::make_counting_iterator<uint32_t>(new_num_nodes),
         t_size_targets.begin(),
@@ -114,10 +129,16 @@ uint32_t greedyMergeGroups(
         t_inbound_targets.begin(),
         [=] __host__ __device__ (uint32_t i) { return d_prefix_inbound_ptr[i] + (dim_t)h_max_inbound_per_part; }
     );
+    thrust::transform(
+        thrust::make_counting_iterator<uint32_t>(0), thrust::make_counting_iterator<uint32_t>(new_num_nodes),
+        t_pins_targets.begin(),
+        [=] __host__ __device__ (uint32_t i) { return d_prefix_pins_ptr[i] + (dim_t)h_max_pins_per_part; }
+    );
 
     // find the first violating prefix slot for each possible greedy segment start
     thrust::device_vector<uint32_t> t_size_next(new_num_nodes); // size_next[pos] -> first prefix slot that violates the size cap from pos
     thrust::device_vector<uint32_t> t_inbound_next(new_num_nodes); // inbound_next[pos] -> first prefix slot that violates the inbound cap from pos
+    thrust::device_vector<uint32_t> t_pins_next(new_num_nodes); // pins_next[pos] -> first prefix slot that violates the pins cap from pos
     thrust::upper_bound(
         t_prefix_sizes.begin(), t_prefix_sizes.end(),
         t_size_targets.begin(), t_size_targets.end(),
@@ -128,22 +149,28 @@ uint32_t greedyMergeGroups(
         t_inbound_targets.begin(), t_inbound_targets.end(),
         t_inbound_next.begin()
     );
+    thrust::upper_bound(
+        t_prefix_pins.begin(), t_prefix_pins.end(),
+        t_pins_targets.begin(), t_pins_targets.end(),
+        t_pins_next.begin()
+    );
 
     // convert the first violating prefix slot into the next greedy segment start
     thrust::device_vector<uint32_t> t_next_start(1 + new_num_nodes, new_num_nodes); // next_start[pos] -> next segment start after greedily packing from pos
     auto next_start_input_begin = thrust::make_zip_iterator(thrust::make_tuple(
         thrust::make_counting_iterator<uint32_t>(0),
-        t_size_next.begin(), t_inbound_next.begin()
+        t_size_next.begin(), t_inbound_next.begin(), t_pins_next.begin()
     ));
     thrust::transform(
         next_start_input_begin,
         next_start_input_begin + new_num_nodes,
         t_next_start.begin(),
-        [] __host__ __device__ (const thrust::tuple<uint32_t, uint32_t, uint32_t>& x) {
+        [] __host__ __device__ (const thrust::tuple<uint32_t, uint32_t, uint32_t, uint32_t>& x) {
             uint32_t pos = thrust::get<0>(x);
             uint32_t size_ub = thrust::get<1>(x);
             uint32_t inbound_ub = thrust::get<2>(x);
-            return max(pos + 1u, min(size_ub, inbound_ub) - 1u);
+            uint32_t pins_ub = thrust::get<3>(x);
+            return max(pos + 1u, min(size_ub, min(inbound_ub, pins_ub)) - 1u);
         }
     );
 
@@ -237,6 +264,13 @@ uint32_t greedyMergeGroups(
         thrust::make_discard_iterator(), t_groups_sizes
     );
 
+    // rebuild cumulative pins for the compacted merged groups
+    auto node_pins_values_begin = thrust::make_permutation_iterator(t_nodes_pins, t_indices.begin());
+    thrust::reduce_by_key(
+        t_headflags.begin(), t_headflags.end(), node_pins_values_begin,
+        thrust::make_discard_iterator(), t_groups_pins
+    );
+
     // scatter the compact merged group ids back to the original node order
     thrust::scatter(t_headflags.begin(), t_headflags.end(), t_indices.begin(), t_groups);
     INFO(cfg) std::cout << "Greedy groups merge reduced groups from " << new_num_nodes << " to " << new_num_groups << "\n";
@@ -248,22 +282,25 @@ void mergeSmallPartitions(
     const runconfig &cfg,
     const uint32_t *d_partitions_sizes,
     const uint32_t *d_partitions_inbound_sizes,
+    const uint32_t *d_partitions_pins,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
+    const uint32_t h_max_pins_per_part,
     uint32_t *d_partitions
 ) {
     /*
     * Given a set of partitions, try to merge together smaller the ones, within constraints
     * => reduce for free the total number of partitions, where feasible
-    * NOTE: this does NOT update "partitions_sizes" and "partitions_inbound_sizes" !!
+    * NOTE: this does NOT update "partitions_sizes", "partitions_inbound_sizes" and "partitions_pins" !!
     */
 
     // prepare device views over the current partitioning
     thrust::device_ptr<uint32_t> t_partitions(d_partitions);
     thrust::device_ptr<const uint32_t> t_partitions_sizes(d_partitions_sizes);
     thrust::device_ptr<const uint32_t> t_partitions_inbound_sizes(d_partitions_inbound_sizes);
+    thrust::device_ptr<const uint32_t> t_partitions_pins(d_partitions_pins);
 
     // enumerate all partition ids and extract the ones considered small
     thrust::device_vector<uint32_t> t_part_index(num_partitions); // part_index[pos] -> partition id at position pos
@@ -275,7 +312,7 @@ void mergeSmallPartitions(
     INFO(cfg) std::cout << "Smallest partition size: " << smallest_part_size << "\n";
     if (!t_small_parts.empty()) {
         INFO(cfg) std::cout << "Partitions compression over " << t_small_parts.size() << " partitions ...\n";
-        // sort the small partitions by increasing (size, inbound, id)
+        // sort the small partitions by increasing (size, inbound, pins, id)
         thrust::stable_sort(
             t_small_parts.begin(), t_small_parts.end(),
             [=] __host__ __device__ (uint32_t a, uint32_t b) {
@@ -284,30 +321,40 @@ void mergeSmallPartitions(
                 if (sa != sb) return sa < sb;
                 uint32_t ia = t_partitions_inbound_sizes[a];
                 uint32_t ib = t_partitions_inbound_sizes[b];
-                if (ia != ib) return ia < ib; return a < b;
+                if (ia != ib) return ia < ib;
+                uint32_t pa = t_partitions_pins[a];
+                uint32_t pb = t_partitions_pins[b];
+                if (pa != pb) return pa < pb; return a < b;
             }
         );
 
-        // gather the sorted sizes and inbound bounds that drive the greedy packing
+        // gather the sorted sizes, inbound bounds, and pins that drive the greedy packing
         uint32_t num_small_parts = (uint32_t)t_small_parts.size();
         thrust::device_vector<dim_t> t_sorted_sizes(num_small_parts); // sorted_sizes[pos] -> size of the small partition at sorted position pos
         thrust::device_vector<dim_t> t_sorted_inbound(num_small_parts); // sorted_inbound[pos] -> inbound size of the small partition at sorted position pos
+        thrust::device_vector<dim_t> t_sorted_pins(num_small_parts); // sorted_pins[pos] -> pins of the small partition at sorted position pos
         thrust::gather(t_small_parts.begin(), t_small_parts.end(), t_partitions_sizes, t_sorted_sizes.begin());
         thrust::gather(t_small_parts.begin(), t_small_parts.end(), t_partitions_inbound_sizes, t_sorted_inbound.begin());
+        thrust::gather(t_small_parts.begin(), t_small_parts.end(), t_partitions_pins, t_sorted_pins.begin());
 
         // build exclusive-prefix buffers to query any greedy segment sum
         thrust::device_vector<dim_t> t_prefix_sizes(1 + num_small_parts); // prefix_sizes[pos] -> sum of sorted_sizes in [0, pos)
         thrust::device_vector<dim_t> t_prefix_inbound(1 + num_small_parts); // prefix_inbound[pos] -> sum of sorted_inbound in [0, pos)
+        thrust::device_vector<dim_t> t_prefix_pins(1 + num_small_parts); // prefix_pins[pos] -> sum of sorted_pins in [0, pos)
         t_prefix_sizes[0] = 0;
         t_prefix_inbound[0] = 0;
+        t_prefix_pins[0] = 0;
         thrust::inclusive_scan(t_sorted_sizes.begin(), t_sorted_sizes.end(), t_prefix_sizes.begin() + 1);
         thrust::inclusive_scan(t_sorted_inbound.begin(), t_sorted_inbound.end(), t_prefix_inbound.begin() + 1);
+        thrust::inclusive_scan(t_sorted_pins.begin(), t_sorted_pins.end(), t_prefix_pins.begin() + 1);
         dim_t *d_prefix_sizes_ptr = thrust::raw_pointer_cast(t_prefix_sizes.data());
         dim_t *d_prefix_inbound_ptr = thrust::raw_pointer_cast(t_prefix_inbound.data());
+        dim_t *d_prefix_pins_ptr = thrust::raw_pointer_cast(t_prefix_pins.data());
 
         // compute the largest prefix values each greedy segment may reach from every start position
         thrust::device_vector<dim_t> t_size_targets(num_small_parts); // size_targets[pos] -> max allowed prefix size for a segment starting at pos
         thrust::device_vector<dim_t> t_inbound_targets(num_small_parts); // inbound_targets[pos] -> max allowed prefix inbound for a segment starting at pos
+        thrust::device_vector<dim_t> t_pins_targets(num_small_parts); // pins_targets[pos] -> max allowed prefix pins for a segment starting at pos
         thrust::transform(
             thrust::make_counting_iterator<uint32_t>(0), thrust::make_counting_iterator<uint32_t>(num_small_parts),
             t_size_targets.begin(),
@@ -318,10 +365,16 @@ void mergeSmallPartitions(
             t_inbound_targets.begin(),
             [=] __host__ __device__ (uint32_t i) { return d_prefix_inbound_ptr[i] + (dim_t)h_max_inbound_per_part; }
         );
+        thrust::transform(
+            thrust::make_counting_iterator<uint32_t>(0), thrust::make_counting_iterator<uint32_t>(num_small_parts),
+            t_pins_targets.begin(),
+            [=] __host__ __device__ (uint32_t i) { return d_prefix_pins_ptr[i] + (dim_t)h_max_pins_per_part; }
+        );
 
         // find the first violating prefix slot for each possible greedy segment start
         thrust::device_vector<uint32_t> t_size_next(num_small_parts); // size_next[pos] -> first prefix slot that violates the size cap from pos
         thrust::device_vector<uint32_t> t_inbound_next(num_small_parts); // inbound_next[pos] -> first prefix slot that violates the inbound cap from pos
+        thrust::device_vector<uint32_t> t_pins_next(num_small_parts); // pins_next[pos] -> first prefix slot that violates the pins cap from pos
         thrust::upper_bound(
             t_prefix_sizes.begin(), t_prefix_sizes.end(),
             t_size_targets.begin(), t_size_targets.end(),
@@ -332,22 +385,28 @@ void mergeSmallPartitions(
             t_inbound_targets.begin(), t_inbound_targets.end(),
             t_inbound_next.begin()
         );
+        thrust::upper_bound(
+            t_prefix_pins.begin(), t_prefix_pins.end(),
+            t_pins_targets.begin(), t_pins_targets.end(),
+            t_pins_next.begin()
+        );
 
         // convert the first violating prefix slot into the next greedy segment start
         thrust::device_vector<uint32_t> t_next_start(1 + num_small_parts, num_small_parts); // next_start[pos] -> next segment start after greedily packing from pos
         auto next_start_input_begin = thrust::make_zip_iterator(thrust::make_tuple(
             thrust::make_counting_iterator<uint32_t>(0),
-            t_size_next.begin(), t_inbound_next.begin()
+            t_size_next.begin(), t_inbound_next.begin(), t_pins_next.begin()
         ));
         thrust::transform(
             next_start_input_begin,
             next_start_input_begin + num_small_parts,
             t_next_start.begin(),
-            [] __host__ __device__ (const thrust::tuple<uint32_t, uint32_t, uint32_t>& x) {
+            [] __host__ __device__ (const thrust::tuple<uint32_t, uint32_t, uint32_t, uint32_t>& x) {
                 uint32_t pos = thrust::get<0>(x);
                 uint32_t size_ub = thrust::get<1>(x);
                 uint32_t inbound_ub = thrust::get<2>(x);
-                return max(pos + 1u, min(size_ub, inbound_ub) - 1u);
+                uint32_t pins_ub = thrust::get<3>(x);
+                return max(pos + 1u, min(size_ub, min(inbound_ub, pins_ub)) - 1u);
             }
         );
 

@@ -91,6 +91,7 @@ int main(int argc, char** argv) {
     std::cout << "Using constraints \"" << constr.name() << "\":\n";
     std::cout << "  Nodes per partition:         " << constr.nodesPerPart() << "\n";
     std::cout << "  Inbound hedge per partition: " << constr.inboundPerPart() << "\n";
+    std::cout << "  Inbound pins per partition:  " << constr.pinsPerPart() << "\n";
     std::cout << "  Maximum partitions:          " << constr.maxParts() << "\n";
 
     // quick path: a single partition was requested ('-k 1'), every node trivially belongs to partition 0
@@ -185,10 +186,12 @@ int main(int argc, char** argv) {
     // constraints
     const uint32_t h_max_nodes_per_part = constr.nodesPerPart();
     const uint32_t h_max_inbound_per_part = constr.inboundPerPart();
+    const uint32_t h_max_pins_per_part = constr.pinsPerPart();
     const uint32_t max_parts = constr.maxParts(); // not needed in kernels
     const uint32_t target_parts = min(max_parts, (num_nodes + h_max_nodes_per_part - 1) / h_max_nodes_per_part);
     assert(h_max_nodes_per_part <= INT32_MAX);
     assert(h_max_inbound_per_part <= INT32_MAX);
+    assert(h_max_pins_per_part <= INT32_MAX);
     assert(max_parts <= INT32_MAX);
 
     INFO(cfg) std::cout << "Starting timer...\n";
@@ -232,9 +235,11 @@ int main(int argc, char** argv) {
     uint32_t *d_u_scores = nullptr; // fixed point version of the above, used for the candidates and grouping kernels
     slot *d_slots = nullptr; // slot to finalize node pairs during grouping (true dtype: "slot")
     dp_score *d_dp_scores = nullptr; // dynamic programming score for each node in the tree assuming it connected (with) or not (w/out) to its target
-    uint32_t *d_nodes_sizes = nullptr; // nodes_size[node idx] -> how many pins the node counts as towards the partition size limit
+    uint32_t *d_nodes_sizes = nullptr; // nodes_size[node idx] -> how many nodes the node counts as towards the partition size limit
+    uint32_t *d_nodes_pins = nullptr; // nodes_pins[node idx] -> how many (inbound) pins the node counts as towards the partition pins limit
     uint32_t *d_partitions_sizes = nullptr; // partitions_sizes[idx] -> how many nodes (by total size) are in the partition
     uint32_t *d_partitions_inbound_sizes = nullptr; // partitions_inbound_sizes[partition] -> distinct inbound hedges count for "partition"
+    uint32_t *d_partitions_pins = nullptr; // partitions_pins[idx] -> how many inbound pins (by total count) are in the partition
 
     // allocate device memory
     CUDA_CHECK(cudaMalloc(&d_hedges, hg.hedgesFlat().size() * sizeof(uint32_t)));
@@ -247,6 +252,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_slots, num_nodes * sizeof(slot)));
     CUDA_CHECK(cudaMalloc(&d_dp_scores, num_nodes * sizeof(dp_score)));
     CUDA_CHECK(cudaMalloc(&d_nodes_sizes, num_nodes * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_nodes_pins, num_nodes * sizeof(uint32_t)));
 
     // copy to device
     CUDA_CHECK(cudaMemcpy(d_hedges, hg.hedgesFlat().data(), hg.hedgesFlat().size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
@@ -264,6 +270,7 @@ int main(int argc, char** argv) {
     // copy constants to device
     CUDA_CHECK(cudaMemcpyToSymbol(max_nodes_per_part, &h_max_nodes_per_part, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpyToSymbol(max_inbound_per_part, &h_max_inbound_per_part, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyToSymbol(max_pins_per_part, &h_max_pins_per_part, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
 
     // wrap up memory duties with a sync
     DBG(cfg) CUDA_CHECK(cudaGetLastError());
@@ -287,6 +294,9 @@ int main(int argc, char** argv) {
             hg
         );
     }
+    // |
+    // initialize inbound pin counts per node pins from inbound set cardinality
+    CUDA_CHECK(cudaMemcpy(d_nodes_pins, d_inbound_count, num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
 
     // estimated max neighbors count
     //const dim_t max_neighbors = hg.sampleMaxNeighborhoodSize(NEIGHBORS_SAMPLE_SIZE); // TODO: is 240 enough here? Maybe 2400?
@@ -323,7 +333,7 @@ int main(int argc, char** argv) {
 
 
     // returns the number of partitions and the pointer to the final partitions device buffer
-    std::function<std::tuple<uint32_t, uint32_t*>(const uint32_t, const uint32_t, uint32_t*&, dim_t*&, uint32_t*&, dim_t, uint32_t*&, dim_t*&, dim_t, uint32_t*&, uint32_t*&)> coarsen_refine_uncoarsen = [&](
+    std::function<std::tuple<uint32_t, uint32_t*>(const uint32_t, const uint32_t, uint32_t*&, dim_t*&, uint32_t*&, dim_t, uint32_t*&, dim_t*&, dim_t, uint32_t*&, uint32_t*&, uint32_t*&)> coarsen_refine_uncoarsen = [&](
         const uint32_t level_idx,
         const uint32_t curr_num_nodes,
         uint32_t*& d_hedges,
@@ -334,7 +344,8 @@ int main(int argc, char** argv) {
         dim_t*& d_touching_offsets,
         const dim_t touching_size,
         uint32_t*& d_inbound_count,
-        uint32_t*& d_nodes_sizes
+        uint32_t*& d_nodes_sizes,
+        uint32_t*& d_nodes_pins
     ) { // this is a lambda
         INFO(cfg) std::cout << "Coarsening level " << level_idx << ", remaining nodes=" << curr_num_nodes << "\n";
 
@@ -371,6 +382,7 @@ int main(int argc, char** argv) {
         * - d_hedges, d_hedges_offsets, d_srcs_count
         * - d_touching, d_touching_offsets, d_inbound_count
         * - d_nodes_sizes / d_groups_sizes
+        * - d_nodes_pins / d_groups_pins
         * Buffers (constructed by and) returned from each level:
         * - d_partitions
         * Buffers updated (globally) in-place after each level:
@@ -382,6 +394,7 @@ int main(int argc, char** argv) {
         * - d_partitions_sizes
         * - d_pins_per_partitions
         * - d_partitions_inbound_sizes
+        * - d_partitions_pins
         * Untouched buffers:
         * - d_hedge_weights
         *
@@ -430,6 +443,11 @@ int main(int argc, char** argv) {
             );
             d_partitions_sizes = d_init_partitions_sizes;
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, max_parts * sizeof(uint32_t))); // TODO: remove, not needed in KWAY mode
+            CUDA_CHECK(cudaMalloc(&d_partitions_pins, max_parts * sizeof(uint32_t))); // TODO: remove, not needed in KWAY mode
+            // k-way leaves the inbound pins constraint maxed out, so this accumulator is never enforced against, but the
+            // refinement still reads it as an event's base value: zero it rather than feeding the events kernel garbage
+            // NOTE: were pins ever to be enforced in k-way, this would have to be computed from the initial partitioning
+            CUDA_CHECK(cudaMemset(d_partitions_pins, 0x00, max_parts * sizeof(uint32_t)));
 
             // neighbors are no longer needed after coarsening is done
             CUDA_CHECK(cudaFree(d_neighbors));
@@ -452,6 +470,7 @@ int main(int argc, char** argv) {
             d_inbound_count,
             d_hedge_weights,
             d_nodes_sizes,
+            d_nodes_pins,
             curr_num_nodes,
             d_pairs,
             d_u_scores
@@ -473,19 +492,22 @@ int main(int argc, char** argv) {
         uint32_t new_num_nodes; // new number of nodes after this coarsening round
         uint32_t *d_groups = nullptr; // groups[node idx] -> node's group id (zero-based)
         uint32_t *d_groups_sizes = nullptr; // group_sizes[group id] = sum of sizes of all nodes in that group
+        uint32_t *d_groups_pins = nullptr; // group_pins[group id] = sum of pins of all nodes in that group
         uint32_t *d_ungroups = nullptr; // ungroups[ungroups_offsets[group id] + i] -> the group's i-th node (its original idx)
         dim_t *d_ungroups_offsets = nullptr; // ungroups_offsets[node idx] -> node's group id (zero-based)
         // TODO: make groupNodes only build d_ungroups while sorting node ids by their group id, build the offsets array later, as it is only needed if you do not reach a base case
-        std::tie(new_num_nodes, d_groups, d_groups_sizes, d_ungroups, d_ungroups_offsets) = groupNodes(
+        std::tie(new_num_nodes, d_groups, d_groups_sizes, d_groups_pins, d_ungroups, d_ungroups_offsets) = groupNodes(
             cfg,
             props,
             d_inbound_count,
             d_pairs,
             d_u_scores,
             d_nodes_sizes,
+            d_nodes_pins,
             curr_num_nodes,
             h_max_nodes_per_part,
             h_max_inbound_per_part,
+            h_max_pins_per_part,
             d_slots,
             d_dp_scores
         );
@@ -524,10 +546,16 @@ int main(int argc, char** argv) {
             );
             d_partitions_sizes = d_init_partitions_sizes;
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, max_parts * sizeof(uint32_t))); // TODO: remove, not needed in KWAY mode
+            CUDA_CHECK(cudaMalloc(&d_partitions_pins, max_parts * sizeof(uint32_t))); // TODO: remove, not needed in KWAY mode
+            // k-way leaves the inbound pins constraint maxed out, so this accumulator is never enforced against, but the
+            // refinement still reads it as an event's base value: zero it rather than feeding the events kernel garbage
+            // NOTE: were pins ever to be enforced in k-way, this would have to be computed from the initial partitioning
+            CUDA_CHECK(cudaMemset(d_partitions_pins, 0x00, max_parts * sizeof(uint32_t)));
             CUDA_CHECK(cudaFree(d_groups));
             CUDA_CHECK(cudaFree(d_ungroups));
             CUDA_CHECK(cudaFree(d_ungroups_offsets));
             CUDA_CHECK(cudaFree(d_groups_sizes));
+            CUDA_CHECK(cudaFree(d_groups_pins));
 
             // neighbors are no longer needed after coarsening is done
             CUDA_CHECK(cudaFree(d_neighbors));
@@ -556,6 +584,7 @@ int main(int argc, char** argv) {
                 new_num_nodes = greedyMergeGroups(
                     cfg,
                     d_nodes_sizes,
+                    d_nodes_pins,
                     d_inbound_count,
                     d_ungroups,
                     d_ungroups_offsets,
@@ -563,8 +592,10 @@ int main(int argc, char** argv) {
                     new_num_nodes,
                     h_max_nodes_per_part,
                     h_max_inbound_per_part,
+                    h_max_pins_per_part,
                     d_groups,
-                    d_groups_sizes
+                    d_groups_sizes,
+                    d_groups_pins
                 );
             }
 
@@ -605,6 +636,8 @@ int main(int argc, char** argv) {
             // prepare initial partition sizes
             // NOTE: current groups become the partitions, and so group sizes become partition sizes
             d_partitions_sizes = d_groups_sizes;
+            // NOTE: same for group pins, they become the partitions' pin counts
+            d_partitions_pins = d_groups_pins;
 
             // perpare inbound set size counts per partition (written by "refinementRepeats")
             CUDA_CHECK(cudaMalloc(&d_partitions_inbound_sizes, new_num_nodes * sizeof(uint32_t)));
@@ -623,9 +656,11 @@ int main(int argc, char** argv) {
             d_pairs,
             d_groups,
             d_groups_sizes,
+            d_groups_pins,
             curr_num_nodes,
             new_num_nodes,
-            h_max_nodes_per_part
+            h_max_nodes_per_part,
+            h_max_pins_per_part
         );
         // =============================
 
@@ -726,7 +761,8 @@ int main(int argc, char** argv) {
             d_coarse_touching_offsets,
             new_touching_size,
             d_coarse_inbound_count,
-            d_groups_sizes
+            d_groups_sizes,
+            d_groups_pins
         );
         // ======================================
 
@@ -791,6 +827,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaFree(d_coarse_touching_offsets));
         CUDA_CHECK(cudaFree(d_coarse_inbound_count));
         CUDA_CHECK(cudaFree(d_groups_sizes));
+        CUDA_CHECK(cudaFree(d_groups_pins));
         CUDA_CHECK(cudaFree(d_coarse_partitions)); // allocated at the next inner level, freed here!
 
         // =============================
@@ -800,10 +837,12 @@ int main(int argc, char** argv) {
                 d_partitions,
                 d_partitions_sizes,
                 d_partitions_inbound_sizes,
+                d_partitions_pins,
                 curr_num_nodes,
                 num_partitions,
                 h_max_nodes_per_part,
-                h_max_inbound_per_part
+                h_max_inbound_per_part,
+                h_max_pins_per_part
             );
         }
         // =============================
@@ -819,17 +858,21 @@ int main(int argc, char** argv) {
             d_inbound_count,
             d_hedge_weights,
             d_nodes_sizes,
+            d_nodes_pins,
             level_idx,
             curr_num_nodes,
             num_hedges,
             num_partitions,
             touching_size,
             level_idx == 0, // on the final level -> return true inbound set sizes
+            h_max_nodes_per_part,
+            h_max_pins_per_part,
             d_pairs,
             d_f_scores,
             d_partitions,
             d_partitions_sizes,
-            d_partitions_inbound_sizes
+            d_partitions_inbound_sizes,
+            d_partitions_pins
         );
 
         return std::make_tuple(num_partitions, d_partitions);
@@ -848,7 +891,8 @@ int main(int argc, char** argv) {
         d_touching_offsets,
         touching_hedges_size,
         d_inbound_count,
-        d_nodes_sizes
+        d_nodes_sizes,
+        d_nodes_pins
     );
 
 
@@ -858,10 +902,12 @@ int main(int argc, char** argv) {
             cfg,
             d_partitions_sizes,
             d_partitions_inbound_sizes,
+            d_partitions_pins,
             num_nodes,
             num_partitions,
             h_max_nodes_per_part,
             h_max_inbound_per_part,
+            h_max_pins_per_part,
             d_partitions
         );
     }
@@ -922,9 +968,11 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_slots));
     CUDA_CHECK(cudaFree(d_dp_scores));
     CUDA_CHECK(cudaFree(d_nodes_sizes));
+    CUDA_CHECK(cudaFree(d_nodes_pins));
     CUDA_CHECK(cudaFree(d_partitions));
     CUDA_CHECK(cudaFree(d_partitions_sizes));
     CUDA_CHECK(cudaFree(d_partitions_inbound_sizes));
+    CUDA_CHECK(cudaFree(d_partitions_pins));
 
     // final sync
     CUDA_CHECK(cudaGetLastError());

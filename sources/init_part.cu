@@ -569,15 +569,18 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                 blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
                 // launch - build size events kernel
                 LAUNCH(cfg) RUN << "build size events kernel (iter=" << fm << ") (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") (thread=" << tid << ") ...\n";
+                // NOTE: k-way mode leaves the inbound pins constraint maxed out, hence no pins events are emitted here
                 build_size_events_kernel<<<blocks, threads_per_block, 0, stream>>>(
                     d_moves,
                     d_ranks,
                     d_partitions,
                     d_nodes_sizes,
+                    nullptr,
                     num_nodes,
                     d_size_events_partition,
                     d_size_events_index,
-                    d_size_events_delta
+                    d_size_events_delta,
+                    nullptr
                 );
                 DBG(cfg) CUDA_CHECK(cudaGetLastError());
                 // sort events by (partition, rank) [in lexicographical order for the tuple] and carry size_events_delta along
@@ -600,6 +603,7 @@ std::tuple<uint32_t*, uint32_t*> initial_partitioning(
                     d_size_events_delta,
                     d_partitions_sizes,
                     num_size_events,
+                    h_max_nodes_per_part,
                     d_valid_moves
                 );
                 DBG(cfg) CUDA_CHECK(cudaGetLastError());

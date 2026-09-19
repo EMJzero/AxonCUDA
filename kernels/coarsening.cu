@@ -18,6 +18,7 @@ void candidates_kernel(
     const uint32_t* __restrict__ inbound_count,
     const float* __restrict__ hedge_weights,
     const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ nodes_pins,
     const uint32_t num_nodes,
     const uint32_t candidates_count,
     uint32_t* __restrict__ pairs,
@@ -64,6 +65,7 @@ void candidates_kernel(
     const uint32_t my_inbound_count = inbound_count[warp_id];
 
     const uint32_t my_size = nodes_sizes[warp_id];
+    const uint32_t my_pins = nodes_pins[warp_id];
 
     // all threads in the warp should agree on those...
     // TODO: only keep these in lane 0!
@@ -81,8 +83,8 @@ void candidates_kernel(
             uint32_t curr_neighbor = UINT32_MAX;
             if (nb < neighbors_count) {
                 curr_neighbor = my_neighbors[nb];
-                 // skip incompatible neighbors due to size constraints
-                if (my_size + nodes_sizes[curr_neighbor] <= max_nodes_per_part) {
+                 // skip incompatible neighbors due to size and pins constraints
+                if (my_size + nodes_sizes[curr_neighbor] <= max_nodes_per_part && my_pins + nodes_pins[curr_neighbor] <= max_pins_per_part) {
                     histogram_node[nb] = curr_neighbor;
                     inserted++;
                 } else
@@ -242,6 +244,7 @@ void grouping_kernel(
     const uint32_t* __restrict__ pairs, // pairs[idx] is the partner idx wants to be grouped with (UINT32_MAX if undefined)
     const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be grouped with pairs[idx] (0 if undefined)
     const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ nodes_pins,
     const uint32_t num_nodes,
     const uint32_t candidates_count,
     slot* __restrict__ group_slots, // initialized with -1 on the id
@@ -322,8 +325,8 @@ void grouping_kernel(
     *  - if your entry is still there in your target, start copying all its slot over yours, as to propagate downward the assembled group's information
     * Important: at the end of this, all nodes of a group must have IDENTICAL slots (all slots), then the minimum id in the slots will be used to tag the group.
     *
-    * TODO: for now, nodes_sizes is not used, because we assume pairs are already filtered by the candidates kernel, however allowing larger groups requries
-    *       introducing constraint checks here as well...
+    * TODO: for now, nodes_sizes and nodes_pins are not used, because we assume pairs are already filtered by the candidates kernel, however allowing larger
+    *       groups requries introducing constraint checks here as well...
     *
     * Beyond just the first choice:
     * - let the candidates kernel return the top-k candidates (sorted) for each node, rather thank just pairs

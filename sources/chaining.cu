@@ -255,16 +255,18 @@ void chaining(
 
 // given a set of pairs proposed between nodes (d_pairs), isolate nodes without a pair,
 // try to force them into a pair with another node in the same condition such that their
-// combined size and inbound set cardinality are within constraints. The objective is an
-// almost-maximal number of formed pairs.
+// combined size, distinct inbound count, and inbound pins count are within constraints. The
+// objective is an almost-maximal number of formed pairs.
 void build_orphan_pairs(
     const runconfig &cfg,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t *d_inbound_count,
     const uint32_t *d_pairs,
     const uint32_t curr_num_nodes,
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
+    const uint32_t h_max_pins_per_part,
     const uint32_t candidates_count,
     uint32_t *d_groups // pre-initialized -> this routine writes group ids for paired nodes only.
 ) {
@@ -315,9 +317,11 @@ void build_orphan_pairs(
         d_free_indices,
         num_free,
         d_nodes_sizes,
+        d_nodes_pins,
         d_inbound_count,
         h_max_nodes_per_part,
         h_max_inbound_per_part,
+        h_max_pins_per_part,
         d_groups
     );
 

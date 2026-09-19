@@ -47,6 +47,7 @@ void candidatesProposal(
     const uint32_t *d_inbound_count,
     const float *d_hedge_weights,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t curr_num_nodes,
     uint32_t *d_pairs,
     uint32_t *d_u_scores
@@ -59,16 +60,18 @@ void logCandidates(
     const uint32_t curr_num_nodes
 );
 
-std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
+std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
     const runconfig &cfg,
     const cudaDeviceProp props,
     const uint32_t *d_inbound_count,
     const uint32_t *d_pairs,
     const uint32_t *d_u_scores,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t curr_num_nodes,
     const uint32_t max_nodes_per_part,
     const uint32_t max_inbound_per_part,
+    const uint32_t max_pins_per_part,
     slot *d_slots,
     dp_score *d_dp_scores
 );
@@ -78,9 +81,11 @@ void logGroups(
     const uint32_t *d_pairs,
     const uint32_t *d_groups,
     const uint32_t *d_groups_sizes,
+    const uint32_t *d_groups_pins,
     const uint32_t curr_num_nodes,
     const uint32_t new_num_nodes,
-    const uint32_t h_max_nodes_per_part
+    const uint32_t h_max_nodes_per_part,
+    const uint32_t h_max_pins_per_part
 );
 
 
@@ -98,6 +103,7 @@ void candidates_kernel(
     const uint32_t* __restrict__ inbound_count,
     const float* __restrict__ hedge_weights,
     const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ nodes_pins,
     const uint32_t num_nodes,
     const uint32_t candidates_count,
     uint32_t* __restrict__ pairs,
@@ -109,6 +115,7 @@ void grouping_kernel(
     const uint32_t* __restrict__ pairs,
     const uint32_t* __restrict__ scores,
     const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ nodes_pins,
     const uint32_t num_nodes,
     const uint32_t candidates_count,
     slot* __restrict__ group_slots,

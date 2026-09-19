@@ -69,8 +69,8 @@ namespace hwmodel {
                 return false;
             }
             for (std::uint32_t n = 0; n < hgraph.nodes(); ++n) {
-                if (hgraph.inboundIds(n).size() > synapses_per_core_) {
-                    if (verbose) std::cout << "HYPERGRAPH CAN'T FIT ON THE HW: more inbound hyperedges on a partition than the HW can handle\n";
+                if (hgraph.inboundIds(n).size() > inbound_per_core_) {
+                    if (verbose) std::cout << "HYPERGRAPH CAN'T FIT ON THE HW: more inbound axons on a partition than the HW can handle\n";
                     return false;
                 }
             }
@@ -83,14 +83,14 @@ namespace hwmodel {
         }
 
         for (std::uint32_t n = 0; n < hgraph.nodes(); ++n) {
-            if (hgraph.inboundIds(n).size() > synapses_per_core_) {
-                if (verbose) std::cout << "HYPERGRAPH CAN'T FIT ON THE HW: more inbound hyperedges on a single node than the HW can handle\n";
+            if (hgraph.inboundIds(n).size() > inbound_per_core_) {
+                if (verbose) std::cout << "HYPERGRAPH CAN'T FIT ON THE HW: more inbound axons on a single node than the HW can handle\n";
                 return false;
             }
         }
 
         try {
-            (void)partitionSequential(hgraph, nodes_per_core_, synapses_per_core_, coresCount());
+            (void)partitionSequential(hgraph, nodes_per_core_, inbound_per_core_, coresCount());
         } catch (...) {
             if (verbose) std::cout << "HYPERGRAPH WON'T LIKELY FIT ON THE HW: the greedy split of nodes (and their pins) among cores failed\n";
             return false;
@@ -130,9 +130,9 @@ namespace hwmodel {
                 throw std::runtime_error("Partitions must be incrementally indexed from 0 onward.");
         }
 
-        std::vector<uint32_t> synapses_per_partition(partitions_count, 0);
+        std::vector<uint32_t> inbound_per_partition(partitions_count, 0);
 
-        // for each hyperedge, count distinct inbound synapses per partition
+        // for each hyperedge, count distinct inbound axons per partition
         for (const auto& he : hgraph.hedges()) {
             std::unordered_set<uint32_t> already_seen;
             already_seen.reserve(he.length());
@@ -140,15 +140,15 @@ namespace hwmodel {
             for (auto neuron : he.destinations()) {
                 uint32_t partition = partitions[neuron];
                 if (!already_seen.count(partition)) {
-                    ++synapses_per_partition[partition];
+                    ++inbound_per_partition[partition];
                     already_seen.insert(partition);
                 }
             }
         }
 
         for (uint32_t i = 0; i < partitions_count; ++i) {
-            if (synapses_per_partition[i] > synapses_per_core_) {
-                if (verbose) std::cout << "INVALID PARTITIONING: more inbound hyperedges per partition (" << synapses_per_partition[i] << ") than a core can handle (" << synapses_per_core_ << ")\n";
+            if (inbound_per_partition[i] > inbound_per_core_) {
+                if (verbose) std::cout << "INVALID PARTITIONING: more inbound axons per partition (" << inbound_per_partition[i] << ") than a core can handle (" << inbound_per_core_ << ")\n";
                 return false;
             }
         }

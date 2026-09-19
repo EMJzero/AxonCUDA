@@ -44,7 +44,10 @@ Examples of typical invocations are as follows:
 
 Placement settings:
 - `-r <hgraph>`: path to the hypergraph to place;
-- `-c <name>`: choose a named constraints set, among hard-coded ones, for the lattice size and hop costs;
+- `-c <name>`: choose a named constraints set, among hard-coded ones, for the lattice size, per-core constraints, and hop costs;
+
+> Besides the lattice and its hop costs, a named hardware model carries the constraints of a single core: maximum neurons, maximum distinct inbound axons, and maximum synapses, aka inbound hyperedge pins.
+> Here they are only carried along and reported, never enforced, as the hypergraph being placed is expected to already be partitioned under the matching [partitioning constraints](../README.md#algorithmic-complexity-legend).
 
 Recommended options:
 - `-dtc`: speed up loading time by building and deduplicating initial incidence sets directly on the GPU;

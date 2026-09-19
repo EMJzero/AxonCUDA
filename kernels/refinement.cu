@@ -331,12 +331,14 @@ void fm_refinement_apply_kernel(
     const uint32_t* __restrict__ moves, // moves[idx] -> positive-gain move (target partition idx) proposed by node idx (DO NOT SORT)
     const uint32_t* __restrict__ move_ranks, // move_ranks[node_idx] -> i (ranking by score) of the move proposed by the idx node
     const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ nodes_pins,
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
     const uint32_t num_good_moves, // idx + 1 of the maximum in the updated scores
     uint32_t* __restrict__ partitions, // partitions[idx] is the partition node idx is part of
-    uint32_t* __restrict__ partitions_sizes
+    uint32_t* __restrict__ partitions_sizes,
+    uint32_t* __restrict__ partitions_pins
     //uint32_t* pins_per_partitions // pins_per_partitions[hedge_idx * num_partitions + partition_idx] is the number of pins of that partition owned by this hedge
 ) {
     // STYLE: one node (move) per thread!
@@ -350,10 +352,15 @@ void fm_refinement_apply_kernel(
     const uint32_t my_partition = partitions[tid];
     const uint32_t my_move_part = moves[tid];
     const uint32_t my_size = nodes_sizes[tid];
+    const uint32_t my_pins = nodes_pins[tid];
 
     // update partition sizes
     atomicSub(&partitions_sizes[my_partition], my_size);
     atomicAdd(&partitions_sizes[my_move_part], my_size);
+
+    // update partition pins
+    atomicSub(&partitions_pins[my_partition], my_pins);
+    atomicAdd(&partitions_pins[my_move_part], my_pins);
 
     // update my partition
     partitions[tid] = my_move_part;
@@ -370,16 +377,20 @@ void fm_refinement_apply_kernel(
 }
 
 // transform moves into a sequence of size-altering events for capacity constraint checks
+// NOTE: the (partition, rank) key of an event does not depend on the quantity being accounted for, hence sizes and
+//       inbound pins share one key array and one sort; pass null "nodes_pins"/"ev_pins_delta" to only emit sizes
 __global__
 void build_size_events_kernel(
     const uint32_t* __restrict__ moves,
     const uint32_t* __restrict__ ranks,
     const uint32_t* __restrict__ partitions,
     const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ nodes_pins,
     const uint32_t num_nodes,
     uint32_t* __restrict__ ev_partition,
     uint32_t* __restrict__ ev_index,
-    int32_t* __restrict__ ev_delta
+    int32_t* __restrict__ ev_delta,
+    int32_t* __restrict__ ev_pins_delta
 ) {
     // STYLE: one node (move) per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -403,6 +414,10 @@ void build_size_events_kernel(
         ev_partition[e1] = UINT32_MAX;
         ev_index[e1] = rank;
         ev_delta[e1] = 0;
+        if (ev_pins_delta != nullptr) {
+            ev_pins_delta[e0] = 0;
+            ev_pins_delta[e1] = 0;
+        }
         return;
     }
 
@@ -413,9 +428,16 @@ void build_size_events_kernel(
     ev_partition[e1] = dst_part;
     ev_index[e1] = rank;
     ev_delta[e1] = size;
+
+    if (ev_pins_delta != nullptr) {
+        const int32_t pins = static_cast<int32_t>(nodes_pins[tid]);
+        ev_pins_delta[e0] = -pins;
+        ev_pins_delta[e1] = pins;
+    }
 }
 
-// mark moves that are valid points in the sequence w.r.t. size constraints
+// mark moves that are valid points in the sequence w.r.t. an additive per-partition constraint
+// NOTE: "sizes" here is any additive quantity, this kernel serves both nodes sizes and nodes pins
 __global__
 void flag_size_events_kernel(
     const uint32_t* __restrict__ ev_partition,
@@ -423,6 +445,7 @@ void flag_size_events_kernel(
     const int32_t* __restrict__ ev_delta,
     const uint32_t* __restrict__ partitions_sizes,
     const uint32_t num_events,
+    const uint32_t h_max_per_part,
     int32_t* __restrict__ valid_moves // initialized with 0s
 ) {
     // STYLE: one event per thread!
@@ -454,7 +477,7 @@ void flag_size_events_kernel(
     // TODO: those type casts are kinda dangerous...
     const int32_t base_size = static_cast<int32_t>(partitions_sizes[part]);
     const int32_t curr_size = base_size + ev_delta[tid];
-    const int32_t max_size = static_cast<int32_t>(max_nodes_per_part);
+    const int32_t max_size = static_cast<int32_t>(h_max_per_part);
     const int32_t new_excess = max(curr_size - max_size, 0); // by how much we now exceed the constraint
 
     const uint32_t pred_part = tid > 0 ? ev_partition[tid - 1] : UINT32_MAX; // partition acted upon by the event before this one
@@ -1004,11 +1027,13 @@ void build_size_events_sparse_kernel(
     const uint32_t* __restrict__ ranks,
     const uint32_t* __restrict__ partitions,
     const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ nodes_pins,
     const dim_t* __restrict__ size_ev_offsets,
     const uint32_t num_nodes,
     uint32_t* __restrict__ ev_partition,
     uint32_t* __restrict__ ev_index,
-    int32_t* __restrict__ ev_delta
+    int32_t* __restrict__ ev_delta,
+    int32_t* __restrict__ ev_pins_delta
 ) {
     // STYLE: one node (move) per thread!
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1032,6 +1057,12 @@ void build_size_events_sparse_kernel(
     ev_partition[e1] = dst_part;
     ev_index[e1] = rank;
     ev_delta[e1] = size;
+
+    if (ev_pins_delta != nullptr) {
+        const int32_t pins = static_cast<int32_t>(nodes_pins[tid]);
+        ev_pins_delta[e0] = -pins;
+        ev_pins_delta[e1] = pins;
+    }
 }
 
 // see "build_hedge_events_kernel"

@@ -6,6 +6,7 @@ Entirely developed in CUDA, every algorithm is parallel in nodes and hyperedge p
 Present algorithms originally targeted a specific set of partitioning constraints:
 - maximum nodes per partition
 - maximum distinct inbound hyperedges per partition
+- maximum inbound pins, aka synapses in a SNN, per partition
 
 However, it has also been generalized to support $k$-way balanced partitioning.<br>
 The primary optimization objective is the connectivity (or $\lambda - 1$ metric).
@@ -66,7 +67,7 @@ make clean && make
 Refer to the help menu `./hgraph_gpu.exe -h` for detailed usage instructions.
 
 AxonCUDA supports two partitioning modes.
-Inbound constrained minimal partitioning, that attempts to construct the fewest partitions under size and inbound set size constraints per partition.
+Inbound constrained minimal partitioning, that attempts to construct the fewest partitions under size, inbound set size, and inbound pins count constraints per partition.
 K-way balanced partitioning, with a fixed number of partitions and a constraint only on partition size.
 Both modes optimize for minimum connectivity, but cut-net and SOED also improve as a side-effect (see [metrics](#hypergraph-partitioning-metrics)).
 
@@ -75,7 +76,7 @@ Examples of typical invocations are as follows:
 # partition a SNN with predefined constraints
 ./hgraph_gpu.exe -r hgraphs/some_snn.snn -c loihi84
 # partition a SNN with custom constraints and algorithm-specific options
-./hgraph_gpu.exe -r hgraphs/some_snn.snn -m 128 1024 4096 -cnc 4 -rfr 32
+./hgraph_gpu.exe -r hgraphs/some_snn.snn -m 128 1024 8192 4096 -cnc 4 -rfr 32
 # partition a hypergraph under k-way balanced constraints
 ./hgraph_gpu.exe -r hgraphs/some_hgr.hgr -k 2 0.03
 ```
@@ -83,8 +84,9 @@ Examples of typical invocations are as follows:
 Partitioning settings:
 - `-r <hgraph>`: path to the hypergraph to partition;
 - `-c <name>`: choose a named constraints set, among hard-coded ones, for inbound constrained minimal partitioning;
-- `-m <size> <inbound> <p-cnt>`: set partitions size, inbound size, and count constraints for inbound constrained minimal partitioning;
+- `-m <size> <inbound> <pins> <p-cnt>`: set partitions size, inbound size, inbound pins count, and count constraints for inbound constrained minimal partitioning;
 - `-k <k> <ε>`: set partitions count and balance parameter for k-way balanced partitioning;
+- `-np`: drop the pins per partition constraint, maxing it out;
 
 > Unless `-k` is present, the partitioning mode defaults to inbound constrained minimal partitioning.
 
@@ -122,14 +124,17 @@ The hyperedge set is $E = \{(s, D) \mid s \in N, D \subseteq N\}$, where each hy
 <!--A partitioning of $G$ is defined as a function $\rho : N \rightarrow P$, where $P \subseteq \mathcal{P}(N)$ is the set of disjoint partitions.-->
 Be $P \subseteq \mathcal{P}(N)$ a partitioning of $N$, equivalently defined by a function $\rho : N \rightarrow P$ assigning nodes to partitions.
 
-Let $\Omega$ be the maximum number of nodes allowed for a partition, and $\Delta$ its maximum number of distinct inbound hyperedges.
+Let $\Omega$ be the maximum number of nodes allowed for a partition, $\Delta$ its maximum number of distinct inbound hyperedges, and $\Pi$ its maximum number of inbound pins.
 Formally, our constraints imply:
 ```math
 \begin{aligned}
 \forall b \in P, \: |b| &\leq \Omega \\
-|\textstyle\bigcup_{u \in b} in(u)| &\leq \Delta
+|\textstyle\bigcup_{u \in b} in(u)| &\leq \Delta \\
+\textstyle\sum_{u \in b} |in(u)| &\leq \Pi
 \end{aligned}
 ```
+Both $\Delta$ and $\Pi$ look at the inbound side of a hyperedge alone, $in(u)$ being the hyperedges that have $u$ among their destinations: the former counts one of them once per partition, no matter how many of its nodes land there, the latter once per such node, i.e. once per inbound pin.
+Hereafter, "pins" always means inbound pins.
 
 For convenience, we discuss algorithmic complexity using the following variables w.r.t. a generic hgraph:
 - $n$ : number of hgraph nodes, $|N|$
@@ -201,6 +206,7 @@ We refer to refinement gains in two ways:
 
 > All results are reported under the "default" configuration.
 > All "ko"s are out-of-memory instances...
+> These numbers predate the pins per partition constraint, hence they are only reproducible with `-np`; a re-run under the named constraints is pending.
 
 ## Suggested Configurations
 
@@ -223,6 +229,7 @@ All problems manifest as asserts being triggered:
 - `GM hash-set full!` in any `apply_X` or `neighbors` kernel means oversized segments for deduplication were not large enough, increase `-om <mul>` from the CLI...
 - `invalid partitioning returned` in k-way mode after the initial Mt-KaHyPar solution means no valid initial partitioning likely existed, try raising `KWAY_INIT_UPPER_THREASHOLD`...
 - in case of an unexpected `invalid partitioning` under known valid constraints:
+  - if the violation is on pins, check the largest inbound set among the nodes, as a pins per partition constraint below it leaves that node homeless and makes the instance infeasible by construction, either raise it or drop it with `-np`...
   - inspect the total hyperedge weight (printed after the hypergraph is loaded), and if it is close to the `uint32 / FIXED_POINT_SCALE` limit, the cause is likely an overflow after applying `FIXED_POINT_SCALE`, try lowering it...
   - otherwise, make sure the hypergraph has less than $2^{32}$ nodes or hyperedges, as the code is currently hardwired to identify those with 32 bits...
 - too much host RAM usage: add the `-dtc` flag if your device has more VRAM than the host has RAM! Also recommended for a good speedup...

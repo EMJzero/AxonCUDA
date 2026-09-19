@@ -73,10 +73,11 @@ int main(int argc, char** argv) {
 
         // print hardware details
         std::cout << "Using hardware model \"" << hw.name() << "\":\n";
-        std::cout << "  Topology:          " << topologyToString(cfg.topology) << "\n";
-        std::cout << "  Neurons per core:  " << hw.neuronsPerCore() << "\n";
-        std::cout << "  Synapses per core: " << hw.synapsesPerCore() << "\n";
-        std::cout << "  Cores per dim:  " << hw.coresAlongDim(0);
+        std::cout << "  Topology:                 " << topologyToString(cfg.topology) << "\n";
+        std::cout << "  Neurons per core:         " << hw.neuronsPerCore() << "\n";
+        std::cout << "  Inbound axons per core:   " << hw.inboundPerCore() << "\n";
+        std::cout << "  Synapses (pins) per core: " << hw.pinsPerCore() << "\n";
+        std::cout << "  Cores per dim:            " << hw.coresAlongDim(0);
         for (uint32_t dim = 1; dim < T::dimensions; dim++)
             std::cout << ", " << hw.coresAlongDim(dim);
         std::cout << " (" << hw.coresCount() << " tot.)" << "\n";

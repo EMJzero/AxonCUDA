@@ -30,17 +30,21 @@ void refinementRepeats(
     const uint32_t *d_inbound_count,
     const float *d_hedge_weights,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t level_idx,
     const uint32_t curr_num_nodes,
     const uint32_t num_hedges,
     const uint32_t num_partitions,
     const dim_t touching_size,
     const bool update_final_inbound_counts,
+    const uint32_t h_max_nodes_per_part,
+    const uint32_t h_max_pins_per_part,
     uint32_t *d_pairs,
     float *d_f_scores,
     uint32_t *d_partitions,
     uint32_t *d_partitions_sizes,
-    uint32_t *d_partitions_inbound_sizes
+    uint32_t *d_partitions_inbound_sizes,
+    uint32_t *d_partitions_pins
 );
 
 void refinementSparseRepeats(
@@ -53,27 +57,33 @@ void refinementSparseRepeats(
     const uint32_t *d_inbound_count,
     const float *d_hedge_weights,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t level_idx,
     const uint32_t curr_num_nodes,
     const uint32_t num_hedges,
     const uint32_t num_partitions,
     const dim_t touching_size,
     const bool update_final_inbound_counts,
+    const uint32_t h_max_nodes_per_part,
+    const uint32_t h_max_pins_per_part,
     uint32_t *d_pairs,
     float *d_f_scores,
     uint32_t *d_partitions,
     uint32_t *d_partitions_sizes,
-    uint32_t *d_partitions_inbound_sizes
+    uint32_t *d_partitions_inbound_sizes,
+    uint32_t *d_partitions_pins
 );
 
 void logPartitions(
     const uint32_t *d_partitions,
     const uint32_t *d_partitions_sizes,
     const uint32_t *d_partitions_inbound_sizes,
+    const uint32_t *d_partitions_pins,
     const uint32_t curr_num_nodes,
     const uint32_t num_partitions,
     const uint32_t h_max_nodes_per_part,
-    const uint32_t h_max_inbound_per_part
+    const uint32_t h_max_inbound_per_part,
+    const uint32_t h_max_pins_per_part
 );
 
 void logMoves(
@@ -153,12 +163,14 @@ void fm_refinement_apply_kernel(
     const uint32_t* __restrict__ moves,
     const uint32_t* __restrict__ move_ranks,
     const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ nodes_pins,
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
     const uint32_t num_good_moves,
     uint32_t* __restrict__ partitions,
-    uint32_t* __restrict__ partitions_sizes
+    uint32_t* __restrict__ partitions_sizes,
+    uint32_t* __restrict__ partitions_pins
     //uint32_t* __restrict__ pins_per_partitions
 );
 
@@ -168,10 +180,12 @@ void build_size_events_kernel(
     const uint32_t* __restrict__ ranks,
     const uint32_t* __restrict__ partitions,
     const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ nodes_pins,
     const uint32_t num_nodes,
     uint32_t* __restrict__ ev_partition,
     uint32_t* __restrict__ ev_index,
-    int32_t* __restrict__ ev_delta
+    int32_t* __restrict__ ev_delta,
+    int32_t* __restrict__ ev_pins_delta
 );
 
 __global__
@@ -181,6 +195,7 @@ void flag_size_events_kernel(
     const int32_t* __restrict__ ev_delta,
     const uint32_t* __restrict__ partitions_sizes,
     const uint32_t num_events,
+    const uint32_t h_max_per_part,
     int32_t* __restrict__ valid_moves
 );
 
@@ -324,11 +339,13 @@ void build_size_events_sparse_kernel(
     const uint32_t* __restrict__ ranks,
     const uint32_t* __restrict__ partitions,
     const uint32_t* __restrict__ nodes_sizes,
+    const uint32_t* __restrict__ nodes_pins,
     const dim_t* __restrict__ size_ev_offsets,
     const uint32_t num_nodes,
     uint32_t* __restrict__ ev_partition,
     uint32_t* __restrict__ ev_index,
-    int32_t* __restrict__ ev_delta
+    int32_t* __restrict__ ev_delta,
+    int32_t* __restrict__ ev_pins_delta
 );
 
 __global__

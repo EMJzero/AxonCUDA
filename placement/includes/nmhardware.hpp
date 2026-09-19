@@ -62,7 +62,8 @@ namespace hwmodel {
     struct HardwareModelConfig {
         std::string name;
         uint32_t nodes_per_core;
-        uint32_t synapses_per_core;
+        uint32_t inbound_per_core; // distinct inbound axons per core
+        uint32_t pins_per_core; // synapses (inbound hgraph pins) per core -> sum of the nodes' inbound set cardinalities
         double energy_per_routing;
         double energy_per_wire;
         double latency_per_routing;
@@ -70,7 +71,7 @@ namespace hwmodel {
     };
 
     // partitionSequential: sequential greedy partitioning with constraints on
-    // max neurons (N), max inbound synapses (M), and max partitions (K).
+    // max neurons (N), max inbound axons (M), and max partitions (K).
     std::vector<uint32_t> partitionSequential(const HyperGraph& hg, uint32_t N, uint32_t M, uint32_t K);
 
     template<Topology T>
@@ -83,7 +84,8 @@ namespace hwmodel {
         // CONSTRAINTS
         T topology_; // the topology's extent determines the number of cores along each dimension
         uint32_t nodes_per_core_;
-        uint32_t synapses_per_core_;
+        uint32_t inbound_per_core_; // distinct inbound axons per core
+        uint32_t pins_per_core_; // synapses (inbound hgraph pins) per core
 
         // COSTS
         double energy_per_routing_; // in [pJ]
@@ -96,13 +98,14 @@ namespace hwmodel {
             name_(cfg.name),
             topology_(topology),
             nodes_per_core_(cfg.nodes_per_core),
-            synapses_per_core_(cfg.synapses_per_core),
+            inbound_per_core_(cfg.inbound_per_core),
+            pins_per_core_(cfg.pins_per_core),
             energy_per_routing_(cfg.energy_per_routing),
             energy_per_wire_(cfg.energy_per_wire),
             latency_per_routing_(cfg.latency_per_routing),
             latency_per_wire_(cfg.latency_per_wire)
         {
-            if (!(nodes_per_core_ > 0 && synapses_per_core_ > 0)) {
+            if (!(nodes_per_core_ > 0 && inbound_per_core_ > 0 && pins_per_core_ > 0)) {
                 throw std::invalid_argument("All hardware constraints must be > 0.");
             }
             if (!(energy_per_routing_ >= 0.0 && energy_per_wire_ >= 0.0 &&
@@ -115,7 +118,8 @@ namespace hwmodel {
         std::string name() const { return name_; }
         const T& topology() const noexcept { return topology_; }
         uint32_t neuronsPerCore() const { return nodes_per_core_; }
-        uint32_t synapsesPerCore() const { return synapses_per_core_; }
+        uint32_t inboundPerCore() const { return inbound_per_core_; }
+        uint32_t pinsPerCore() const { return pins_per_core_; }
 
         double energyPerRouting() const { return energy_per_routing_; }
         double energyPerWire() const { return energy_per_wire_; }
@@ -267,7 +271,8 @@ namespace hwmodel {
             HardwareModelConfig cfg_loihi;
             cfg_loihi.name = "Loihi";
             cfg_loihi.nodes_per_core = 1024;
-            cfg_loihi.synapses_per_core = 4096;
+            cfg_loihi.inbound_per_core = 4096;
+            cfg_loihi.pins_per_core = 16384;
             cfg_loihi.energy_per_routing = 1.7;
             cfg_loihi.energy_per_wire = 3.5;
             cfg_loihi.latency_per_routing = 2.1;
@@ -283,7 +288,8 @@ namespace hwmodel {
             HardwareModelConfig cfg_loihi_large;
             cfg_loihi_large.name = "Loihi Large";
             cfg_loihi_large.nodes_per_core = 1024;
-            cfg_loihi_large.synapses_per_core = 4096;
+            cfg_loihi_large.inbound_per_core = 4096;
+            cfg_loihi_large.pins_per_core = 16384;
             cfg_loihi_large.energy_per_routing = 1.7;
             cfg_loihi_large.energy_per_wire = 3.5;
             cfg_loihi_large.latency_per_routing = 2.1;
@@ -299,7 +305,8 @@ namespace hwmodel {
             HardwareModelConfig cfg_loihi_jin_84;
             cfg_loihi_jin_84.name = "Loihi Jin 84";
             cfg_loihi_jin_84.nodes_per_core = 4096;
-            cfg_loihi_jin_84.synapses_per_core = 1024*64;
+            cfg_loihi_jin_84.inbound_per_core = 1024*64;
+            cfg_loihi_jin_84.pins_per_core = 1024*256;
             cfg_loihi_jin_84.energy_per_routing = 1.0;
             cfg_loihi_jin_84.energy_per_wire = 0.1;
             cfg_loihi_jin_84.latency_per_routing = 1.0;
@@ -315,7 +322,8 @@ namespace hwmodel {
             HardwareModelConfig cfg_loihi_jin_1024;
             cfg_loihi_jin_1024.name = "Loihi Jin 1024";
             cfg_loihi_jin_1024.nodes_per_core = 4096;
-            cfg_loihi_jin_1024.synapses_per_core = 1024*64;
+            cfg_loihi_jin_1024.inbound_per_core = 1024*64;
+            cfg_loihi_jin_1024.pins_per_core = 1024*256;
             cfg_loihi_jin_1024.energy_per_routing = 1.0;
             cfg_loihi_jin_1024.energy_per_wire = 0.1;
             cfg_loihi_jin_1024.latency_per_routing = 1.0;
@@ -331,7 +339,8 @@ namespace hwmodel {
             HardwareModelConfig cfg_truenorth;
             cfg_truenorth.name = "TrueNorth";
             cfg_truenorth.nodes_per_core = 256;
-            cfg_truenorth.synapses_per_core = 256;
+            cfg_truenorth.inbound_per_core = 256;
+            cfg_truenorth.pins_per_core = 16384;
             cfg_truenorth.energy_per_routing = 1.7; // unknown (this is from Loihi)
             cfg_truenorth.energy_per_wire = 3.5; // unknown (this is from Loihi)
             cfg_truenorth.latency_per_routing = 2.1; // unknown (this is from Loihi)

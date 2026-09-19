@@ -18,6 +18,7 @@ using namespace config;
 uint32_t greedyMergeGroups(
     const runconfig &cfg,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t *d_inbound_count,
     const uint32_t *d_ungroups,
     const dim_t *d_ungroups_offsets,
@@ -25,18 +26,22 @@ uint32_t greedyMergeGroups(
     const uint32_t new_num_nodes,
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
+    const uint32_t h_max_pins_per_part,
     uint32_t *d_groups,
-    uint32_t *d_groups_sizes
+    uint32_t *d_groups_sizes,
+    uint32_t *d_groups_pins
 );
 
 void mergeSmallPartitions(
     const runconfig &cfg,
     const uint32_t *d_partitions_sizes,
     const uint32_t *d_partitions_inbound_sizes,
+    const uint32_t *d_partitions_pins,
     const uint32_t num_nodes,
     const uint32_t num_partitions,
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
+    const uint32_t h_max_pins_per_part,
     uint32_t *d_partitions
 );
 

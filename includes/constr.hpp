@@ -20,20 +20,22 @@ namespace constraints {
     struct ConstraintsConfig {
         std::string name;
         uint32_t nodes_per_part;
-        uint32_t inbound_per_part;
+        uint32_t inbound_per_part; // distinct inbound axons per partition
+        uint32_t pins_per_part; // synapses (inbound hgraph pins) per partition -> sum of the nodes' inbound set cardinalities
         uint32_t max_parts;
     };
 
     // sequential greedy partitioning with constraints:
-    // max nodes per part (N), max inbound per part (M), and max partitions (K).
-    std::vector<uint32_t> partitionSequential(const hgraph::HyperGraph& hg, uint32_t N, uint32_t M, uint32_t K);
+    // max nodes per part (N), max inbound per part (M), max inbound pins per part (Q), and max partitions (K).
+    std::vector<uint32_t> partitionSequential(const hgraph::HyperGraph& hg, uint32_t N, uint32_t M, uint32_t Q, uint32_t K);
 
     class Constraints {
         private:
         std::string name_;
         // CONSTRAINTS
         uint32_t nodes_per_part_;
-        uint32_t inbound_per_part_;
+        uint32_t inbound_per_part_; // distinct inbound axons per partition
+        uint32_t pins_per_part_; // synapses (inbound hgraph pins) per partition
         uint32_t max_parts_;
 
         public:
@@ -41,9 +43,10 @@ namespace constraints {
             name_(cfg.name),
             nodes_per_part_(cfg.nodes_per_part),
             inbound_per_part_(cfg.inbound_per_part),
+            pins_per_part_(cfg.pins_per_part),
             max_parts_(cfg.max_parts)
         {
-            if (!(nodes_per_part_ > 0 && inbound_per_part_ > 0 && max_parts_ > 0))
+            if (!(nodes_per_part_ > 0 && inbound_per_part_ > 0 && pins_per_part_ > 0 && max_parts_ > 0))
                 throw std::invalid_argument("All constraints must be > 0.");
         }
 
@@ -51,6 +54,7 @@ namespace constraints {
         std::string name() const { return name_; }
         uint32_t nodesPerPart() const { return nodes_per_part_; }
         uint32_t inboundPerPart() const { return inbound_per_part_; }
+        uint32_t pinsPerPart() const { return pins_per_part_; }
         uint32_t maxParts() const { return max_parts_; }
 
         // empirical: can have false negatives (no false positives tho)

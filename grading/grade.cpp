@@ -41,7 +41,7 @@ void printHelp() {
         "  -plc <file> Read placement data from file\n"
         "  -s <file>   Save partitioned hypergraph to file\n"
         "  -c-prt <name>   Partitioning constraints set to use (valid ones: truenorth, loihi64, loihi84, loihi1024)\n"
-        "  -m-prt <> <> <> Partitioning constraints set to use, in order: max part. size, max part. distinct inbound hedges, max num. of part.s (overrides '-c-prt')\n"
+        "  -m-prt <>x4     Partitioning constraints set to use, in order: max part. size, max part. distinct inbound hedges, max part. pins, max num. of part.s (overrides '-c-prt')\n"
         "  -k-prt <k> <ε>  K-way balanced constraints set to use (overrides '-c-prt' and '-m-prt')\n"
         "  -c-plc <name>   Placement constraints set to use (valid ones: truenorth, loihi, loihi64, loihi84, loihi1024)\n"
         "  -t-plc <name>   Placement topology (valid ones: lat2d, tor6d)\n"
@@ -120,12 +120,14 @@ Constraints setupPartConstr(PartConstrType constraints_type, ConstraintsConfig c
         constr_config.name = std::to_string(kway) + "-way " + epsistr.str() + " balanced";
         constr_config.nodes_per_part = (uint32_t)std::ceil((1 + epsi) * (float)hg.nodes() / kway);
         constr_config.inbound_per_part = INT32_MAX;
+        constr_config.pins_per_part = INT32_MAX;
         constr_config.max_parts = kway;
         return Constraints(constr_config);
     } else if (constraints_type == PartConstrType::MANL) { // manual constraints ('-m')
         if (constr_config.nodes_per_part == 0) { std::cerr << "Error: the 1st constraint (max partition size) must be a positive integer \n"; std::exit(1); }
         if (constr_config.inbound_per_part == 0) { std::cerr << "Error: the 2nd constraint (max distinct inbound hedge per partition) must be a positive integer \n"; std::exit(1); }
-        if (constr_config.max_parts == 0) { std::cerr << "Error: the 3rd constraint (max number of partitions) must be a positive integer \n"; std::exit(1); }
+        if (constr_config.pins_per_part == 0) { std::cerr << "Error: the 3rd constraint (max pins per partition) must be a positive integer \n"; std::exit(1); }
+        if (constr_config.max_parts == 0) { std::cerr << "Error: the 4th constraint (max number of partitions) must be a positive integer \n"; std::exit(1); }
         return Constraints(constr_config);
     } else if (constraints_type == PartConstrType::NAME) { // preconfigured constraints ('-c')
         std::unordered_map<std::string, Constraints (*)()> configurations {
@@ -235,11 +237,12 @@ int main(int argc, char** argv) {
             part_constraints_type = PartConstrType::NAME;
             part_constr_config.name = argv[++i];
         } else if (arg == "-m-prt") {
-            if (i + 3 >= argc) { std::cerr << "Error: -m-prt requires integer values for the three constraints\n"; std::exit(1); }
+            if (i + 4 >= argc) { std::cerr << "Error: -m-prt requires integer values for the four constraints\n"; std::exit(1); }
             part_constraints_type = PartConstrType::MANL;
             part_constr_config.name = "manual";
             part_constr_config.nodes_per_part = std::stoul(argv[++i]);
             part_constr_config.inbound_per_part = std::stoul(argv[++i]);
+            part_constr_config.pins_per_part = std::stoul(argv[++i]);
             part_constr_config.max_parts = std::stoul(argv[++i]);
         } else if (arg == "-k-prt") {
             if (i + 2 >= argc) { std::cerr << "Error: -k-prt requires values for 'k' and 'ε'\n"; std::exit(1); }
@@ -313,6 +316,7 @@ int main(int argc, char** argv) {
         std::cout << "Using partitioning constraints \"" << part_constr.name() << "\":\n";
         std::cout << "  Nodes per partition:         " << part_constr.nodesPerPart() << "\n";
         std::cout << "  Inbound hedge per partition: " << part_constr.inboundPerPart() << "\n";
+        std::cout << "  Inbound pins per partition:  " << part_constr.pinsPerPart() << "\n";
         std::cout << "  Maximum partitions:          " << part_constr.maxParts() << "\n";
 
         // load partitioning
@@ -372,10 +376,11 @@ int main(int argc, char** argv) {
             using Coord = Coord_t<T>;
 
             std::cout << "Using placement constraints \"" << plac_constr.name() << "\":\n";
-            std::cout << "  Topology:          " << topology_name << "\n";
-            std::cout << "  Neurons per core:  " << plac_constr.neuronsPerCore() << "\n";
-            std::cout << "  Synapses per core: " << plac_constr.synapsesPerCore() << "\n";
-            std::cout << "  Cores per dim:  " << plac_constr.coresAlongDim(0);
+            std::cout << "  Topology:                 " << topology_name << "\n";
+            std::cout << "  Neurons per core:         " << plac_constr.neuronsPerCore() << "\n";
+            std::cout << "  Inbound axons per core:   " << plac_constr.inboundPerCore() << "\n";
+            std::cout << "  Synapses (pins) per core: " << plac_constr.pinsPerCore() << "\n";
+            std::cout << "  Cores per dim:            " << plac_constr.coresAlongDim(0);
             for (uint32_t dim = 1; dim < T::dimensions; dim++)
                 std::cout << ", " << plac_constr.coresAlongDim(dim);
             std::cout << " (" << plac_constr.coresCount() << " tot.)" << "\n";

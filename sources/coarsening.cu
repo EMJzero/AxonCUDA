@@ -26,6 +26,7 @@ void candidatesProposal(
     const uint32_t *d_inbound_count,
     const float *d_hedge_weights,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t curr_num_nodes,
     uint32_t *d_pairs,
     uint32_t *d_u_scores
@@ -57,6 +58,7 @@ void candidatesProposal(
             d_inbound_count,
             d_hedge_weights,
             d_nodes_sizes,
+            d_nodes_pins,
             curr_num_nodes,
             cfg.candidates_count,
             d_pairs,
@@ -67,16 +69,18 @@ void candidatesProposal(
     }
 }
 
-std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
+std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
     const runconfig &cfg,
     const cudaDeviceProp props,
     const uint32_t *d_inbound_count,
     const uint32_t *d_pairs,
     const uint32_t *d_u_scores,
     const uint32_t *d_nodes_sizes,
+    const uint32_t *d_nodes_pins,
     const uint32_t curr_num_nodes,
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
+    const uint32_t h_max_pins_per_part,
     slot *d_slots,
     dp_score *d_dp_scores
 ) {
@@ -121,6 +125,7 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
             (void*)&d_pairs,
             (void*)&d_u_scores,
             (void*)&d_nodes_sizes,
+            (void*)&d_nodes_pins,
             (void*)&curr_num_nodes,
             (void*)&cfg.candidates_count,
             (void*)&d_slots,
@@ -140,11 +145,13 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
     build_orphan_pairs(
         cfg,
         d_nodes_sizes,
+        d_nodes_pins,
         d_inbound_count,
         d_pairs,
         curr_num_nodes,
         h_max_nodes_per_part,
         h_max_inbound_per_part,
+        h_max_pins_per_part,
         cfg.candidates_count,
         d_groups
     );
@@ -183,6 +190,19 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
     thrust::reduce_by_key(t_headflags.begin(), t_headflags.end(), nodes_sizes_values_begin, thrust::make_discard_iterator(), t_groups_sizes);
     // => now "d_groups_sizes[idx]" holds the sum of nodes_size over all nodes in group idx, for idx in [0, new_num_nodes)
     // ======================================
+    // prepare this level's cumulative groups pins
+    // NOTE: inbound pins are additive just like sizes, a node always brings along its whole inbound set
+    uint32_t *d_groups_pins = nullptr; // group_pins[group id] = sum of pins of all nodes in that group
+    CUDA_CHECK(cudaMalloc(&d_groups_pins, new_num_nodes * sizeof(uint32_t)));
+    // extra step: compute cumulative group pins
+    thrust::device_ptr<uint32_t> t_groups_pins(d_groups_pins);
+    thrust::device_ptr<const uint32_t> t_nodes_pins(d_nodes_pins);
+    // permute node pins in "sorted-by-group" order, exactly as done above for node sizes
+    auto nodes_pins_values_begin = thrust::make_permutation_iterator(t_nodes_pins, t_nodes);
+    // reduce (sum) nodes_pins inside each group, keyed by headflag just like nodes_sizes
+    thrust::reduce_by_key(t_headflags.begin(), t_headflags.end(), nodes_pins_values_begin, thrust::make_discard_iterator(), t_groups_pins);
+    // => now "d_groups_pins[idx]" holds the sum of nodes_pins over all nodes in group idx, for idx in [0, new_num_nodes)
+    // ======================================
     // scatter the new ids back to original positions using the sequence; for sorted position i, original index is t_nodes[i]; we want: d_groups[t_nodes[i]] = t_headflags[i]
     thrust::scatter(t_headflags.begin(), t_headflags.end(), t_nodes, t_groups);
     // if the number of groups has reached the required threshold, they become the partitions
@@ -206,7 +226,7 @@ std::tuple<uint32_t, uint32_t*, uint32_t*, uint32_t*, dim_t*> groupNodes(
     dim_t dim_t_curr_num_nodes = (dim_t)curr_num_nodes;
     CUDA_CHECK(cudaMemcpy(d_ungroups_offsets + new_num_nodes, &dim_t_curr_num_nodes, sizeof(dim_t), cudaMemcpyHostToDevice));
 
-    return std::make_tuple(new_num_nodes, d_groups, d_groups_sizes, d_ungroups, d_ungroups_offsets);
+    return std::make_tuple(new_num_nodes, d_groups, d_groups_sizes, d_groups_pins, d_ungroups, d_ungroups_offsets);
 }
 
 
@@ -261,21 +281,26 @@ void logGroups(
     const uint32_t *d_pairs,
     const uint32_t *d_groups,
     const uint32_t *d_groups_sizes,
+    const uint32_t *d_groups_pins,
     const uint32_t curr_num_nodes,
     const uint32_t new_num_nodes,
-    const uint32_t h_max_nodes_per_part
+    const uint32_t h_max_nodes_per_part,
+    const uint32_t h_max_pins_per_part
 ) {
     std::vector<uint32_t> pairs_tmp(curr_num_nodes * cfg.candidates_count);
     std::vector<uint32_t> groups_tmp(curr_num_nodes);
     std::vector<uint32_t> groups_sizes_tmp(new_num_nodes);
+    std::vector<uint32_t> groups_pins_tmp(new_num_nodes);
     CUDA_CHECK(cudaMemcpy(pairs_tmp.data(), d_pairs, curr_num_nodes * sizeof(uint32_t) * cfg.candidates_count, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(groups_tmp.data(), d_groups, curr_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(groups_sizes_tmp.data(), d_groups_sizes, new_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(groups_pins_tmp.data(), d_groups_pins, new_num_nodes * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     std::unordered_map<uint32_t, int> groups_count;
     std::cout << "Grouping results:\n";
     for (uint32_t i = 0; i < curr_num_nodes; ++i) {
         uint32_t group = groups_tmp[i];
         uint32_t group_size = groups_sizes_tmp[group];
+        uint32_t group_pins = groups_pins_tmp[group];
         groups_count[group]++;
         if (i < std::min<uint32_t>(curr_num_nodes, VERBOSE_LENGTH)) {
             std::cout << "  node " << i << " ->";
@@ -284,16 +309,22 @@ void logGroups(
                 if (target == UINT32_MAX) std::cout << " (" << j << " target=none)";
                 else std::cout << " (" << j << " target=" << target << ")";
             }
-            std::cout << " group=" << group << " group_size=" << group_size << "\n";
+            std::cout << " group=" << group << " group_size=" << group_size << " group_pins=" << group_pins << "\n";
         }
     }
     long long max_gs = 0, sum_gs = 0;
+    long long max_gp = 0, sum_gp = 0;
     for (uint32_t i = 0; i < new_num_nodes; ++i) {
         uint32_t group_size = groups_sizes_tmp[i];
+        uint32_t group_pins = groups_pins_tmp[i];
         sum_gs += group_size;
+        sum_gp += group_pins;
         if (group_size > max_gs) max_gs = group_size;
+        if (group_pins > max_gp) max_gp = group_pins;
         if (group_size > h_max_nodes_per_part)
             std::cerr << "  WARNING, max group size constraint (" << h_max_nodes_per_part << ") violated by group=" << i << " with group_size=" << group_size << " !!\n";
+        if (group_pins > h_max_pins_per_part)
+            std::cerr << "  WARNING, max group pins constraint (" << h_max_pins_per_part << ") violated by group=" << i << " with group_pins=" << group_pins << " !!\n";
     }
     long long max_cgs = 0, sum_cgs = 0;
     for (const auto& [group, count] : groups_count) {
@@ -302,4 +333,5 @@ void logGroups(
     }
     std::cout << "Groups count: " << groups_count.size() << "\n  Max coarse group size: " << max_cgs << ", Avg coarse group size: " << std::fixed << std::setprecision(2) << (float)sum_cgs/groups_count.size() << "\n";
     std::cout << "  Max nodes group size: " << max_gs << ", Avg nodes group size: " << std::fixed << std::setprecision(2) << (float)sum_gs/groups_count.size() << "\n";
+    std::cout << "  Max nodes group pins: " << max_gp << ", Avg nodes group pins: " << std::fixed << std::setprecision(2) << (float)sum_gp/groups_count.size() << "\n";
 }

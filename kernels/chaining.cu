@@ -238,9 +238,11 @@ void pair_kth_smallest_with_kth_largest(
     const uint32_t* __restrict__ sorted_indices, // length = K
     const uint32_t num_free,
     const uint32_t* __restrict__ d_nodes_sizes,
+    const uint32_t* __restrict__ d_nodes_pins,
     const uint32_t* __restrict__ d_inbound_count,
     const uint32_t h_max_nodes_per_part,
     const uint32_t h_max_inbound_per_part,
+    const uint32_t h_max_pins_per_part,
     uint32_t* __restrict__ d_groups
 ) {
     // STYLE: one orphan-in-two per thread!
@@ -263,7 +265,14 @@ void pair_kth_smallest_with_kth_largest(
 
     if (inL + inR > h_max_inbound_per_part) return;
 
-    // both constraints satisfied -> write group id
+    // read pin counts
+    uint32_t pL = d_nodes_pins[idxL];
+    uint32_t pR = d_nodes_pins[idxR];
+
+    // check pins constraint
+    if (pL + pR > h_max_pins_per_part) return;
+
+    // all constraints satisfied -> write group id
     uint32_t gid = (idxL < idxR) ? idxL : idxR;
     d_groups[idxL] = gid;
     d_groups[idxR] = gid;
