@@ -272,7 +272,7 @@ namespace hwmodel {
             cfg_loihi.name = "Loihi";
             cfg_loihi.nodes_per_core = 1024;
             cfg_loihi.inbound_per_core = 4096;
-            cfg_loihi.pins_per_core = 16384;
+            cfg_loihi.pins_per_core = 128*1024;
             cfg_loihi.energy_per_routing = 1.7;
             cfg_loihi.energy_per_wire = 3.5;
             cfg_loihi.latency_per_routing = 2.1;
@@ -289,7 +289,7 @@ namespace hwmodel {
             cfg_loihi_large.name = "Loihi Large";
             cfg_loihi_large.nodes_per_core = 1024;
             cfg_loihi_large.inbound_per_core = 4096;
-            cfg_loihi_large.pins_per_core = 16384;
+            cfg_loihi_large.pins_per_core = 128*1024;
             cfg_loihi_large.energy_per_routing = 1.7;
             cfg_loihi_large.energy_per_wire = 3.5;
             cfg_loihi_large.latency_per_routing = 2.1;
@@ -306,7 +306,7 @@ namespace hwmodel {
             cfg_loihi_jin_84.name = "Loihi Jin 84";
             cfg_loihi_jin_84.nodes_per_core = 4096;
             cfg_loihi_jin_84.inbound_per_core = 1024*64;
-            cfg_loihi_jin_84.pins_per_core = 1024*256;
+            cfg_loihi_jin_84.pins_per_core = 1024*1024;
             cfg_loihi_jin_84.energy_per_routing = 1.0;
             cfg_loihi_jin_84.energy_per_wire = 0.1;
             cfg_loihi_jin_84.latency_per_routing = 1.0;
@@ -323,7 +323,7 @@ namespace hwmodel {
             cfg_loihi_jin_1024.name = "Loihi Jin 1024";
             cfg_loihi_jin_1024.nodes_per_core = 4096;
             cfg_loihi_jin_1024.inbound_per_core = 1024*64;
-            cfg_loihi_jin_1024.pins_per_core = 1024*256;
+            cfg_loihi_jin_1024.pins_per_core = 1024*1024;
             cfg_loihi_jin_1024.energy_per_routing = 1.0;
             cfg_loihi_jin_1024.energy_per_wire = 0.1;
             cfg_loihi_jin_1024.latency_per_routing = 1.0;

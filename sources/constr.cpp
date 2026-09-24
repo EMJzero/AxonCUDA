@@ -218,7 +218,7 @@ namespace constraints {
         cfg_loihi_large.name = "Loihi Large";
         cfg_loihi_large.nodes_per_part = 1024;
         cfg_loihi_large.inbound_per_part = 4096;
-        cfg_loihi_large.pins_per_part = 16384;
+        cfg_loihi_large.pins_per_part = 128*1024;
         cfg_loihi_large.max_parts = 4096;
         return Constraints(cfg_loihi_large);
     }
@@ -228,7 +228,7 @@ namespace constraints {
         cfg_loihi_jin_84.name = "Loihi Jin 84";
         cfg_loihi_jin_84.nodes_per_part = 4096;
         cfg_loihi_jin_84.inbound_per_part = 1024*64;
-        cfg_loihi_jin_84.pins_per_part = 1024*256;
+        cfg_loihi_jin_84.pins_per_part = 1024*1024;
         cfg_loihi_jin_84.max_parts = 7056;
         return Constraints(cfg_loihi_jin_84);
     }
@@ -238,7 +238,7 @@ namespace constraints {
         cfg_loihi_jin_1024.name = "Loihi Jin 1024";
         cfg_loihi_jin_1024.nodes_per_part = 4096;
         cfg_loihi_jin_1024.inbound_per_part = 1024*64;
-        cfg_loihi_jin_1024.pins_per_part = 1024*256;
+        cfg_loihi_jin_1024.pins_per_part = 1024*1024;
         cfg_loihi_jin_1024.max_parts = 1048576;
         return Constraints(cfg_loihi_jin_1024);
     }
