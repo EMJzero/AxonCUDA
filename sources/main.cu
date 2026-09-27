@@ -21,6 +21,7 @@
 #include "runconfig.hpp"
 
 #include "utils.cuh"
+#include "eval_instr.cuh"
 #include "defines.cuh"
 #include "constants.cuh"
 #include "data_types.cuh"
@@ -277,6 +278,7 @@ int main(int argc, char** argv) {
     DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
 
     // prepare touching sets
+    EVP_PUSH("setup_touching");
     dim_t touching_hedges_size;
     if (cfg.device_touching_construction) {
         std::tie(touching_hedges_size, d_touching, d_touching_offsets, d_inbound_count) = buildTouching(
@@ -310,6 +312,7 @@ int main(int argc, char** argv) {
         NEIGHBORS_SAMPLE_SIZE
     );
     INFO(cfg) std::cout << "Max neighbors estimate set to: " << max_neighbors << "\n";
+    EVP_POP(); // setup_touching
 
     INFO(cfg) std::cout << "Starting core timer...\n";
     cudaEvent_t d_time_core_start, d_time_core_stop;
@@ -318,6 +321,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventRecord(d_time_core_start));
 
     // prepare neighborhoods
+    EVP_PUSH("construct_neighbors");
     dim_t neighbors_size;
     std::tie(neighbors_size, d_neighbors, d_neighbors_offsets) = buildNeighbors(
         cfg,
@@ -330,6 +334,7 @@ int main(int argc, char** argv) {
         d_neighbors,
         d_neighbors_offsets
     );
+    EVP_POP(); // construct_neighbors
 
 
     // returns the number of partitions and the pointer to the final partitions device buffer
@@ -457,6 +462,8 @@ int main(int argc, char** argv) {
         }
         // ======================================
 
+        EVP_PUSH(std::string("coarsen L") + std::to_string(level_idx));
+
         // each node picks its candidate(s)
         candidatesProposal(
             cfg,
@@ -561,6 +568,7 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaFree(d_neighbors));
             CUDA_CHECK(cudaFree(d_neighbors_offsets));
 
+            EVP_POP(); // coarsen L (k-way shrink base case)
             return std::make_tuple(max_parts, d_init_partitions);
         }
         // ======================================
@@ -645,6 +653,7 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaFree(d_ungroups));
             CUDA_CHECK(cudaFree(d_ungroups_offsets));
 
+            EVP_POP(); // coarsen L (initial-partitioning base case)
             return std::make_tuple(new_num_nodes, d_groups);
         }
         // ======================================
@@ -748,6 +757,8 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaFree(d_inbound_count));
         }
         
+        EVP_POP(); // coarsen L{level_idx}
+
         // ======================================
         // recursive call, go down one more level
         auto [num_partitions, d_coarse_partitions] = coarsen_refine_uncoarsen(
@@ -765,6 +776,8 @@ int main(int argc, char** argv) {
             d_groups_pins
         );
         // ======================================
+
+        EVP_PUSH(std::string("uncoarsen_refine L") + std::to_string(level_idx));
 
         INFO(cfg) std::cout << "Uncoarsening level " << level_idx << ", remaining nodes=" << curr_num_nodes << "\n";
 
@@ -875,6 +888,7 @@ int main(int argc, char** argv) {
             d_partitions_pins
         );
 
+        EVP_POP(); // uncoarsen_refine L{level_idx}
         return std::make_tuple(num_partitions, d_partitions);
     }; // coarsen_refine_uncoarsen end
 
@@ -1017,7 +1031,10 @@ int main(int argc, char** argv) {
     //if (dbg_conn != partitioned_hg.connectivity()) std::cerr << "ERROR, incorrect metric calculation for connectivity: " << dbg_conn << " vs " << partitioned_hg.connectivity() << " !!\n";
     //if (dbg_cutn != partitioned_hg.cutnet()) std::cerr << "ERROR, incorrect metric calculation for cut-net: " << dbg_cutn << " vs " << partitioned_hg.cutnet() << " !!\n";
 
-    if (!evaluateAndSaveResults(cfg, constr, hg, partitions)) {
+    EVP_PUSH("postproc_host");
+    bool ok = evaluateAndSaveResults(cfg, constr, hg, partitions);
+    EVP_POP(); // postproc_host
+    if (!ok) {
         std::cerr << "ERROR, invalid partitining !!\n";
         return 1;
     }

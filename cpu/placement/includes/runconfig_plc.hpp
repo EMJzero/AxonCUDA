@@ -23,21 +23,22 @@ namespace config_plc {
         uint32_t fd_iterations; // number of force-directed refinement iterations to perform
         uint32_t candidates_count; // number of candidate swaps proposed per node during force-directed refinement
         uint32_t multi_start_override; // imposes the number of multi-start attempts at placement
-        uint32_t batch_size; // imposes how many multi-start attempts are refined together, by one launch of every kernel
+        uint32_t batch_size; // imposes how many multi-start attempts are refined together, by one call of every kernel
+        uint32_t threads; // number of OpenMP threads to use
         topology::TargetTopology topology; // target graph topology, how places are interconnected
         curve::SpaceFillingCurve space_filling_curve; // space filling curve to use for the 1D-to-(N)D locality-preserving mapping
-        bool feedforward_order; // if true, use the greedy sequential feedforward initial partitioning (runs on the host !!)
+        bool feedforward_order; // if true, use the greedy sequential feedforward initial partitioning (runs sequentially !!)
         // ROUTING POLICIES: which cost models to evaluate the placement under (see -rp)
         bool unicast_metrics; // if true, compute and log the unicast placement quality metrics
         bool xy_multicast_metrics; // if true, compute and log the XY-multicast placement quality metrics
         bool steiner_multicast_metrics; // if true, compute and log the Steiner-multicast placement quality metrics (very slow!!)
-        bool device_touching_construction; // whether to construct touching/incidence sets on the device or the host
+        bool parallel_touching_construction; // whether to construct touching/incidence sets in parallel or sequentially while loading
         uint64_t seed; // seed for the multi-start and recursive bisection methods
         bool verbose_logs; // whether to log what is happening inside the algorithms
         bool verbose_info; // whether to log the step/phase where the program is at
         bool verbose_errs_and_warns; // whether to log errs and warnings
-        bool verbose_kernel_launches; // whether to log every kernel launch or not
-        bool debug; // whether to run extra debug synchronization/checks
+        bool verbose_kernel_launches; // whether to log every parallel loop or not
+        bool debug; // whether to run extra debug checks
     };
 
     void printHelp();
@@ -52,7 +53,7 @@ namespace config_plc {
     hwmodel::HardwareModel<T> setupNMH(runconfig &cfg);
 
     template<topology::Topology T>
-    void saveResult(runconfig &cfg, std::vector<topology::Coord_t<T>> h_placement);
+    void saveResult(runconfig &cfg, std::vector<topology::Coord_t<T>> placement);
 
     const char* topologyToString(topology::TargetTopology topology);
 

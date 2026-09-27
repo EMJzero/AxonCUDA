@@ -3,14 +3,11 @@
 #include <string>
 #include <cstdint>
 
-#include <cuda_runtime.h>
-#include <cooperative_groups.h>
-
 #include "topology.hpp"
 
-#include "data_types.cuh"
-#include "data_types_plc.cuh"
-#include "defines_plc.cuh"
+#include "data_types.hpp"
+#include "data_types_plc.hpp"
+#include "defines_plc.hpp"
 
 namespace config_plc {
     struct runconfig;
@@ -19,22 +16,10 @@ namespace config_plc {
 using namespace config_plc;
 using namespace topology;
 
-namespace cg = cooperative_groups;
-
-// DEVICE CONSTANTS:
+// TOPOLOGY:
+// NOTE: in CUDA this is a '__constant__' symbol, here a plain global, set once in main and then read everywhere
 template<Topology T>
-extern __constant__ T c_topo;
-
-
-// USED BY: exclusive swaps kernel
-
-#define SWAPS_PATH_SIZE 4096u // initial slots for places to see while traversing the swaps tree
-#define MAX_SWAPS_MATCHING_REPEATS 64u // number of places that can be handled by the same thread in case of limited space for the cooperative kernel launch (must be <= 64)
-
-
-// USED BY: locality metrics estimation
-
-#define REG_PINS_CAPACITY 64u // maximum number of pins per hedge that can fit in registers (32+1 bit each) -> use in-register MST algorithm
+extern T topo;
 
 
 // STEPS
@@ -42,71 +27,58 @@ extern __constant__ T c_topo;
 template<Topology T>
 void forceDirectedRefinement(
     const runconfig &cfg,
-    const cudaDeviceProp props,
-    const uint32_t* d_hedges,
-    const dim_t* d_hedges_offsets,
-    const uint32_t* d_touching,
-    const dim_t* d_touching_offsets,
-    const float* d_hedge_weights,
+    const uint32_t* hedges,
+    const dim_t* hedges_offsets,
+    const uint32_t* touching,
+    const dim_t* touching_offsets,
+    const float* hedge_weights,
     const uint32_t num_nodes,
     const uint32_t batch_size,
     const uint32_t volume,
-    Coord_t<T>* d_placement,
-    uint32_t* d_inv_placement,
-    const cudaStream_t stream,
-    const int tid
+    Coord_t<T>* placement,
+    uint32_t* inv_placement
 );
 
 template<Topology T>
 void getLocalityMetrics(
     const runconfig &cfg,
-    const Coord_t<T>* d_placement,
-    const uint32_t* d_hedges,
-    const dim_t* d_hedges_offsets,
-    const uint32_t* d_srcs_count,
-    const float* d_hedge_weights,
+    const Coord_t<T>* placement,
+    const uint32_t* hedges,
+    const dim_t* hedges_offsets,
+    const uint32_t* srcs_count,
+    const float* hedge_weights,
     const uint32_t num_hedges,
     const uint32_t num_nodes,
     const uint32_t batch_size,
-    float* d_src_dst_distance, // src_dst_distance[start] -> weighted avg. hedge max src-dst manhattan distance of that multi-start
-    float* d_steiner_span, // steiner_span[start] -> weighted avg. hedge Steiner tree span of that multi-start
-    const cudaStream_t stream,
-    const int tid
+    float* src_dst_distance, // src_dst_distance[start] -> weighted avg. hedge max src-dst manhattan distance of that multi-start
+    float* steiner_span // steiner_span[start] -> weighted avg. hedge Steiner tree span of that multi-start
 );
 
 template<Topology T>
 void logForces(
-    const float *d_forces,
-    const uint32_t num_nodes,
-    const cudaStream_t stream,
-    const int tid
+    const float *forces,
+    const uint32_t num_nodes
 );
 
 template<Topology T>
 void logTensions(
     const runconfig &cfg,
-    const uint32_t *d_pairs,
-    const uint32_t *d_scores,
-    const uint32_t num_nodes,
-    const cudaStream_t stream,
-    const int tid
+    const uint32_t *pairs,
+    const uint32_t *scores,
+    const uint32_t num_nodes
 );
 
 template<Topology T>
 void logSwapPairs(
-    const slot *d_swap_slots,
-    const uint32_t num_nodes,
-    const cudaStream_t stream,
-    const int tid
+    const slot *swap_slots,
+    const uint32_t num_nodes
 );
 
 void logEvents(
-    const swap *d_ev_swaps,
-    const float *d_ev_scores,
+    const swap *ev_swaps,
+    const float *ev_scores,
     const uint32_t num_nodes,
-    const std::string flare,
-    const cudaStream_t stream,
-    const int tid
+    const std::string flare
 );
 
 
@@ -115,10 +87,9 @@ void logEvents(
 // NOTE: every kernel below runs a whole batch of multi-starts at once
 // => per-multi-start arrays are one flat allocation of "batch_size" equally-sized segments, multi-start "b" owning [b*size, (b+1)*size)
 // => node idxs stored in "pairs", "swap_slots", "ev_swaps" and "inv_placement" are batch-flat, hypergraph pin idxs are not
-// => "active[b]" retires a converged multi-start, and is always tested warp-uniformly
+// => "active[b]" retires a converged multi-start
 
 template<Topology T>
-__global__
 void inverse_placement_kernel(
     const Coord_t<T>* __restrict__ placement,
     const uint32_t num_nodes,
@@ -128,7 +99,6 @@ void inverse_placement_kernel(
 );
 
 template<Topology T>
-__global__
 void forces_kernel(
     const uint32_t* __restrict__ hedges,
     const dim_t* __restrict__ hedges_offsets,
@@ -143,7 +113,6 @@ void forces_kernel(
 );
 
 template<Topology T>
-__global__
 void tensions_kernel(
     const Coord_t<T>* __restrict__ placement,
     const uint32_t* __restrict__ inv_placement,
@@ -158,20 +127,17 @@ void tensions_kernel(
 );
 
 template<Topology T>
-__global__
 void exclusive_swaps_kernel(
     const uint32_t* __restrict__ pairs,
     const uint32_t* __restrict__ scores,
     const uint32_t num_nodes,
-    const uint32_t first_start,
-    const uint32_t num_starts,
+    const uint32_t batch_size,
     const uint8_t* __restrict__ active,
     const uint32_t candidates_count,
     slot* __restrict__ swap_slots
 );
 
 template<Topology T>
-__global__
 void swap_events_kernel(
     const slot* __restrict__ swap_slots,
     const uint32_t num_nodes,
@@ -182,7 +148,6 @@ void swap_events_kernel(
 );
 
 template<Topology T>
-__global__
 void scatter_ranks_kernel(
     const swap* __restrict__ ev_swaps,
     const uint32_t num_nodes,
@@ -192,7 +157,6 @@ void scatter_ranks_kernel(
 );
 
 template<Topology T>
-__global__
 void resolve_empty_conflicts_kernel(
     const Coord_t<T>* __restrict__ placement,
     const uint32_t* __restrict__ inv_placement,
@@ -205,7 +169,6 @@ void resolve_empty_conflicts_kernel(
 );
 
 template<Topology T>
-__global__
 void cascade_kernel(
     const uint32_t* __restrict__ hedges,
     const dim_t* __restrict__ hedges_offsets,
@@ -221,16 +184,15 @@ void cascade_kernel(
     float* __restrict__ scores
 );
 
-__global__
 void prefix_gain_kernel(
     const float* __restrict__ ev_scores,
     const uint32_t num_nodes,
+    const uint32_t batch_size,
     uint32_t* __restrict__ num_good_swaps,
     uint8_t* __restrict__ active
 );
 
 template<Topology T>
-__global__
 void apply_swaps_kernel(
     const swap* __restrict__ ev_swaps,
     const uint32_t* __restrict__ num_good_swaps,
@@ -243,7 +205,6 @@ void apply_swaps_kernel(
 );
 
 template<Topology T>
-__global__
 void max_src_dst_distance_kernel(
     const Coord_t<T>* __restrict__ placement,
     const uint32_t* __restrict__ hedges,
@@ -255,7 +216,6 @@ void max_src_dst_distance_kernel(
 );
 
 template<Topology T>
-__global__
 void tot_src_dst_distance_kernel(
     const Coord_t<T>* __restrict__ placement,
     const uint32_t* __restrict__ hedges,
@@ -269,7 +229,6 @@ void tot_src_dst_distance_kernel(
 );
 
 template<Topology T>
-__global__
 void min_spanning_tree_weight_kernel(
     const Coord_t<T>* __restrict__ placement,
     const uint32_t* __restrict__ hedges,

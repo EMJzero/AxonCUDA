@@ -48,7 +48,7 @@ void flag_cutnet_events_kernel(
     // STYLE: one hedge per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
     // global across blocks - coincides with the batch-flat hedge to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    const uint32_t warp_id = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
     if (warp_id >= batch_size * num_hedges) return;
 
     // the hypergraph is shared by every multi-start, only the partitioning its pins are mapped through differs
@@ -94,7 +94,7 @@ void cutnet_event_generation_kernel(
     // STYLE: one hedge per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
     // global across blocks - coincides with the batch-flat hedge to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    const uint32_t warp_id = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
     if (warp_id >= batch_size * num_hedges) return;
 
     // the hypergraph is shared by every multi-start, only the partitioning its pins are mapped through differs

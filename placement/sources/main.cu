@@ -24,6 +24,7 @@
 #include "runconfig_plc.hpp"
 
 #include "utils.cuh"
+#include "eval_instr.cuh"
 #include "utils_plc.cuh"
 #include "data_types.cuh"
 #include "data_types_plc.cuh"
@@ -35,6 +36,7 @@
 using namespace hgraph;
 using namespace hwmodel;
 using namespace topology;
+using namespace curve;
 using namespace config_plc;
 
 
@@ -228,6 +230,7 @@ int main(int argc, char** argv) {
         DBG(cfg) CUDA_CHECK(cudaDeviceSynchronize());
 
         // prepare touching sets
+        EVP_PUSH("setup_touching");
         if (cfg.device_touching_construction) {
             std::tie(d_touching, d_touching_offsets) = buildTouching(
                 cfg,
@@ -242,6 +245,7 @@ int main(int argc, char** argv) {
                 hg
             );
         }
+        EVP_POP(); // setup_touching
 
         // generate a 1D to 2D map for lattice points
         std::vector<Coord> h_1dto2d_placement = generatePlacementCurve<T>(
@@ -326,6 +330,7 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaEventRecord(d_time_batch_start, stream));
 
             // initial placement
+            EVP_PUSH("initial_placement");
             uint32_t* d_order_idx = nullptr; // order_idx[node] -> position in its multi-start's 1D ordering for node
             if (cfg.feedforward_order) {
                 // NOTE: feed-forward ordering is deterministic, so it forces the multi-start count - and thus the batch - down to 1
@@ -441,7 +446,10 @@ int main(int argc, char** argv) {
             }
             // =============================
 
+            EVP_POP(); // initial_placement
+
             // run force-directed refinement over the whole batch
+            EVP_PUSH("fd_refinement");
             forceDirectedRefinement<T>(
                 cfg,
                 props,
@@ -458,8 +466,10 @@ int main(int argc, char** argv) {
                 stream,
                 tid
             );
+            EVP_POP(); // fd_refinement
 
             // grade every solution in the batch
+            EVP_PUSH("grade");
             getLocalityMetrics<T>(
                 cfg,
                 d_placement,
@@ -475,6 +485,7 @@ int main(int argc, char** argv) {
                 stream,
                 tid
             );
+            EVP_POP(); // grade
 
             CUDA_CHECK(cudaMemcpyAsync(h_src_dst_distance.data(), d_src_dst_distance, curr_batch * sizeof(float), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaMemcpyAsync(h_steiner_span.data(), d_steiner_span, curr_batch * sizeof(float), cudaMemcpyDeviceToHost, stream));
@@ -597,6 +608,7 @@ int main(int argc, char** argv) {
         std::cout << "Total device execution time: " << std::fixed << std::setprecision(3) << d_total_ms << " ms\n";
         std::cout << "Total host execution time: " << std::fixed << std::setprecision(3) << total_ms << " ms\n";
 
+        EVP_PUSH("postproc_metrics");
         if (hw.checkPlacementValidity(hg, h_placement, cfg.verbose_errs_and_warns)) {
             if (cfg.unicast_metrics) {
                 DBG(cfg) std::cout << "Computing placement unicast metrics...\n";
@@ -644,6 +656,7 @@ int main(int argc, char** argv) {
         } else {
             ERR(cfg) std::cerr << "WARNING, invalid placement !!\n";
         }
+        EVP_POP(); // postproc_metrics
 
         return 0;
     }; // place_routine end

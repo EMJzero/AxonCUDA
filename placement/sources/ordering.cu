@@ -13,6 +13,11 @@
 #include "utils_plc.cuh"
 #include "ordering.cuh"
 
+// NOTE: the whole batch of multi-starts is ordered by one launch per step
+// => per-multi-start arrays are one flat allocation of "batch_size" equally-sized segments, multi-start "b" owning [b*size, (b+1)*size)
+// => partition ids are composite, "b*num_parts + p", so a single global sort/scan/reduce keyed by partition already keeps multi-starts apart
+// => node idxs are batch-flat, hypergraph pin idxs are not
+
 // map every pin of every multi-start's view of the hypergraph to the partition that multi-start put it in
 struct batch_pin_to_partition {
     const uint32_t* hedges;
@@ -186,162 +191,173 @@ void compute_partitions_cutnet(
     *       from the count and offsets (aka, flags) you then allocate the buffer and repeat the deduplication to write final split costs
     */
 
-    const dim_t batch_pins = static_cast<dim_t>(batch_size) * hedges_size;
-    const uint32_t batch_hedges = batch_size * num_hedges;
     const uint32_t batch_part_pairs = batch_size * (num_parts / 2);
 
     // CUB's segmented sort counts items with an int
-    if (batch_pins > static_cast<dim_t>(INT_MAX)) {
-        ERR(cfg) std::cerr TID(tid) << "ABORTING: cutnet segmented sort over " << batch_pins << " pins exceeds INT_MAX, lower the batch size !!\n";
+    // => a batch whose pins exceed INT_MAX is handled in chunks of multi-starts, each as large as an int counts, since multi-starts never interact
+    const uint32_t starts_per_chunk = static_cast<uint32_t>(std::min(static_cast<dim_t>(batch_size), static_cast<dim_t>(INT_MAX) / hedges_size));
+    if (starts_per_chunk == 0) {
+        ERR(cfg) std::cerr TID(tid) << "ABORTING: cutnet segmented sort over " << hedges_size << " pins exceeds INT_MAX for a single multi-start !!\n";
         abort();
     }
+    if (starts_per_chunk < batch_size)
+        INFO(cfg) std::cout TID(tid) << "NOTE: cutnet segmented sort required " << static_cast<dim_t>(batch_size) * hedges_size << " pins, but INT_MAX=" << INT_MAX << ", sorting chunks of " << starts_per_chunk << " multi-starts ...\n";
 
-    uint32_t* d_part_pins = nullptr; // part_pins[start*hedges_size + hedges_offsets[hedge idx] + pin idx] -> partition the pin is in
-    CUDA_CHECK(cudaMallocAsync(&d_part_pins, batch_pins * sizeof(uint32_t), stream));
-
-    thrust::device_ptr<uint32_t> t_part_pins(d_part_pins);
     thrust::device_ptr<float> t_cutnet(d_cutnet);
 
     // initialize every partition pair as "fully trapped"; pairs that generate events will overwrite their true split cost
     thrust::fill(thrust_exec, t_cutnet, t_cutnet + batch_part_pairs, 0.0f);
 
-    // map pins to their partition -> each multi-start maps the shared pin sequence through its own partitioning
-    thrust::transform(
-        thrust_exec,
-        thrust::counting_iterator<dim_t>(0), thrust::counting_iterator<dim_t>(batch_pins),
-        t_part_pins,
-        batch_pin_to_partition{d_hedges, d_partitions, hedges_size, num_nodes}
-    );
+    for (uint32_t first_start = 0; first_start < batch_size; first_start += starts_per_chunk) {
+        const uint32_t num_starts = std::min(starts_per_chunk, batch_size - first_start);
+        // NOTE: partition ids are composite, so a chunk's events already land on its own pairs of the whole batch's cutnet
+        const uint32_t* d_chunk_partitions = d_partitions + first_start * num_nodes;
+        const dim_t chunk_pins = static_cast<dim_t>(num_starts) * hedges_size;
+        const uint32_t chunk_hedges = num_starts * num_hedges;
 
-    // segmented sort of part_pins (using the segments from hedges, one set of them per multi-start)
-    auto batch_hedges_offsets = thrust::make_transform_iterator(
-        thrust::counting_iterator<uint32_t>(0),
-        batch_hedge_offset{d_hedges_offsets, num_hedges, hedges_size}
-    );
-    uint32_t* d_part_pins_buffer = nullptr; // CUB segmented sort buffer
-    CUDA_CHECK(cudaMallocAsync(&d_part_pins_buffer, batch_pins * sizeof(uint32_t), stream));
-    cub::DoubleBuffer<uint32_t> c_part_pins_double_buffer(d_part_pins, d_part_pins_buffer);
-    void* c_part_pins_storage = nullptr;
-    size_t c_part_pins_storage_bytes = 0;
-    // NOTE: 'DeviceSegmentedSort', and not 'DeviceSegmentedRadixSort', because hedges are many and short
-    // => it bins segments by size and picks a per-bin algorithm, instead of paying a full radix pass for every one of them
-    cub::DeviceSegmentedSort::SortKeys(
-        c_part_pins_storage, c_part_pins_storage_bytes, c_part_pins_double_buffer,
-        batch_pins, batch_hedges, batch_hedges_offsets, batch_hedges_offsets + 1,
-        stream
-    );
-    CUB(cfg) std::cout TID(tid) << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(batch_pins * sizeof(uint32_t)) / (1 << 30)
-        << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_part_pins_storage_bytes) / (1 << 20)
-        << " MB of temporary storage ...\n";
-    CUDA_CHECK(cudaMallocAsync(&c_part_pins_storage, c_part_pins_storage_bytes, stream));
-    cub::DeviceSegmentedSort::SortKeys(
-        c_part_pins_storage, c_part_pins_storage_bytes, c_part_pins_double_buffer,
-        batch_pins, batch_hedges, batch_hedges_offsets, batch_hedges_offsets + 1,
-        stream
-    );
-    DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (c_part_pins_double_buffer.Current() != d_part_pins) {
-        uint32_t* tmp = d_part_pins_buffer;
-        d_part_pins_buffer = d_part_pins;
-        d_part_pins = tmp;
-    }
-    CUDA_CHECK(cudaFreeAsync(d_part_pins_buffer, stream));
-    CUDA_CHECK(cudaFreeAsync(c_part_pins_storage, stream));
+        uint32_t* d_part_pins = nullptr; // part_pins[chunk-local start*hedges_size + hedges_offsets[hedge idx] + pin idx] -> partition the pin is in
+        CUDA_CHECK(cudaMallocAsync(&d_part_pins, chunk_pins * sizeof(uint32_t), stream));
 
-    // NOTE: 32 bits are enough, these end up holding event offsets, and events never outnumber pins, which the check above caps at INT_MAX
-    uint32_t* d_flags = nullptr; // event_weight[idx] -> weight of the hedge being cut in event idx
-    CUDA_CHECK(cudaMallocAsync(&d_flags, (batch_pins + 1) * sizeof(uint32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(d_flags, 0x00, (batch_pins + 1) * sizeof(uint32_t), stream));
-    thrust::device_ptr<uint32_t> t_flags(d_flags);
-    {
-        // launch configuration - flag cutnet events kernel
-        int threads_per_block = 128; // 128/32 -> 4 warps per block
-        int warps_per_block = threads_per_block / WARP_SIZE;
-        int num_warps_needed = batch_hedges; // 1 warp per hedge
-        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-        // launch - flag cutnet events kernel
-        LAUNCH(cfg) TID(tid) RUN << "flag cutnet events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-        flag_cutnet_events_kernel<<<blocks, threads_per_block, 0, stream>>>(
-            d_part_pins,
-            d_hedges_offsets,
-            num_hedges,
-            batch_size,
-            hedges_size,
-            d_flags
+        thrust::device_ptr<uint32_t> t_part_pins(d_part_pins);
+
+        // map pins to their partition -> each multi-start maps the shared pin sequence through its own partitioning
+        thrust::transform(
+            thrust_exec,
+            thrust::counting_iterator<dim_t>(0), thrust::counting_iterator<dim_t>(chunk_pins),
+            t_part_pins,
+            batch_pin_to_partition{d_hedges, d_chunk_partitions, hedges_size, num_nodes}
         );
-        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+
+        // segmented sort of part_pins (using the segments from hedges, one set of them per multi-start)
+        auto chunk_hedges_offsets = thrust::make_transform_iterator(
+            thrust::counting_iterator<uint32_t>(0),
+            batch_hedge_offset{d_hedges_offsets, num_hedges, hedges_size}
+        );
+        uint32_t* d_part_pins_buffer = nullptr; // CUB segmented sort buffer
+        CUDA_CHECK(cudaMallocAsync(&d_part_pins_buffer, chunk_pins * sizeof(uint32_t), stream));
+        cub::DoubleBuffer<uint32_t> c_part_pins_double_buffer(d_part_pins, d_part_pins_buffer);
+        void* c_part_pins_storage = nullptr;
+        size_t c_part_pins_storage_bytes = 0;
+        // NOTE: 'DeviceSegmentedSort', and not 'DeviceSegmentedRadixSort', because hedges are many and short
+        // => it bins segments by size and picks a per-bin algorithm, instead of paying a full radix pass for every one of them
+        cub::DeviceSegmentedSort::SortKeys(
+            c_part_pins_storage, c_part_pins_storage_bytes, c_part_pins_double_buffer,
+            chunk_pins, chunk_hedges, chunk_hedges_offsets, chunk_hedges_offsets + 1,
+            stream
+        );
+        CUB(cfg) std::cout TID(tid) << "CUB segmented sort requiring " << std::fixed << std::setprecision(3) << (float)(chunk_pins * sizeof(uint32_t)) / (1 << 30)
+            << " GB of pong-buffer and " << std::fixed << std::setprecision(3) << ((float)c_part_pins_storage_bytes) / (1 << 20)
+            << " MB of temporary storage ...\n";
+        CUDA_CHECK(cudaMallocAsync(&c_part_pins_storage, c_part_pins_storage_bytes, stream));
+        cub::DeviceSegmentedSort::SortKeys(
+            c_part_pins_storage, c_part_pins_storage_bytes, c_part_pins_double_buffer,
+            chunk_pins, chunk_hedges, chunk_hedges_offsets, chunk_hedges_offsets + 1,
+            stream
+        );
         DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
+        if (c_part_pins_double_buffer.Current() != d_part_pins) {
+            uint32_t* tmp = d_part_pins_buffer;
+            d_part_pins_buffer = d_part_pins;
+            d_part_pins = tmp;
+        }
+        CUDA_CHECK(cudaFreeAsync(d_part_pins_buffer, stream));
+        CUDA_CHECK(cudaFreeAsync(c_part_pins_storage, stream));
 
-    // exclusive prefix sum of flags, then extract the last value (total sum) as the events count
-    // NOTE: the scan is over integers, so batching it whole leaves every multi-start's offsets unchanged
-    thrust::exclusive_scan(thrust_exec, t_flags, t_flags + batch_pins + 1, t_flags);
-    uint32_t events_count = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&events_count, d_flags + batch_pins, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    float* d_event_weight = nullptr; // event_weight[idx] -> weight of the hedge being cut in event idx
-    uint32_t* d_event_part = nullptr; // event_part[idx] -> composite partition/2 affected by event idx
-
-    if (events_count > 0) {
-        CUDA_CHECK(cudaMallocAsync(&d_event_weight, events_count * sizeof(float), stream));
-        CUDA_CHECK(cudaMallocAsync(&d_event_part, events_count * sizeof(uint32_t), stream));
-
-        thrust::device_ptr<float> t_event_weight(d_event_weight);
-        thrust::device_ptr<uint32_t> t_event_part(d_event_part);
-
-        // for each part_pins entry that previously generated a flag, use the new prefix-summed flags as the index in event_weight and event_part
-        // where to let that part_pins entry write its content (in event_part) and its hedge's weight (in event_weight)
+        // NOTE: 32 bits are enough, these end up holding event offsets, and events never outnumber pins, which the chunking above caps at INT_MAX
+        uint32_t* d_flags = nullptr; // event_weight[idx] -> weight of the hedge being cut in event idx
+        CUDA_CHECK(cudaMallocAsync(&d_flags, (chunk_pins + 1) * sizeof(uint32_t), stream));
+        CUDA_CHECK(cudaMemsetAsync(d_flags, 0x00, (chunk_pins + 1) * sizeof(uint32_t), stream));
+        thrust::device_ptr<uint32_t> t_flags(d_flags);
         {
-            // launch configuration - cutnet event generation kernel
+            // launch configuration - flag cutnet events kernel
             int threads_per_block = 128; // 128/32 -> 4 warps per block
             int warps_per_block = threads_per_block / WARP_SIZE;
-            int num_warps_needed = batch_hedges; // 1 warp per hedge
+            int num_warps_needed = chunk_hedges; // 1 warp per hedge
             int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
-            // launch - cutnet event generation kernel
-            LAUNCH(cfg) TID(tid) RUN << "cutnet event generation kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            cutnet_event_generation_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            // launch - flag cutnet events kernel
+            LAUNCH(cfg) TID(tid) RUN << "flag cutnet events kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+            flag_cutnet_events_kernel<<<blocks, threads_per_block, 0, stream>>>(
                 d_part_pins,
                 d_hedges_offsets,
-                d_hedge_weights,
-                d_flags,
                 num_hedges,
-                batch_size,
+                num_starts,
                 hedges_size,
-                d_event_weight,
-                d_event_part
+                d_flags
             );
             DBG(cfg) CUDA_CHECK(cudaGetLastError());
             DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
-        // sort event_weight and event_part both according to event_part
-        // => partitions are composite, so this single sort already groups every multi-start's events apart
-        thrust::sort_by_key(thrust_exec, t_event_part, t_event_part + events_count, t_event_weight);
+        // exclusive prefix sum of flags, then extract the last value (total sum) as the events count
+        // NOTE: the scan is over integers, so batching it whole leaves every multi-start's offsets unchanged
+        thrust::exclusive_scan(thrust_exec, t_flags, t_flags + chunk_pins + 1, t_flags);
+        uint32_t events_count = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&events_count, d_flags + chunk_pins, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        float* d_event_weight = nullptr; // event_weight[idx] -> weight of the hedge being cut in event idx
+        uint32_t* d_event_part = nullptr; // event_part[idx] -> composite partition/2 affected by event idx
 
-        // reduce-sum each segment of event_weight with the same event_part value and store the result in cutnet[t_event_part[.]]
-        // => although the buffer is still called "cutnet", it now stores weighted minority pin-cut
-        uint32_t* d_unique_event_part = nullptr; // unique_event_part[idx] -> idx-th composite partition/2 that generated at least one cutnet event
-        float* d_unique_event_weight = nullptr; // unique_event_weight[idx] -> reduced cutnet contribution for unique_event_part[idx]
-        CUDA_CHECK(cudaMallocAsync(&d_unique_event_part, events_count * sizeof(uint32_t), stream));
-        CUDA_CHECK(cudaMallocAsync(&d_unique_event_weight, events_count * sizeof(float), stream));
-        thrust::device_ptr<uint32_t> t_unique_event_part(d_unique_event_part);
-        thrust::device_ptr<float> t_unique_event_weight(d_unique_event_weight);
-        auto reduced_end = thrust::reduce_by_key(
-            thrust_exec,
-            t_event_part, t_event_part + events_count, t_event_weight,
-            t_unique_event_part, t_unique_event_weight
-        );
-        dim_t unique_events_count = thrust::get<0>(reduced_end) - t_unique_event_part;
-        thrust::scatter(thrust_exec, t_unique_event_weight, t_unique_event_weight + unique_events_count, t_unique_event_part, t_cutnet);
+        if (events_count > 0) {
+            CUDA_CHECK(cudaMallocAsync(&d_event_weight, events_count * sizeof(float), stream));
+            CUDA_CHECK(cudaMallocAsync(&d_event_part, events_count * sizeof(uint32_t), stream));
 
-        CUDA_CHECK(cudaFreeAsync(d_unique_event_part, stream));
-        CUDA_CHECK(cudaFreeAsync(d_unique_event_weight, stream));
-        CUDA_CHECK(cudaFreeAsync(d_event_weight, stream));
-        CUDA_CHECK(cudaFreeAsync(d_event_part, stream));
+            thrust::device_ptr<float> t_event_weight(d_event_weight);
+            thrust::device_ptr<uint32_t> t_event_part(d_event_part);
+
+            // for each part_pins entry that previously generated a flag, use the new prefix-summed flags as the index in event_weight and event_part
+            // where to let that part_pins entry write its content (in event_part) and its hedge's weight (in event_weight)
+            {
+                // launch configuration - cutnet event generation kernel
+                int threads_per_block = 128; // 128/32 -> 4 warps per block
+                int warps_per_block = threads_per_block / WARP_SIZE;
+                int num_warps_needed = chunk_hedges; // 1 warp per hedge
+                int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+                // launch - cutnet event generation kernel
+                LAUNCH(cfg) TID(tid) RUN << "cutnet event generation kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+                cutnet_event_generation_kernel<<<blocks, threads_per_block, 0, stream>>>(
+                    d_part_pins,
+                    d_hedges_offsets,
+                    d_hedge_weights,
+                    d_flags,
+                    num_hedges,
+                    num_starts,
+                    hedges_size,
+                    d_event_weight,
+                    d_event_part
+                );
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+
+            // sort event_weight and event_part both according to event_part
+            // => partitions are composite, so this single sort already groups every multi-start's events apart
+            thrust::sort_by_key(thrust_exec, t_event_part, t_event_part + events_count, t_event_weight);
+
+            // reduce-sum each segment of event_weight with the same event_part value and store the result in cutnet[t_event_part[.]]
+            // => although the buffer is still called "cutnet", it now stores weighted minority pin-cut
+            uint32_t* d_unique_event_part = nullptr; // unique_event_part[idx] -> idx-th composite partition/2 that generated at least one cutnet event
+            float* d_unique_event_weight = nullptr; // unique_event_weight[idx] -> reduced cutnet contribution for unique_event_part[idx]
+            CUDA_CHECK(cudaMallocAsync(&d_unique_event_part, events_count * sizeof(uint32_t), stream));
+            CUDA_CHECK(cudaMallocAsync(&d_unique_event_weight, events_count * sizeof(float), stream));
+            thrust::device_ptr<uint32_t> t_unique_event_part(d_unique_event_part);
+            thrust::device_ptr<float> t_unique_event_weight(d_unique_event_weight);
+            auto reduced_end = thrust::reduce_by_key(
+                thrust_exec,
+                t_event_part, t_event_part + events_count, t_event_weight,
+                t_unique_event_part, t_unique_event_weight
+            );
+            dim_t unique_events_count = thrust::get<0>(reduced_end) - t_unique_event_part;
+            thrust::scatter(thrust_exec, t_unique_event_weight, t_unique_event_weight + unique_events_count, t_unique_event_part, t_cutnet);
+
+            CUDA_CHECK(cudaFreeAsync(d_unique_event_part, stream));
+            CUDA_CHECK(cudaFreeAsync(d_unique_event_weight, stream));
+            CUDA_CHECK(cudaFreeAsync(d_event_weight, stream));
+            CUDA_CHECK(cudaFreeAsync(d_event_part, stream));
+        }
+
+        CUDA_CHECK(cudaFreeAsync(d_part_pins, stream));
+        CUDA_CHECK(cudaFreeAsync(d_flags, stream));
     }
-
-    CUDA_CHECK(cudaFreeAsync(d_part_pins, stream));
-    CUDA_CHECK(cudaFreeAsync(d_flags, stream));
     DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
@@ -1019,3 +1035,114 @@ uint32_t* locality_ordering(
 
     return d_order_idx;
 }
+
+
+/*
+// twin-pull reordering
+
+// fuse back partitions while internally reversing them as needed to "trap" strong connections locally inside partition pairs
+while (num_parts > 2) { // go back up the bisection tree
+    INFO(cfg) std::cout TID(tid) << "Tree reorientation level " << level_idx << " number of partitions=" << num_parts << "\n";
+    level_idx--;
+
+    float* d_sibling_score = nullptr; // sibling_score[2*(p/4)+0] -> total strength between p and p+3 plus p+1 and p+2; sibling_score[2*(p/4)+1] -> total strength between p and p+2 plus p+1 and p+3
+    // => sibling_score[2*(p/4)+1] > sibling_score[2*(p/4)+0] -> reverse one of the two branches
+    CUDA_CHECK(cudaMallocAsync(&d_sibling_score, (num_parts / 2) * sizeof(float), stream));
+    CUDA_CHECK(cudaMemsetAsync(d_sibling_score, 0x00, (num_parts / 2) * sizeof(float), stream));
+
+    // compute connection strength of each partition with its parent's sibling subtree
+    {
+        // launch configuration - sibling tree connection strength kernel
+        int threads_per_block = 128; // 128/32 -> 4 warps per block
+        int warps_per_block = threads_per_block / WARP_SIZE;
+        int num_warps_needed = num_nodes; // 1 warp per event
+        int blocks = (num_warps_needed + warps_per_block - 1) / warps_per_block;
+        // launch - sibling tree connection strength kernel
+        LAUNCH(cfg) TID(tid) RUN << "sibling tree connection strength kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        sibling_tree_connection_strength_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            d_hedges,
+            d_hedges_offsets,
+            d_touching,
+            d_touching_offsets,
+            d_hedge_weights,
+            d_order,
+            d_ord_part,
+            d_partitions,
+            num_nodes,
+            d_sibling_score
+        );
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    // refold p*2 and p*2+1 back into p
+    num_parts /= 2;
+    thrust::transform(
+        thrust_exec,
+        t_partitions, t_partitions + num_nodes, t_partitions,
+        [] __device__ (uint32_t x) { return x >> 1; }
+    );
+    thrust::transform(
+        thrust_exec,
+        t_ord_part, t_ord_part + num_nodes, t_ord_part,
+        [] __device__ (uint32_t x) { return x >> 1; }
+    );
+
+    bool* d_reverse = nullptr; // reverse[p/4] -> true if the subtree of p/4 (well, ex-p/4, since we already folded it back in p) needs to have one of its branches reversed
+    CUDA_CHECK(cudaMallocAsync(&d_reverse, (num_parts / 2) * sizeof(bool), stream));
+    {
+        // launch configuration - flag reversals kernel
+        int threads_per_block = 256;
+        int num_threads_needed = num_parts / 2; // 1 thread per (quarter) partition
+        int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+        // launch - flag reversals kernel
+        LAUNCH(cfg) TID(tid) RUN << "flag reversals kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        flag_reversals_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            d_sibling_score,
+            num_parts / 2,
+            d_reverse
+        );
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    // build offset indices over ord_part
+    uint32_t* d_ord_part_offsets = nullptr; // ord_part_offsets[p] -> first index of partition p in ord_part
+    CUDA_CHECK(cudaMallocAsync(&d_ord_part_offsets, (num_parts + 1) * sizeof(uint32_t), stream));
+    thrust::device_ptr<uint32_t> t_ord_part_offsets(d_ord_part_offsets);
+    thrust::counting_iterator<uint32_t> ord_search_begin(0);
+    // NOTE: the search was "made to work" by storing p/2 inside event_part-s, hence it is enough to search from 0 to num_parts/2
+    thrust::lower_bound(
+        thrust_exec,
+        t_ord_part, t_ord_part + num_nodes,
+        ord_search_begin, ord_search_begin + num_parts,
+        t_ord_part_offsets
+    );
+    CUDA_CHECK(cudaMemcpyAsync(d_ord_part_offsets + num_parts, &num_nodes, sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
+
+    // apply the reversal of leaves/nodes inside each flagged subtree
+    // NOTE: always the left branch reverses
+    {
+        // launch configuration - apply reversals kernel
+        int threads_per_block = 256;
+        int num_threads_needed = num_nodes; // 1 thread per node
+        int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+        // launch - apply reversals kernel
+        LAUNCH(cfg) TID(tid) RUN << "apply reversals kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
+        apply_reversals_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            d_ord_part,
+            d_ord_part_offsets,
+            d_reverse,
+            num_nodes,
+            d_order
+        );
+        DBG(cfg) CUDA_CHECK(cudaGetLastError());
+        DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    CUDA_CHECK(cudaFreeAsync(d_sibling_score, stream));
+    CUDA_CHECK(cudaFreeAsync(d_reverse, stream));
+    CUDA_CHECK(cudaFreeAsync(d_ord_part_offsets, stream));
+}
+
+*/

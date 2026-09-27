@@ -11,11 +11,13 @@
 #include <filesystem>
 #include <unordered_map>
 
+#include <omp.h>
+
 #include "hgraph.hpp"
 #include "topology.hpp"
 #include "nmhardware.hpp"
 
-#include "defines_plc.cuh"
+#include "defines_plc.hpp"
 
 #include "runconfig_plc.hpp"
 
@@ -39,8 +41,9 @@ namespace config_plc {
             "  -lpr <num>  Set the number of label propagation repeats during recursive bisection initial partitioning\n"
             "  -fdi <num>  Set the number of force-directed refinement iterations\n"
             "  -cnc <num>  Set the count of candidate swaps proposed per node during force-directed refinement\n"
-            "  -mso <num>  Overrides the number of multi-start attempts (default is chosen to maximally occupy the GPU)\n"
+            "  -mso <num>  Overrides the number of multi-start attempts (default is one per thread)\n"
             "  -bs <num>   Overrides how many multi-start attempts are refined together in one batch (default equals multi-start attempts)\n"
+            "  -thr <num>  Set the number of OpenMP threads (default: OMP_NUM_THREADS or all hardware threads)\n"
             "  -t <name>   Set the topology of the target graph where to place hypergraph nodes, valid names are:\n"
             "      - lat2d: 2D lattice (default)    - tor6d: 6D torus\n"
             "      - hcube: N-D hypercube           - hx3d: 3D HyperX\n"
@@ -52,13 +55,13 @@ namespace config_plc {
             "    => sfc x topology support lists:\n"
             "      - hilb, snak, zord, quad: lattice, torus\n"
             "      - flat: arbitrary\n"
-            "  -ff         Replaces the 1D ordering heuristic with host-side sequential feedforward ordering\n"
+            "  -ff         Replaces the 1D ordering heuristic with sequential feedforward ordering\n"
             "  -rp <list>  Comma-separated routing policies to evaluate placement quality metrics under (default: unicast,xy):\n"
             "      - unicast: one independent minimum path per destination (pessimistic bound)\n"
             "      - xy: dimension-order multicast tree, X first and then Y (realistic reference)\n"
             "      - steiner: minimum Steiner tree multicast (optimistic bound, can take hours!)\n"
             "      - none: disables all placement quality metrics\n"
-            "  -dtc        When set, construct touching sets on the device, rather than on the host\n"
+            "  -ptc        When set, construct touching sets in parallel, rather than sequentially while loading (alias: -dtc)\n"
             "  -seed <num> Set the algorithm's seed to <num> (default: " << SEED << ") (ignored when '-ff' is passed)\n"
             "  -v <lvl>    Set the verbosity level: 0 results only, 1 steps and phases, 2 kernel launches, 3 algorithm outputs, 4 debug \n"
             "  -h          Show this help\n";
@@ -78,11 +81,12 @@ namespace config_plc {
         TargetTopology topology = TargetTopology::LATTICE2D;
         SpaceFillingCurve space_filling_curve = SpaceFillingCurve::HILB;
         bool space_filling_curve_explicit = false;
-        bool feedforward_order = false; // NB: runs sequentially on the HOST!
+        uint32_t threads = (uint32_t)omp_get_max_threads();
+        bool feedforward_order = false; // NB: runs sequentially!
         bool unicast_metrics = true;
         bool xy_multicast_metrics = true;
         bool steiner_multicast_metrics = false; // opt-in: solving minimum Steiner trees can take hours
-        bool device_touching_construction = false;
+        bool parallel_touching_construction = false;
         uint64_t seed = SEED;
         bool verbose_logs = VERBOSE_LOGS;
         bool verbose_info = VERBOSE_INFO;
@@ -120,6 +124,10 @@ namespace config_plc {
                 if (i + 1 >= argc) { std::cerr << "Error: -bs requires a positive integer value\n"; std::exit(1); }
                 batch_size = std::stoul(argv[++i]);
                 if (batch_size == 0) { std::cerr << "Error: -bs must greater than zero\n"; std::exit(1); }
+            } else if (arg == "-thr") {
+                if (i + 1 >= argc) { std::cerr << "Error: -thr requires a positive integer value\n"; std::exit(1); }
+                threads = std::stoul(argv[++i]);
+                if (threads == 0) { std::cerr << "Error: -thr must be strictly greater than 0\n"; std::exit(1); }
             } else if (arg == "-cnc") {
                 if (i + 1 >= argc) { std::cerr << "Error: -cnc requires a positive integer value\n"; std::exit(1); }
                 candidates_count = std::stoul(argv[++i]);
@@ -141,8 +149,8 @@ namespace config_plc {
                 if (!parseRoutingPolicies(policies, unicast_metrics, xy_multicast_metrics, steiner_multicast_metrics)) {
                     std::cerr << "Error: -rp requested an invalid routing policy name (valid ones: unicast, xy, steiner, none)\n"; std::exit(1);
                 }
-            } else if (arg == "-dtc") {
-                device_touching_construction = true;
+            } else if (arg == "-ptc" || arg == "-dtc") {
+                parallel_touching_construction = true;
             } else if (arg == "-seed") {
                 if (i + 1 >= argc) { std::cerr << "Error: -seed requires a positive integer value\n"; std::exit(1); }
                 seed = std::stoull(argv[++i]);
@@ -155,7 +163,7 @@ namespace config_plc {
                 verbose_errs_and_warns = verbosity > 0;
                 verbose_kernel_launches = verbosity > 1;
                 debug = verbosity > 3;
-                if (verbosity > 2) std::cerr << "WARNING: verbosity 3 and 4 can hinder performance, especially on the host side !!\n";
+                if (verbosity > 2) std::cerr << "WARNING: verbosity 3 and 4 can hinder performance !!\n";
             } else { std::cerr << "Unknown option: " << arg << "\n"; std::exit(1); }
         }
 
@@ -184,13 +192,14 @@ namespace config_plc {
             candidates_count,
             multi_start_override,
             batch_size,
+            threads,
             topology,
             space_filling_curve,
             feedforward_order,
             unicast_metrics,
             xy_multicast_metrics,
             steiner_multicast_metrics,
-            device_touching_construction,
+            parallel_touching_construction,
             seed,
             verbose_logs,
             verbose_info,
@@ -293,7 +302,7 @@ namespace config_plc {
     }
 
     template<Topology T>
-    void saveResult(runconfig &cfg, std::vector<Coord_t<T>> h_placement) {
+    void saveResult(runconfig &cfg, std::vector<Coord_t<T>> placement) {
         // save hypergraph
         if (!cfg.save_path.empty()) {
             if (cfg.load_path.empty()) {
@@ -301,7 +310,7 @@ namespace config_plc {
                 std::exit(1);
             }
             try {
-                T::Coord::toFile(h_placement, cfg.save_path);
+                T::Coord::toFile(placement, cfg.save_path);
                 std::cout << "Placement data saved to " << cfg.save_path << "\n";
             } catch (const std::exception& e) {
                 std::cerr << "Error saving file: " << e.what() << "\n";

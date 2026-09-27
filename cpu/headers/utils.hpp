@@ -161,6 +161,13 @@ inline uint32_t slot_id(const slot s) { return (uint32_t)(s & 0xFFFFFFFFull); }
 
 // MISC
 
+// monotonic mapping of floats to unsigned integers, the order of float keys in CUB's radix sorts
+inline uint32_t float_to_ordered_uint(float value) {
+    uint32_t bits;
+    __builtin_memcpy(&bits, &value, sizeof(uint32_t));
+    return bits ^ ((bits & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u);
+}
+
 // number of bits needed to represent 'x'
 inline uint32_t bits_for(const uint64_t x) {
     return x == 0 ? 0u : 64u - (uint32_t)__builtin_clzll(x);

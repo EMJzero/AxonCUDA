@@ -88,6 +88,12 @@ void forces_kernel(
     float my_forces[T::neighborsCount()];
     thr_init<float>(my_forces, T::neighborsCount(), 0.0f);
 
+    // only neighbors inside the topology get a force, the others are never read
+    static_assert(T::neighborsCount() <= 32u, "the neighbors mask holds one bit per neighbor");
+    uint32_t neigh_mask = 0u; // i-th bit set iff the i-th neighbor is inside the topology
+    for (uint32_t neigh_idx = 0; neigh_idx < T::neighborsCount(); neigh_idx++)
+        neigh_mask |= (uint32_t)c_topo<T>.contains(c_topo<T>.neighbor(my_place, neigh_idx)) << neigh_idx;
+
     // scan touching hyperedges, flattening pin iteration across hedge boundaries -> keeps every lane busy
     // regardless of individual hedge size, instead of the whole warp splitting a single hedge's pins
     warpForEachTouchingPin(
@@ -102,6 +108,7 @@ void forces_kernel(
             //        my_force = how much distant I would be from my connectees if moved
             // TODO: could optimize, instead of doing another "distance" call, compute the new distance incrementally
             for (uint32_t neigh_idx = 0; neigh_idx < T::neighborsCount(); neigh_idx++) {
+                if (!((neigh_mask >> neigh_idx) & 1u)) continue;
                 const Coord_t<T> neigh_place = c_topo<T>.neighbor(my_place, neigh_idx);
                 my_forces[neigh_idx] += my_hedge_weight * max(c_topo<T>.distance(neigh_place, pin_place), 1);
             }
@@ -202,7 +209,8 @@ void exclusive_swaps_kernel(
     const uint32_t* __restrict__ pairs, // pairs[idx] is the partner idx wants to be swapped with
     const uint32_t* __restrict__ scores, // scores[idx] is the strenght with which idx wants to be swapped with pairs[idx]
     const uint32_t num_nodes,
-    const uint32_t batch_size,
+    const uint32_t first_start,
+    const uint32_t num_starts,
     const uint8_t* __restrict__ active,
     const uint32_t candidates_count,
     slot* __restrict__ swap_slots // initialized with -1 on the id
@@ -211,15 +219,16 @@ void exclusive_swaps_kernel(
     cg::grid_group grid = cg::this_grid();
 
     // STYLE: 'num_repeats' node per thread!
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t grid_tid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t tcount = gridDim.x * blockDim.x;
 
-    // NOTE: the whole batch is matched by a single grid, node idxs in "pairs" are already batch-flat
-    // => grid.sync() below is a batch-wide barrier, stronger than needed but correct, multi-starts never interact
-    const uint32_t batch_nodes = batch_size * num_nodes;
+    // NOTE: a grid matches the chunk of multi-starts [first_start, first_start + num_starts) of the batch, node idxs in "pairs" are already batch-flat
+    // => grid.sync() below is a barrier across those multi-starts, stronger than needed but correct, multi-starts never interact
+    const uint32_t grid_nodes = num_starts * num_nodes;
+    const uint32_t tid = first_start * num_nodes + grid_tid; // batch-flat node of the first repeat
 
-    //const uint32_t num_repeats = (batch_nodes + tcount - 1) / tcount;
-    const uint32_t actual_repeats = tid < batch_nodes ? 1u + (batch_nodes - 1u - tid) / tcount : 0u;
+    //const uint32_t num_repeats = (grid_nodes + tcount - 1) / tcount;
+    const uint32_t actual_repeats = grid_tid < grid_nodes ? 1u + (grid_nodes - 1u - grid_tid) / tcount : 0u;
     // NOTE: the launch sizes the grid off the item count, so no block is ever entirely empty and grid.sync() cannot hang
     if (actual_repeats == 0) return;
 
@@ -492,6 +501,9 @@ void resolve_empty_conflicts_kernel(
         if (nb_event == UINT32_MAX || nb_event == my_rank) continue;
         const swap nb_ev_swap = ev_swaps[nodes_base + nb_event];
         if (nb_ev_swap.lo != nb_node || nb_ev_swap.hi < UINT32_MAX - T::neighborsCount()) continue; // not an empty move
+        // NOTE: events are cancelled in place while others read them, skip those already cancelled (their direction is lost)
+        // => an event only loses its cell to a better-scoring one, the best one is never cancelled, and every loser still sees it
+        if (nb_ev_swap.hi == UINT32_MAX) continue;
         const uint32_t nb_direction = UINT32_MAX - nb_ev_swap.hi - 1;
         if (c_topo<T>.neighbor(placement[nb_node], nb_direction) == target)
             best_event = min(best_event, nb_event);
@@ -861,7 +873,8 @@ void tot_src_dst_distance_kernel(
     // STYLE: one hedge per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
     // global across blocks - coincides with the batch-flat hedge to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    // NOTE: counted in warps, since a whole batch's thread count overflows 32 bits long before its hedge count does
+    const uint32_t warp_id = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
     if (warp_id >= batch_size * num_hedges) return;
 
     // the hypergraph is shared by every multi-start, only the placement it is graded against differs
@@ -908,7 +921,8 @@ void min_spanning_tree_weight_kernel(
     // STYLE: one hedge per warp!
     const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
     // global across blocks - coincides with the batch-flat hedge to handle
-    const uint32_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    // NOTE: counted in warps, since a whole batch's thread count overflows 32 bits long before its hedge count does
+    const uint32_t warp_id = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
     if (warp_id >= batch_size * num_hedges) return;
 
     // the hypergraph is shared by every multi-start, only the placement it is graded against differs
@@ -1000,7 +1014,7 @@ void min_spanning_tree_weight_kernel(
         uint32_t, uint32_t, uint32_t, const uint8_t*, uint32_t, uint32_t*, uint32_t*); \
      \
     template __global__ void exclusive_swaps_kernel<T>( \
-        const uint32_t*, const uint32_t*, uint32_t, uint32_t, const uint8_t*, uint32_t, slot*); \
+        const uint32_t*, const uint32_t*, uint32_t, uint32_t, uint32_t, const uint8_t*, uint32_t, slot*); \
      \
     template __global__ void swap_events_kernel<T>( \
         const slot*, uint32_t, uint32_t, const uint8_t*, swap*, float*); \

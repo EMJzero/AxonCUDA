@@ -197,43 +197,53 @@ void forceDirectedRefinement(
         {
             // launch configuration - exclusive swaps kernel
             int threads_per_block = 256;
-            int num_threads_needed = batch_nodes; // 1 thread per node
-            int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
             size_t bytes_per_thread = 0; //TODO
             size_t shared_bytes = threads_per_block * bytes_per_thread;
             // additional checks for the cooperative kernel mode
             int blocks_per_SM = 0;
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_SM, exclusive_swaps_kernel<T>, threads_per_block, shared_bytes);
             int max_blocks = blocks_per_SM * props.multiProcessorCount;
-            if (blocks > max_blocks) {
-                const uint32_t num_repeats = (blocks + max_blocks - 1) / max_blocks;
-                INFO(cfg) std::cout TID(tid) << "NOTE: exclusive swaps kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
-                blocks = (blocks + num_repeats - 1) / num_repeats;
-                if (num_repeats > MAX_SWAPS_MATCHING_REPEATS) {
-                    ERR(cfg) std::cerr TID(tid) << "ABORTING: exclusive swaps kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_SWAPS_MATCHING_REPEATS << " !!\n";
-                    abort();
+            // every repeat appends its own walk to the same per-thread path, before the downward pass unwinds them all
+            // => a batch whose walks could outgrow the path is matched in chunks of multi-starts, one grid each, as large as the path fits
+            const uint32_t max_repeats = std::min(MAX_SWAPS_MATCHING_REPEATS, SWAPS_PATH_SIZE / num_nodes);
+            const uint32_t starts_per_chunk = std::max(1u, std::min(batch_size, max_repeats * static_cast<uint32_t>(max_blocks * threads_per_block) / num_nodes));
+            if (starts_per_chunk < batch_size)
+                INFO(cfg) std::cout TID(tid) << "NOTE: exclusive swaps kernel required up to " << batch_nodes << " nodes per grid, but the path fits " << starts_per_chunk * num_nodes << ", matching chunks of " << starts_per_chunk << " multi-starts ...\n";
+            for (uint32_t first_start = 0; first_start < batch_size; first_start += starts_per_chunk) {
+                const uint32_t num_starts = std::min(starts_per_chunk, batch_size - first_start);
+                int num_threads_needed = num_starts * num_nodes; // 1 thread per node
+                int blocks = (num_threads_needed + threads_per_block - 1) / threads_per_block;
+                if (blocks > max_blocks) {
+                    const uint32_t num_repeats = (blocks + max_blocks - 1) / max_blocks;
+                    INFO(cfg) std::cout TID(tid) << "NOTE: exclusive swaps kernel required blocks=" << blocks << ", but max-blocks=" << max_blocks << ", setting repeats=" << num_repeats << " ...\n";
+                    blocks = (blocks + num_repeats - 1) / num_repeats;
+                    // NOTE: with 'starts_per_chunk' sized as above, these can only fail when a single multi-start already outgrows the path
+                    if (num_repeats > MAX_SWAPS_MATCHING_REPEATS) {
+                        ERR(cfg) std::cerr TID(tid) << "ABORTING: exclusive swaps kernel required repeats=" << num_repeats << ", but max-repeats=" << MAX_SWAPS_MATCHING_REPEATS << " !!\n";
+                        abort();
+                    }
+                    if (num_repeats * num_nodes > SWAPS_PATH_SIZE) {
+                        ERR(cfg) std::cerr TID(tid) << "ABORTING: exclusive swaps kernel required up to " << num_repeats * num_nodes << " path slots per thread, but max-path-size=" << SWAPS_PATH_SIZE << " !!\n";
+                        abort();
+                    }
                 }
-                // every repeat appends its own walk to the same per-thread path, before the downward pass unwinds them all
-                if (num_repeats * num_nodes > SWAPS_PATH_SIZE) {
-                    ERR(cfg) std::cerr TID(tid) << "ABORTING: exclusive swaps kernel required up to " << num_repeats * num_nodes << " path slots per thread, but max-path-size=" << SWAPS_PATH_SIZE << ", lower the batch size !!\n";
-                    abort();
-                }
+                // launch - exclusive swaps kernel
+                // NOTE: sizing the grid off the item count keeps every block non-empty, which the grid.sync()-es inside require
+                LAUNCH(cfg) TID(tid) RUN << "exclusive swaps kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ", multi-starts=[" << first_start << ", " << first_start + num_starts << ")) ...\n";
+                void *kernel_args[] = {
+                    (void*)&d_pairs,
+                    (void*)&d_scores,
+                    (void*)&num_nodes,
+                    (void*)&first_start,
+                    (void*)&num_starts,
+                    (void*)&d_active,
+                    (void*)&cfg.candidates_count,
+                    (void*)&d_swap_slots
+                };
+                CUDA_CHECK(cudaLaunchCooperativeKernel((void*)exclusive_swaps_kernel<T>, blocks, threads_per_block, kernel_args, shared_bytes, stream));
+                DBG(cfg) CUDA_CHECK(cudaGetLastError());
+                DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
             }
-            // launch - exclusive swaps kernel
-            // NOTE: sizing the grid off the item count keeps every block non-empty, which the grid.sync()-es inside require
-            LAUNCH(cfg) TID(tid) RUN << "exclusive swaps kernel (blocks=" << blocks << ", thr-per-block=" << threads_per_block << ") ...\n";
-            void *kernel_args[] = {
-                (void*)&d_pairs,
-                (void*)&d_scores,
-                (void*)&num_nodes,
-                (void*)&batch_size,
-                (void*)&d_active,
-                (void*)&cfg.candidates_count,
-                (void*)&d_swap_slots
-            };
-            CUDA_CHECK(cudaLaunchCooperativeKernel((void*)exclusive_swaps_kernel<T>, blocks, threads_per_block, kernel_args, shared_bytes, stream));
-            DBG(cfg) CUDA_CHECK(cudaGetLastError());
-            DBG(cfg) CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         // =============================

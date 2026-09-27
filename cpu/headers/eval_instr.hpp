@@ -1,7 +1,7 @@
 #pragma once
 // -----------------------------------------------------------------------------
-// Lightweight phase markers, host-side counterpart of the NVTX ranges in the
-// CUDA version ('headers/eval_instr.cuh'), with the very same phase names.
+// Lightweight phase markers, counterpart of the NVTX ranges in the CUDA
+// version ('headers/eval_instr.cuh'), with the very same phase names.
 //
 // Each range accumulates its wall-clock time under its name; the totals are
 // printed by 'evp_report' at the end of the run, giving per-phase times to put

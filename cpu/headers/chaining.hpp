@@ -92,13 +92,3 @@ void pair_kth_smallest_with_kth_largest(
     const uint32_t* __restrict__ inbound_count,
     uint32_t* __restrict__ groups
 );
-
-
-// HELPERS
-
-// monotonic mapping of floats to unsigned integers (as in 'kernels/chaining.cu')
-inline uint32_t float_to_ordered_uint(float value) {
-    uint32_t bits;
-    __builtin_memcpy(&bits, &value, sizeof(uint32_t));
-    return bits ^ ((bits & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u);
-}

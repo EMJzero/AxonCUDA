@@ -6,6 +6,7 @@
 #include <fstream>
 #include <cstdint>
 #include <cstddef>
+#include <utility>
 #include <concepts>
 #include <algorithm>
 #include <stdexcept>
@@ -25,6 +26,33 @@
 #endif
 
 namespace topology {
+
+    // TARGET TOPOLOGIES
+
+    // TODO: change from fixed-dimensionality topologies to topology+N in the CLI arguments
+
+    enum class TargetTopology {
+        LATTICE2D, // 2D lattice -> intrinsic dim. = 2, distance func. = Manhattan
+        TORUS6D, // 6D torus -> intrinsic dim. = 6, distance func. = wrapping Manhattan
+        HYPERCUBE, // N-D hypercube -> intrinsic dim. = 1, distance func. = Hamming
+        HYPERX3D, // 3D HyperX -> intrinsic dim. = 3, distance func. = # not-equal dim. (any-radix Hamming)
+        ARBITRARY // arbitrary undirected weighted graph -> intrinsic dim. = 1, distance func. = precomputed weighted shortest path
+    };
+
+    static constexpr std::pair<TargetTopology, const char*> TOPOLOGY_NAMES[] = {
+        { TargetTopology::LATTICE2D, "lat2d" },
+        { TargetTopology::TORUS6D, "tor6d" },
+        { TargetTopology::HYPERCUBE, "hcube" },
+        { TargetTopology::HYPERX3D, "hx3d" },
+        { TargetTopology::ARBITRARY, "arb" }
+    };
+
+    using TopologySupport = uint32_t; // flag bits -> the i-th bit is set if the i-th topology in TargetTopology's order is supported
+
+    static constexpr TopologySupport topologySupport(TargetTopology topology) noexcept {
+        return TopologySupport{1} << static_cast<uint32_t>(topology);
+    }
+
 
     // COORDINATES
 

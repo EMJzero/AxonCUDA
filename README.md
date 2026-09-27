@@ -98,6 +98,32 @@ Helpful options:
 - `-smh <lvl>`: increasing 'lvl' can prevent going out of memory when there are many coarsening levels or simply many nodes/nets;
 - `-om <mult>`: do increase iff an assert for full hash tables triggers during initial neighbors construction;
 
+## Profiling
+
+The main steps of both partitioning and placement are marked as NVTX ranges, via the `EVP_PUSH(name)`/`EVP_POP()` macros of [`eval_instr.cuh`](./headers/eval_instr.cuh).
+Ranges are visible to Nsight Systems and Nsight Compute, and cost nothing measurable when no profiler is attached.
+
+Ranges:
+- partitioning: `setup_touching`, `construct_neighbors`, `coarsen L<i>` and `uncoarsen_refine L<i>` for every level `i`, `postproc_host`;
+- placement: `setup_touching`, `initial_placement`, `fd_refinement`, `grade`, `postproc_metrics` (the middle three once per multi-start batch).
+
+Examples of typical uses:
+```sh
+# profile a run, keeping the CUDA and NVTX traces
+nsys profile -t cuda,nvtx -o report ./hgraph_gpu.exe -r hgraphs/some_snn.snn -c loihi84
+# GPU time spent inside each range (ranges are opened on the host, kernel launches are asynchronous, hence the projection)
+nsys stats -r nvtx_gpu_proj_sum report.nsys-rep
+# kernels grouped by the range that launched them
+nsys stats -r nvtx_kern_sum report.nsys-rep
+# collect kernel metrics only inside one range
+ncu --nvtx --nvtx-include "coarsen L0/" ./hgraph_gpu.exe -r hgraphs/some_snn.snn -c loihi84
+```
+
+The run scripts under [`hgraphs`](./hgraphs) and [`placement/hgraphs`](./placement/hgraphs) profile every run with `-p` (`nsys`, summaries included in the log) or `-n` (`ncu`).
+Build with `make EXTRA=-DAXON_NO_NVTX` to compile the ranges out entirely.
+
+> The CPU version under [`cpu`](./cpu) keeps the same ranges, timed with the wall clock, and prints their totals at the end of a run with `-v 1` or higher.
+
 ## Procuring Hypergraphs
 
 Our set of benchmark hypergraphs derived from Spiking Neural Networks (SNNs) is available [here (Zenodo)](https://zenodo.org/records/19194881).

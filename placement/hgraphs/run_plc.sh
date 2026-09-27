@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
 DATA_DIR="$(cd -P "$SCRIPT_DIR/part_snns" && pwd)"
 TARGET_BIN="$(cd -P "$SCRIPT_DIR/.." && pwd)/hplace_gpu.exe"
-TARGET_ARGS=(-lpr 16 -fdi 1024 -dtc -v 0 -mso 2 -bs 2 -sfc hilb) # can be later overriden per-run
+TARGET_ARGS=(-lpr 16 -fdi 1024 -dtc -v 0 -mso 64 -bs 64 -sfc hilb) # can be later overriden per-run
 RESULTS_DIR="$DATA_DIR/results_lpr16_fdi1024_mso2"
 
 PROFILING=0
@@ -126,9 +126,9 @@ run_case() {
     if ! (
       cd "$DATA_DIR"
       "${NSYS_BASE_CMD[@]}" \
-        -r "${filename}.snn" \
         --output="${RESULTS_DIR}/${filename}_profile" \
         "$TARGET_BIN" "${TARGET_ARGS[@]}" "$@" \
+        -r "${filename}.snn" \
         |& tee "${RESULTS_DIR}/${filename}.txt"
     ); then
       rc=$?
@@ -140,9 +140,9 @@ run_case() {
     if ! (
       cd "$DATA_DIR"
       "${NCU_BASE_CMD[@]}" \
-        -r "${filename}.snn" \
         --log-file "${RESULTS_DIR}/${filename}.csv" \
-        "$TARGET_BIN" "${TARGET_ARGS[@]}" "$@"
+        "$TARGET_BIN" "${TARGET_ARGS[@]}" "$@" \
+        -r "${filename}.snn"
     ); then
       rc=$?
     fi

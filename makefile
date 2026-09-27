@@ -18,6 +18,11 @@ NVCCFLAGS   := -O3 --std=c++20 -arch=$(ARCH) -dc -dlto -allow-unsupported-compil
                -I $(HDR_DIR) -I $(INC_DIR)
 LINKFLAGS   := --std=c++20 -arch=$(ARCH) -dlto -allow-unsupported-compiler --extended-lambda -lgomp
 
+# extra compile-time flags
+EXTRA       :=
+CXXFLAGS    += $(EXTRA)
+NVCCFLAGS   += $(EXTRA)
+
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 MAKEFLAGS += -j$(NPROC) # run with as many jobs as there are CPU cores
 

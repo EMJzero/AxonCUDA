@@ -375,6 +375,41 @@ T par_reduce(const dim_t n, const T init, Get get, Op op) {
 }
 
 
+// SEGMENTS
+
+// out[v] -> index of the first item in the sorted 'keys' not less than v, for every v in [0, num_values)
+template <typename K>
+void par_lower_bound(const K* __restrict__ keys, const dim_t n, const uint32_t num_values, uint32_t* __restrict__ out) {
+    // STYLE: one searched value per iteration!
+    #pragma omp parallel for schedule(static) if(num_values > PARALLEL_GRAIN)
+    for (uint32_t v = 0; v < num_values; v++)
+        out[v] = (uint32_t)(std::lower_bound(keys, keys + n, (K)v) - keys);
+}
+
+// sort the items inside each of 'num_segments' segments, the seg-th spanning [offset(seg), offset(seg + 1))
+template <typename T, typename Offset>
+void par_segmented_sort(T* __restrict__ data, const uint32_t num_segments, Offset offset) {
+    // STYLE: one segment per iteration!
+    #pragma omp parallel for schedule(dynamic, DYNAMIC_CHUNK) if(num_segments > PARALLEL_GRAIN)
+    for (uint32_t seg = 0; seg < num_segments; seg++)
+        std::sort(data + offset(seg), data + offset(seg + 1));
+}
+
+// call 'fn(begin, end)' on every run [begin, end) of consecutive items sharing a key
+// => 'same(i - 1, i)' is true iff items i - 1 and i share a key
+// => runs are handled in parallel, the items of a run sequentially: float sums inside a run never depend on the number of threads
+template <typename Same, typename Fn>
+void par_for_each_run(const dim_t n, Same same, Fn fn) {
+    if (n == 0) return;
+    buffer<uint32_t> run_starts = par_copy_if((uint32_t)n, [&](uint32_t i) { return i == 0 || !same(i - 1, i); });
+    const uint32_t num_runs = (uint32_t)run_starts.size();
+    // STYLE: one run per iteration!
+    #pragma omp parallel for schedule(dynamic, DYNAMIC_CHUNK) if(num_runs > 1 && n > PARALLEL_GRAIN)
+    for (uint32_t run = 0; run < num_runs; run++)
+        fn((dim_t)run_starts[run], run + 1 < num_runs ? (dim_t)run_starts[run + 1] : n);
+}
+
+
 // CSR CONSTRUCTION
 
 // build a CSR structure (offsets + packed segments) when the size of each item's segment is not known in advance
